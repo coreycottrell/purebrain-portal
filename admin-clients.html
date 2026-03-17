@@ -1,0 +1,1251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PUREBRAIN Client Admin</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #080a12;
+    --bg2:       #0d1120;
+    --bg3:       #131929;
+    --border:    #1e2a40;
+    --blue:      #2a93c1;
+    --blue-dim:  #1c6a8f;
+    --orange:    #f1420b;
+    --orange-dim:#b03209;
+    --text:      #e8edf5;
+    --text-dim:  #7a8aaa;
+    --green:     #22c55e;
+    --yellow:    #f59e0b;
+    --red:       #ef4444;
+  }
+
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+
+  /* ── Auth Gate ── */
+  #auth-gate {
+    position: fixed; inset: 0;
+    background: var(--bg);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 9999;
+  }
+  #auth-gate.hidden { display: none; }
+  .auth-box {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 40px;
+    width: 100%;
+    max-width: 420px;
+    text-align: center;
+  }
+  .auth-box .logo { font-size: 24px; font-weight: 700; margin-bottom: 8px; }
+  .auth-box .logo .blue  { color: var(--blue); }
+  .auth-box .logo .orange { color: var(--orange); }
+  .auth-box p { color: var(--text-dim); margin-bottom: 24px; font-size: 13px; }
+  .auth-box input {
+    width: 100%;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    padding: 10px 14px;
+    font-size: 14px;
+    margin-bottom: 12px;
+    outline: none;
+  }
+  .auth-box input:focus { border-color: var(--blue); }
+  .auth-box .err { color: var(--red); font-size: 12px; margin-bottom: 8px; min-height: 16px; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    padding: 10px 20px;
+    border-radius: 8px;
+    border: none;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+    transition: opacity .15s, transform .1s;
+  }
+  .btn:hover { opacity: .88; }
+  .btn:active { transform: scale(.97); }
+  .btn-blue    { background: var(--blue);    color: #fff; }
+  .btn-orange  { background: var(--orange);  color: #fff; }
+  .btn-ghost   { background: var(--bg3);     color: var(--text); border: 1px solid var(--border); }
+  .btn-green   { background: var(--green);   color: #000; }
+  .btn-yellow  { background: var(--yellow);  color: #000; }
+  .btn-red     { background: var(--red);     color: #fff; }
+  .btn-sm      { padding: 6px 12px; font-size: 12px; }
+  .btn-full    { width: 100%; }
+
+  /* ── Layout ── */
+  #app { display: none; flex-direction: column; min-height: 100vh; }
+  #app.visible { display: flex; }
+
+  header {
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+    height: 56px;
+    display: flex; align-items: center; justify-content: space-between;
+    position: sticky; top: 0; z-index: 100;
+  }
+  .header-logo { font-size: 18px; font-weight: 700; }
+  .header-logo .blue   { color: var(--blue); }
+  .header-logo .orange { color: var(--orange); }
+  .header-right { display: flex; align-items: center; gap: 12px; }
+  .header-link {
+    font-size: 12px; color: var(--text-dim); text-decoration: none;
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px 10px;
+    transition: color .15s, border-color .15s;
+  }
+  .header-link:hover { color: var(--blue); border-color: var(--blue); }
+  .badge {
+    display: inline-flex; align-items: center;
+    background: var(--bg3); border: 1px solid var(--border);
+    border-radius: 20px; padding: 3px 10px;
+    font-size: 11px; color: var(--text-dim);
+  }
+  .badge .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--green); margin-right: 6px;
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: .4; }
+  }
+
+  main { flex: 1; padding: 24px; max-width: 1400px; margin: 0 auto; width: 100%; }
+
+  /* ── Tabs ── */
+  .tabs {
+    display: flex; gap: 4px;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 4px;
+    margin-bottom: 24px;
+    width: fit-content;
+  }
+  .tab {
+    padding: 8px 18px;
+    border-radius: 7px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-dim);
+    transition: all .15s;
+    border: none; background: transparent;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { background: var(--blue); color: #fff; }
+
+  /* ── Cards / Stats ── */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+  }
+  .stat-label { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 8px; }
+  .stat-value { font-size: 28px; font-weight: 700; }
+  .stat-value.blue   { color: var(--blue); }
+  .stat-value.orange { color: var(--orange); }
+  .stat-value.green  { color: var(--green); }
+  .stat-value.yellow { color: var(--yellow); }
+  .stat-value.red    { color: var(--red); }
+
+  /* ── Panels ── */
+  .panel {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    margin-bottom: 24px;
+  }
+  .panel-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .panel-title { font-size: 14px; font-weight: 600; }
+  .panel-body  { padding: 0; }
+
+  /* ── Search / Filter bar ── */
+  .filter-bar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg3);
+  }
+  .filter-bar input, .filter-bar select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 7px 12px;
+    font-size: 13px;
+    outline: none;
+  }
+  .filter-bar input { min-width: 220px; }
+  .filter-bar input:focus, .filter-bar select:focus { border-color: var(--blue); }
+  .filter-bar select option { background: var(--bg2); }
+
+  /* ── Table ── */
+  .tbl-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  thead { background: var(--bg3); }
+  th {
+    padding: 10px 16px;
+    text-align: left;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--text-dim);
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+  }
+  th:hover { color: var(--text); }
+  th.sort-asc::after  { content: " ▲"; font-size: 9px; }
+  th.sort-desc::after { content: " ▼"; font-size: 9px; }
+  td {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    vertical-align: middle;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(42,147,193,.04); }
+  .expand-row td { padding: 0; border-bottom: 1px solid var(--border); }
+  .expand-inner { padding: 16px 20px; background: var(--bg3); }
+
+  /* ── Status chips ── */
+  .status-chip {
+    display: inline-block;
+    border-radius: 20px;
+    padding: 2px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .status-active      { background: rgba(34,197,94,.15);  color: var(--green); }
+  .status-onboarding  { background: rgba(245,158,11,.15); color: var(--yellow); }
+  .status-churned     { background: rgba(239,68,68,.15);  color: var(--red); }
+  .status-trial       { background: rgba(42,147,193,.15); color: var(--blue); }
+  .status-unknown     { background: rgba(122,138,170,.1); color: var(--text-dim); }
+
+  .pay-chip {
+    display: inline-block;
+    border-radius: 20px;
+    padding: 2px 10px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .pay-paid                 { background: rgba(34,197,94,.15);  color: var(--green); }
+  .pay-subscription_active  { background: rgba(42,147,193,.15); color: var(--blue); }
+  .pay-subscription_cancelled { background: rgba(239,68,68,.15); color: var(--red); }
+  .pay-none                 { background: rgba(122,138,170,.1); color: var(--text-dim); }
+
+  .tier-chip {
+    display: inline-block;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: capitalize;
+  }
+  .tier-partnered   { background: rgba(241,66,11,.2);  color: var(--orange); }
+  .tier-bonded      { background: rgba(42,147,193,.2); color: var(--blue); }
+  .tier-awakened    { background: rgba(34,197,94,.15); color: var(--green); }
+  .tier-brainiac    { background: rgba(245,158,11,.2); color: var(--yellow); }
+  .tier-unknown     { background: rgba(122,138,170,.1); color: var(--text-dim); }
+
+  /* ── Inline edit ── */
+  .notes-input {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 6px 10px;
+    font-size: 12px;
+    width: 240px;
+    outline: none;
+    resize: vertical;
+  }
+  .notes-input:focus { border-color: var(--blue); }
+  .status-select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 4px 8px;
+    font-size: 12px;
+    outline: none;
+    cursor: pointer;
+  }
+  .status-select:focus { border-color: var(--blue); }
+
+  /* ── Detail edit form ── */
+  .detail-edit-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-bottom: 16px;
+  }
+  @media (max-width: 640px) { .detail-edit-grid { grid-template-columns: 1fr; } }
+  .field-group { display: flex; flex-direction: column; gap: 10px; }
+  .field-label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 2px; }
+  .field-input {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 7px 10px;
+    font-size: 13px;
+    outline: none;
+    width: 100%;
+  }
+  .field-input:focus { border-color: var(--blue); }
+  .field-select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 7px 10px;
+    font-size: 13px;
+    outline: none;
+    cursor: pointer;
+    width: 100%;
+  }
+  .field-select:focus { border-color: var(--blue); }
+  .field-select option { background: var(--bg2); }
+  .field-textarea {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 7px 10px;
+    font-size: 13px;
+    outline: none;
+    width: 100%;
+    resize: vertical;
+  }
+  .field-textarea:focus { border-color: var(--blue); }
+
+  /* ── Team Access tab ── */
+  .invite-form {
+    display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg3);
+  }
+  .invite-form .field-group { flex: 1; min-width: 160px; }
+  .invite-result {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 14px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: monospace;
+    font-size: 12px;
+    color: var(--blue);
+    word-break: break-all;
+    margin: 12px 20px 0;
+  }
+  .invite-result.hidden { display: none; }
+
+  /* ── Loading / Empty ── */
+  .loading { text-align: center; padding: 40px; color: var(--text-dim); }
+  .spinner {
+    display: inline-block;
+    width: 24px; height: 24px;
+    border: 2px solid var(--border);
+    border-top-color: var(--blue);
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+    margin-bottom: 10px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .empty { text-align: center; padding: 40px; color: var(--text-dim); font-size: 13px; }
+
+  /* ── Toast ── */
+  #toast {
+    position: fixed; bottom: 24px; right: 24px;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 20px;
+    font-size: 13px;
+    max-width: 320px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.4);
+    transition: opacity .25s, transform .25s;
+    opacity: 0; transform: translateY(10px);
+    pointer-events: none;
+    z-index: 999;
+  }
+  #toast.show { opacity: 1; transform: translateY(0); }
+  #toast.success { border-left: 3px solid var(--green); }
+  #toast.error   { border-left: 3px solid var(--red); }
+  #toast.info    { border-left: 3px solid var(--blue); }
+
+  /* ── Refresh btn ── */
+  .refresh-btn { cursor: pointer; color: var(--text-dim); font-size: 18px; border: none; background: none; transition: transform .3s; }
+  .refresh-btn:hover { color: var(--text); transform: rotate(180deg); }
+
+  /* ── Revenue table extras ── */
+  .rev-bar-wrap { display: flex; align-items: center; gap: 10px; }
+  .rev-bar-bg   { flex: 1; height: 6px; background: var(--bg3); border-radius: 3px; overflow: hidden; min-width: 60px; }
+  .rev-bar-fill { height: 100%; background: var(--orange); border-radius: 3px; transition: width .4s; }
+
+  /* ── Activity timeline ── */
+  .timeline-item {
+    display: flex; gap: 14px; align-items: flex-start;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .timeline-item:last-child { border-bottom: none; }
+  .timeline-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    margin-top: 6px; flex-shrink: 0;
+  }
+  .dot-green  { background: var(--green); }
+  .dot-blue   { background: var(--blue); }
+  .dot-orange { background: var(--orange); }
+  .dot-yellow { background: var(--yellow); }
+
+  @media (max-width: 640px) {
+    main { padding: 16px; }
+    .stats-grid { grid-template-columns: 1fr 1fr; }
+    header { padding: 0 16px; }
+    .filter-bar { flex-direction: column; align-items: stretch; }
+    .filter-bar input { min-width: 0; width: 100%; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Auth Gate -->
+<div id="auth-gate">
+  <div class="auth-box">
+    <div class="logo"><span class="blue">PUREBR</span><span class="orange">AI</span><span class="blue">N</span></div>
+    <p>Client Admin — Enter your portal token to continue</p>
+    <input type="password" id="token-input" placeholder="Portal bearer token" autocomplete="off">
+    <div class="err" id="auth-err"></div>
+    <button class="btn btn-blue btn-full" onclick="doAuth()">Unlock Admin</button>
+  </div>
+</div>
+
+<!-- Main App -->
+<div id="app">
+  <header>
+    <div class="header-logo"><span class="blue">PUREBR</span><span class="orange">AI</span><span class="blue">N</span> &nbsp;— Client Admin</div>
+    <div class="header-right">
+      <a class="header-link" href="/admin/referrals">Referral Dashboard &rarr;</a>
+      <div class="badge"><span class="dot"></span>Live</div>
+      <button class="refresh-btn" onclick="loadAll()" title="Refresh all data">&#x21BB;</button>
+      <button class="btn btn-ghost btn-sm" onclick="logout()">Logout</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Stats -->
+    <div class="stats-grid">
+      <div class="stat-card"><div class="stat-label">Total Clients</div><div class="stat-value blue" id="s-total">—</div></div>
+      <div class="stat-card"><div class="stat-label">Active</div><div class="stat-value green" id="s-active">—</div></div>
+      <div class="stat-card"><div class="stat-label">Onboarding</div><div class="stat-value yellow" id="s-onboarding">—</div></div>
+      <div class="stat-card"><div class="stat-label">Churned</div><div class="stat-value red" id="s-churned">—</div></div>
+      <div class="stat-card"><div class="stat-label">Total Revenue</div><div class="stat-value orange" id="s-revenue">—</div></div>
+      <div class="stat-card"><div class="stat-label">MRR</div><div class="stat-value blue" id="s-mrr">—</div></div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs">
+      <button class="tab active" data-tab="clients" onclick="switchTab(this,'clients')">All Clients</button>
+      <button class="tab" data-tab="revenue" onclick="switchTab(this,'revenue')">Revenue</button>
+      <button class="tab" data-tab="activity" onclick="switchTab(this,'activity')">Activity</button>
+      <button class="tab" data-tab="team" onclick="switchTab(this,'team')">Team Access</button>
+    </div>
+
+    <!-- ALL CLIENTS TAB -->
+    <div id="tab-clients">
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">All Clients</span>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <button class="btn btn-blue btn-sm" onclick="importData()">&#x21A7; Import Data</button>
+            <button class="btn btn-ghost btn-sm" onclick="exportCSV()">&#x2193; Export CSV</button>
+            <span class="badge" id="client-count">—</span>
+          </div>
+        </div>
+        <div class="filter-bar">
+          <input type="text" id="search-input" placeholder="Search name, email, company, AI name…" oninput="applyFilters()">
+          <select id="filter-tier" onchange="applyFilters()">
+            <option value="">All Tiers</option>
+            <option value="awakened">Awakened</option>
+            <option value="bonded">Bonded</option>
+            <option value="partnered">Partnered</option>
+            <option value="brainiac">Brainiac</option>
+            <option value="unknown">Unknown</option>
+          </select>
+          <select id="filter-status" onchange="applyFilters()">
+            <option value="">All Statuses</option>
+            <option value="active">Active</option>
+            <option value="onboarding">Onboarding</option>
+            <option value="churned">Churned</option>
+            <option value="trial">Trial</option>
+          </select>
+          <select id="filter-pay" onchange="applyFilters()">
+            <option value="">All Payment</option>
+            <option value="paid">Paid</option>
+            <option value="subscription_active">Subscription Active</option>
+            <option value="subscription_cancelled">Sub Cancelled</option>
+            <option value="none">No Payment</option>
+          </select>
+        </div>
+        <div class="panel-body tbl-wrap">
+          <table id="clients-table">
+            <thead><tr>
+              <th onclick="sortClients('name',this)">Name</th>
+              <th onclick="sortClients('ai_name',this)">AI Name</th>
+              <th onclick="sortClients('email',this)">Email</th>
+              <th onclick="sortClients('company',this)">Company</th>
+              <th onclick="sortClients('tier',this)">Tier</th>
+              <th onclick="sortClients('status',this)">Status</th>
+              <th onclick="sortClients('payment_status',this)">Payment</th>
+              <th onclick="sortClients('total_paid',this)">Paid</th>
+              <th onclick="sortClients('first_seen_at',this)">First Seen</th>
+              <th onclick="sortClients('last_active_at',this)">Last Active</th>
+              <th></th>
+            </tr></thead>
+            <tbody id="clients-tbody"><tr><td colspan="11" class="loading"><div class="spinner"></div><br>Loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- REVENUE TAB -->
+    <div id="tab-revenue" style="display:none">
+      <div class="panel">
+        <div class="panel-header"><span class="panel-title">Revenue Breakdown</span></div>
+        <div class="panel-body tbl-wrap">
+          <table>
+            <thead><tr>
+              <th>Client</th>
+              <th>Tier</th>
+              <th>Total Paid</th>
+              <th>Payments</th>
+              <th>Payment Status</th>
+              <th>Sub ID</th>
+              <th>Revenue Share</th>
+            </tr></thead>
+            <tbody id="revenue-tbody"><tr><td colspan="7" class="loading"><div class="spinner"></div><br>Loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header"><span class="panel-title">Revenue by Tier</span></div>
+        <div class="panel-body" style="padding:20px" id="tier-breakdown-body">
+          <div class="loading"><div class="spinner"></div><br>Loading…</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TEAM ACCESS TAB -->
+    <div id="tab-team" style="display:none">
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Invite Team Member</span>
+        </div>
+        <div class="invite-form">
+          <div class="field-group">
+            <div class="field-label">Name</div>
+            <input type="text" class="field-input" id="invite-name" placeholder="Team member name">
+          </div>
+          <div class="field-group">
+            <div class="field-label">Email</div>
+            <input type="email" class="field-input" id="invite-email" placeholder="their@email.com">
+          </div>
+          <button class="btn btn-blue" onclick="sendInvite()" style="margin-bottom:0">Send Invite</button>
+        </div>
+        <div class="invite-result hidden" id="invite-result">
+          <span id="invite-result-url" style="flex:1"></span>
+          <button class="btn btn-ghost btn-sm" onclick="copyInviteLink()">Copy Link</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Active Team Members</span>
+          <button class="refresh-btn" onclick="loadInvitees()" title="Refresh">&#x21BB;</button>
+        </div>
+        <div class="panel-body tbl-wrap">
+          <table id="invitees-table">
+            <thead><tr>
+              <th>Name</th>
+              <th>Email</th>
+              <th>Role</th>
+              <th>Since</th>
+              <th></th>
+            </tr></thead>
+            <tbody id="invitees-tbody">
+              <tr><td colspan="5" class="loading"><div class="spinner"></div><br>Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ACTIVITY TAB -->
+    <div id="tab-activity" style="display:none">
+      <div class="panel">
+        <div class="panel-header"><span class="panel-title">Recent Signups</span></div>
+        <div class="panel-body tbl-wrap">
+          <table>
+            <thead><tr>
+              <th>Name</th>
+              <th>AI Name</th>
+              <th>Tier</th>
+              <th>Status</th>
+              <th>First Seen</th>
+              <th>Onboarded</th>
+            </tr></thead>
+            <tbody id="recent-signups-tbody"><tr><td colspan="6" class="loading"><div class="spinner"></div><br>Loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header"><span class="panel-title">Recent Activity Timeline</span></div>
+        <div class="panel-body" style="padding:20px" id="timeline-body">
+          <div class="loading"><div class="spinner"></div><br>Loading…</div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ── State ──
+let TOKEN = localStorage.getItem('pb_admin_token') || localStorage.getItem('portal_token') || '';
+const BASE = window.location.origin;
+let allClients = [];
+let filteredClients = [];
+let clientSortCol = 'first_seen_at';
+let clientSortDir = 'desc';
+
+// ── Viewer token from URL ──
+const urlParams = new URLSearchParams(window.location.search);
+const VIEWER_TOKEN = urlParams.get('admin_token') || '';
+const IS_VIEWER = !!VIEWER_TOKEN;
+
+// ── Auth ──
+function doAuth() {
+  const t = document.getElementById('token-input').value.trim();
+  if (!t) return;
+  TOKEN = t;
+  verifyToken();
+}
+document.getElementById('token-input').addEventListener('keydown', e => { if (e.key === 'Enter') doAuth(); });
+
+async function verifyToken() {
+  try {
+    const r = await apiFetch('/api/status');
+    if (r.ok) {
+      localStorage.setItem('pb_admin_token', TOKEN);
+      enterApp();
+    } else {
+      document.getElementById('auth-err').textContent = 'Invalid token — check your portal bearer token';
+    }
+  } catch(e) {
+    document.getElementById('auth-err').textContent = 'Connection error: ' + e.message;
+  }
+}
+
+function enterApp() {
+  document.getElementById('auth-gate').classList.add('hidden');
+  document.getElementById('app').classList.add('visible');
+  if (IS_VIEWER) {
+    // Hide write-only UI for viewers
+    document.querySelectorAll('.viewer-hide').forEach(el => el.style.display = 'none');
+  }
+  loadAll();
+}
+
+// Auto-enter if viewer token present — skip bearer auth gate entirely
+if (VIEWER_TOKEN) {
+  // Verify the viewer token works by testing the API
+  fetch(BASE + '/api/admin/clients?admin_token=' + encodeURIComponent(VIEWER_TOKEN))
+    .then(r => {
+      if (r.ok) {
+        enterApp();
+      } else {
+        document.getElementById('auth-err').textContent = 'Invalid or expired access link. Please request a new one.';
+      }
+    })
+    .catch(() => {
+      document.getElementById('auth-err').textContent = 'Connection error — please try again.';
+    });
+}
+
+function logout() {
+  localStorage.removeItem('pb_admin_token');
+  TOKEN = '';
+  document.getElementById('app').classList.remove('visible');
+  document.getElementById('auth-gate').classList.remove('hidden');
+  document.getElementById('token-input').value = '';
+  document.getElementById('auth-err').textContent = '';
+}
+
+// ── API helper ──
+async function apiFetch(path, opts = {}) {
+  const headers = TOKEN ? { 'Authorization': 'Bearer ' + TOKEN, ...(opts.headers || {}) } : { ...(opts.headers || {}) };
+  if (opts.body && typeof opts.body === 'object') {
+    headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(opts.body);
+  }
+  // Append viewer token to URL if no bearer token
+  let url = BASE + path;
+  if (!TOKEN && VIEWER_TOKEN) {
+    const sep = path.includes('?') ? '&' : '?';
+    url += sep + 'admin_token=' + encodeURIComponent(VIEWER_TOKEN);
+  }
+  return fetch(url, { ...opts, headers });
+}
+
+// ── Toast ──
+let toastTimer;
+function toast(msg, type = 'success') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show ' + type;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.className = '', 3500);
+}
+
+// ── Tabs ──
+function switchTab(btn, name) {
+  document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  ['clients','revenue','activity','team'].forEach(t => {
+    document.getElementById('tab-' + t).style.display = t === name ? '' : 'none';
+  });
+  if (name === 'team') loadInvitees();
+}
+
+// ── Load all ──
+async function loadAll() {
+  await loadClients();
+}
+
+// ── Load clients ──
+async function loadClients() {
+  try {
+    const r = await apiFetch('/api/admin/clients');
+    if (!r.ok) { toast('Failed to load clients', 'error'); return; }
+    const data = await r.json();
+    allClients = data.clients || [];
+    updateStats(data.stats || {});
+    applyFilters();
+    renderRevenue();
+    renderActivity();
+  } catch(e) {
+    toast('Error loading clients: ' + e.message, 'error');
+  }
+}
+
+// ── Stats ──
+function updateStats(stats) {
+  document.getElementById('s-total').textContent     = stats.total ?? allClients.length;
+  document.getElementById('s-active').textContent    = stats.active ?? 0;
+  document.getElementById('s-onboarding').textContent = stats.onboarding ?? 0;
+  document.getElementById('s-churned').textContent   = stats.churned ?? 0;
+  document.getElementById('s-revenue').textContent   = '$' + (stats.total_revenue ?? 0).toFixed(2);
+  document.getElementById('s-mrr').textContent       = '$' + (stats.mrr ?? 0).toFixed(2);
+  document.getElementById('client-count').textContent = allClients.length + ' total';
+}
+
+// ── Filters ──
+function applyFilters() {
+  const q     = document.getElementById('search-input').value.toLowerCase();
+  const tier  = document.getElementById('filter-tier').value.toLowerCase();
+  const status = document.getElementById('filter-status').value.toLowerCase();
+  const pay   = document.getElementById('filter-pay').value.toLowerCase();
+
+  filteredClients = allClients.filter(c => {
+    if (q) {
+      const haystack = [c.name, c.email, c.company, c.ai_name, c.goes_by].join(' ').toLowerCase();
+      if (!haystack.includes(q)) return false;
+    }
+    if (tier   && (c.tier   || '').toLowerCase() !== tier)   return false;
+    if (status && (c.status || '').toLowerCase() !== status) return false;
+    if (pay    && (c.payment_status || '').toLowerCase() !== pay) return false;
+    return true;
+  });
+
+  sortAndRenderClients();
+}
+
+// ── Sort ──
+function sortClients(col, th) {
+  if (clientSortCol === col) {
+    clientSortDir = clientSortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    clientSortCol = col;
+    clientSortDir = 'asc';
+  }
+  document.querySelectorAll('#clients-table th').forEach(h => h.classList.remove('sort-asc','sort-desc'));
+  if (th) th.classList.add('sort-' + clientSortDir);
+  sortAndRenderClients();
+}
+
+function sortAndRenderClients() {
+  const col = clientSortCol;
+  const dir = clientSortDir;
+  const data = [...filteredClients].sort((a, b) => {
+    let va = a[col] ?? '';
+    let vb = b[col] ?? '';
+    if (col === 'total_paid') { va = Number(va) || 0; vb = Number(vb) || 0; }
+    else { va = String(va).toLowerCase(); vb = String(vb).toLowerCase(); }
+    return dir === 'asc' ? (va > vb ? 1 : va < vb ? -1 : 0) : (va < vb ? 1 : va > vb ? -1 : 0);
+  });
+  renderClientsTable(data);
+}
+
+// ── Render clients table ──
+function renderClientsTable(data) {
+  const tbody = document.getElementById('clients-tbody');
+  if (data.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="11" class="empty">No clients found — try adjusting filters or importing data</td></tr>';
+    return;
+  }
+  tbody.innerHTML = data.map((c, i) => `
+    <tr>
+      <td><strong>${esc(c.name || '—')}</strong>${c.goes_by && c.goes_by !== c.name ? `<br><span style="color:var(--text-dim);font-size:11px">goes by: ${esc(c.goes_by)}</span>` : ''}</td>
+      <td style="color:var(--blue);font-weight:600">${esc(c.ai_name || '—')}</td>
+      <td style="color:var(--text-dim);font-size:12px">${esc(c.email)}</td>
+      <td>${esc(c.company || '—')}</td>
+      <td><span class="tier-chip tier-${(c.tier||'unknown').toLowerCase()}">${esc(c.tier || 'Unknown')}</span></td>
+      <td><span class="status-chip status-${(c.status||'unknown').toLowerCase()}">${esc(c.status || 'unknown')}</span></td>
+      <td><span class="pay-chip pay-${(c.payment_status||'none').toLowerCase()}">${payLabel(c.payment_status)}</span></td>
+      <td style="color:var(--orange);font-weight:600">${c.total_paid > 0 ? '$' + Number(c.total_paid).toFixed(2) : '<span style="color:var(--text-dim)">$0</span>'}</td>
+      <td style="color:var(--text-dim);font-size:12px">${fmtDate(c.first_seen_at)}</td>
+      <td style="color:var(--text-dim);font-size:12px">${fmtDate(c.last_active_at)}</td>
+      <td><button class="btn btn-ghost btn-sm" onclick="toggleExpand('c-${i}')">Details &#x25BE;</button></td>
+    </tr>
+    <tr class="expand-row" id="expand-c-${i}" style="display:none">
+      <td colspan="11">
+        <div class="expand-inner">
+          ${renderClientDetail(c, i)}
+        </div>
+      </td>
+    </tr>`).join('');
+}
+
+function payLabel(ps) {
+  const map = { 'paid': 'Paid', 'subscription_active': 'Sub Active', 'subscription_cancelled': 'Sub Cancelled', 'none': 'None' };
+  return map[ps] || esc(ps || 'None');
+}
+
+function renderClientDetail(c, i) {
+  const readOnlyFields = [
+    ['Referral Code', c.referral_code],
+    ['PayPal Sub ID', c.paypal_subscription_id],
+    ['Payment Count', c.payment_count],
+    ['Magic Link', c.magic_link_token ? '***set***' : null],
+    ['Onboarded', fmtDate(c.onboarded_at)],
+    ['Created', fmtDate(c.created_at)],
+  ].filter(([,v]) => v);
+
+  return `
+    <div class="detail-edit-grid">
+      <!-- Left: Core Identity -->
+      <div class="field-group">
+        <div class="field-label" style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Core Identity</div>
+        <div>
+          <div class="field-label">Name</div>
+          <input type="text" class="field-input" id="edit-name-${c.id}" value="${esc(c.name || '')}">
+        </div>
+        <div>
+          <div class="field-label">Goes By</div>
+          <input type="text" class="field-input" id="edit-goes_by-${c.id}" value="${esc(c.goes_by || '')}">
+        </div>
+        <div>
+          <div class="field-label">Email</div>
+          <input type="email" class="field-input" id="edit-email-${c.id}" value="${esc(c.email || '')}">
+        </div>
+        <div>
+          <div class="field-label">AI Name</div>
+          <input type="text" class="field-input" id="edit-ai_name-${c.id}" value="${esc(c.ai_name || '')}">
+        </div>
+        <div>
+          <div class="field-label">Company</div>
+          <input type="text" class="field-input" id="edit-company-${c.id}" value="${esc(c.company || '')}">
+        </div>
+      </div>
+
+      <!-- Right: Classification -->
+      <div class="field-group">
+        <div class="field-label" style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Classification</div>
+        <div>
+          <div class="field-label">Role</div>
+          <input type="text" class="field-input" id="edit-role-${c.id}" value="${esc(c.role || '')}">
+        </div>
+        <div>
+          <div class="field-label">Goal</div>
+          <input type="text" class="field-input" id="edit-goal-${c.id}" value="${esc(c.goal || '')}">
+        </div>
+        <div>
+          <div class="field-label">Tier</div>
+          <select class="field-select" id="edit-tier-${c.id}">
+            <option value="awakened"  ${(c.tier||'').toLowerCase()==='awakened'  ?'selected':''}>Awakened</option>
+            <option value="bonded"    ${(c.tier||'').toLowerCase()==='bonded'    ?'selected':''}>Bonded</option>
+            <option value="partnered" ${(c.tier||'').toLowerCase()==='partnered' ?'selected':''}>Partnered</option>
+            <option value="brainiac"  ${(c.tier||'').toLowerCase()==='brainiac'  ?'selected':''}>Brainiac</option>
+            <option value="unknown"   ${(c.tier||'').toLowerCase()==='unknown' || !c.tier ?'selected':''}>Unknown</option>
+          </select>
+        </div>
+        <div>
+          <div class="field-label">Status</div>
+          <select class="field-select" id="edit-status-${c.id}">
+            <option value="active"     ${c.status==='active'     ?'selected':''}>Active</option>
+            <option value="onboarding" ${c.status==='onboarding' ?'selected':''}>Onboarding</option>
+            <option value="trial"      ${c.status==='trial'      ?'selected':''}>Trial</option>
+            <option value="churned"    ${c.status==='churned'    ?'selected':''}>Churned</option>
+          </select>
+        </div>
+        <div>
+          <div class="field-label">Notes</div>
+          <textarea class="field-textarea" id="edit-notes-${c.id}" rows="3" placeholder="Add notes about this client…">${esc(c.notes || '')}</textarea>
+        </div>
+      </div>
+    </div>
+
+    <!-- Read-only metadata -->
+    ${readOnlyFields.length > 0 ? `
+    <div style="margin-bottom:14px;padding:10px 14px;background:var(--bg);border:1px solid var(--border);border-radius:6px;display:flex;flex-wrap:wrap;gap:16px">
+      ${readOnlyFields.map(([k,v]) => `<div><span style="color:var(--text-dim);font-size:11px">${esc(k)}: </span><span style="font-size:12px;font-family:monospace">${esc(String(v))}</span></div>`).join('')}
+    </div>` : ''}
+
+    <button class="btn btn-blue btn-sm" onclick="saveClient(${c.id})">Save Changes</button>`;
+}
+
+function toggleExpand(id) {
+  const row = document.getElementById('expand-' + id);
+  if (row) row.style.display = row.style.display === 'none' ? '' : 'none';
+}
+
+// ── Save client ──
+async function saveClient(clientId) {
+  const get = id => document.getElementById(id)?.value ?? null;
+  const payload = {
+    id:       clientId,
+    name:     get(`edit-name-${clientId}`),
+    goes_by:  get(`edit-goes_by-${clientId}`),
+    email:    get(`edit-email-${clientId}`),
+    ai_name:  get(`edit-ai_name-${clientId}`),
+    company:  get(`edit-company-${clientId}`),
+    role:     get(`edit-role-${clientId}`),
+    goal:     get(`edit-goal-${clientId}`),
+    tier:     get(`edit-tier-${clientId}`),
+    status:   get(`edit-status-${clientId}`),
+    notes:    get(`edit-notes-${clientId}`),
+  };
+  // Remove null fields
+  Object.keys(payload).forEach(k => { if (payload[k] === null) delete payload[k]; });
+
+  const r = await apiFetch('/api/admin/clients/update', { method: 'POST', body: payload });
+  if (r.ok) {
+    toast('Client saved');
+    // Update local cache
+    const client = allClients.find(c => c.id === clientId);
+    if (client) {
+      Object.assign(client, payload);
+      delete client.id; // don't overwrite with string
+      client.id = clientId;
+    }
+    applyFilters();
+  } else {
+    const d = await r.json().catch(() => ({}));
+    toast('Save failed: ' + (d.error || 'unknown'), 'error');
+  }
+}
+
+// ── Import data ──
+async function importData() {
+  toast('Importing data from logs…', 'info');
+  const r = await apiFetch('/api/admin/clients/import', { method: 'POST', body: {} });
+  if (r.ok) {
+    const d = await r.json();
+    toast(`Import complete: ${d.imported ?? 0} imported, ${d.updated ?? 0} updated`);
+    await loadClients();
+  } else {
+    const d = await r.json().catch(() => ({}));
+    toast('Import failed: ' + (d.error || 'unknown'), 'error');
+  }
+}
+
+// ── Export CSV ──
+function exportCSV() {
+  const cols = ['id','name','goes_by','email','ai_name','company','role','goal','tier','status','payment_status','total_paid','payment_count','referral_code','first_seen_at','last_active_at','onboarded_at','notes'];
+  const header = cols.join(',');
+  const rows = filteredClients.map(c =>
+    cols.map(col => {
+      const v = String(c[col] ?? '');
+      return v.includes(',') || v.includes('"') || v.includes('\n') ? '"' + v.replace(/"/g, '""') + '"' : v;
+    }).join(',')
+  );
+  const csv = [header, ...rows].join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url;
+  a.download = 'purebrain-clients-' + new Date().toISOString().slice(0,10) + '.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+  toast('CSV exported (' + filteredClients.length + ' rows)');
+}
+
+// ── Revenue tab ──
+function renderRevenue() {
+  const sorted = [...allClients].sort((a,b) => (Number(b.total_paid)||0) - (Number(a.total_paid)||0));
+  const maxPaid = Math.max(...sorted.map(c => Number(c.total_paid)||0), 1);
+
+  const tbody = document.getElementById('revenue-tbody');
+  if (sorted.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">No clients yet</td></tr>';
+  } else {
+    tbody.innerHTML = sorted.map(c => {
+      const paid = Number(c.total_paid) || 0;
+      const pct  = Math.round(paid / maxPaid * 100);
+      return `<tr>
+        <td><strong>${esc(c.name || '—')}</strong><br><span style="color:var(--text-dim);font-size:11px">${esc(c.email)}</span></td>
+        <td><span class="tier-chip tier-${(c.tier||'unknown').toLowerCase()}">${esc(c.tier || '—')}</span></td>
+        <td style="color:var(--orange);font-weight:700">$${paid.toFixed(2)}</td>
+        <td style="text-align:center">${c.payment_count || 0}</td>
+        <td><span class="pay-chip pay-${(c.payment_status||'none').toLowerCase()}">${payLabel(c.payment_status)}</span></td>
+        <td style="color:var(--text-dim);font-size:11px;font-family:monospace">${esc(c.paypal_subscription_id || '—')}</td>
+        <td style="min-width:120px">
+          <div class="rev-bar-wrap">
+            <div class="rev-bar-bg"><div class="rev-bar-fill" style="width:${pct}%"></div></div>
+            <span style="font-size:11px;color:var(--text-dim);width:36px;text-align:right">${pct}%</span>
+          </div>
+        </td>
+      </tr>`;
+    }).join('');
+  }
+
+  // Tier breakdown
+  const tiers = {};
+  allClients.forEach(c => {
+    const t = (c.tier || 'unknown').toLowerCase();
+    if (!tiers[t]) tiers[t] = { count: 0, revenue: 0 };
+    tiers[t].count++;
+    tiers[t].revenue += Number(c.total_paid) || 0;
+  });
+  const tierContainer = document.getElementById('tier-breakdown-body');
+  const tierEntries = Object.entries(tiers).sort((a,b) => b[1].revenue - a[1].revenue);
+  if (tierEntries.length === 0) {
+    tierContainer.innerHTML = '<div class="empty">No data yet</div>';
+  } else {
+    const maxRev = Math.max(...tierEntries.map(([,v]) => v.revenue), 1);
+    tierContainer.innerHTML = tierEntries.map(([tier, d]) => `
+      <div style="display:flex;align-items:center;gap:16px;padding:12px 0;border-bottom:1px solid var(--border)">
+        <div style="width:90px"><span class="tier-chip tier-${tier}">${tier}</span></div>
+        <div style="flex:1">
+          <div style="font-size:12px;color:var(--text-dim);margin-bottom:4px">${d.count} client${d.count!==1?'s':''} · $${d.revenue.toFixed(2)}</div>
+          <div class="rev-bar-wrap">
+            <div class="rev-bar-bg"><div class="rev-bar-fill" style="width:${Math.round(d.revenue/maxRev*100)}%"></div></div>
+          </div>
+        </div>
+        <div style="font-size:20px;font-weight:800;color:var(--orange)">$${d.revenue.toFixed(0)}</div>
+      </div>`).join('');
+  }
+}
+
+// ── Activity tab ──
+function renderActivity() {
+  // Recent signups
+  const recent = [...allClients]
+    .sort((a,b) => new Date(b.first_seen_at||0) - new Date(a.first_seen_at||0))
+    .slice(0, 20);
+
+  const signupsTbody = document.getElementById('recent-signups-tbody');
+  if (recent.length === 0) {
+    signupsTbody.innerHTML = '<tr><td colspan="6" class="empty">No clients yet</td></tr>';
+  } else {
+    signupsTbody.innerHTML = recent.map(c => `<tr>
+      <td><strong>${esc(c.name || '—')}</strong></td>
+      <td style="color:var(--blue)">${esc(c.ai_name || '—')}</td>
+      <td><span class="tier-chip tier-${(c.tier||'unknown').toLowerCase()}">${esc(c.tier||'—')}</span></td>
+      <td><span class="status-chip status-${(c.status||'unknown').toLowerCase()}">${esc(c.status||'—')}</span></td>
+      <td style="color:var(--text-dim);font-size:12px">${fmtDate(c.first_seen_at)}</td>
+      <td style="color:var(--text-dim);font-size:12px">${fmtDate(c.onboarded_at)}</td>
+    </tr>`).join('');
+  }
+
+  // Timeline — build synthetic events from client data
+  const events = [];
+  allClients.forEach(c => {
+    if (c.first_seen_at) events.push({ ts: c.first_seen_at, type: 'signup',   label: `${c.name || c.email} signed up`, sub: `${c.tier || 'unknown'} tier`, color: 'dot-blue' });
+    if (c.onboarded_at)  events.push({ ts: c.onboarded_at,  type: 'onboard',  label: `${c.name || c.email} onboarded`,  sub: c.ai_name ? `AI: ${c.ai_name}` : '', color: 'dot-green' });
+    if (c.total_paid > 0 && c.first_seen_at) events.push({ ts: c.first_seen_at, type: 'payment', label: `$${Number(c.total_paid).toFixed(2)} from ${c.name || c.email}`, sub: c.tier || '', color: 'dot-orange' });
+  });
+  events.sort((a,b) => new Date(b.ts) - new Date(a.ts));
+  const recentEvents = events.slice(0, 30);
+
+  const timelineEl = document.getElementById('timeline-body');
+  if (recentEvents.length === 0) {
+    timelineEl.innerHTML = '<div class="empty">No activity yet — import data to populate</div>';
+  } else {
+    timelineEl.innerHTML = recentEvents.map(e => `
+      <div class="timeline-item">
+        <div class="timeline-dot ${e.color}"></div>
+        <div>
+          <div style="font-size:13px;font-weight:500">${esc(e.label)}</div>
+          ${e.sub ? `<div style="font-size:11px;color:var(--text-dim)">${esc(e.sub)}</div>` : ''}
+          <div style="font-size:11px;color:var(--text-dim);margin-top:2px">${fmtDate(e.ts)}</div>
+        </div>
+      </div>`).join('');
+  }
+}
+
+// ── Helpers ──
+function esc(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function fmtDate(d) {
+  if (!d) return '—';
+  try { return new Date(d).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }); }
+  catch(e) { return String(d); }
+}
+
+// ── Team Access ──
+let lastInviteLink = '';
+let cachedInvitees = [];
+
+async function sendInvite() {
+  const name  = document.getElementById('invite-name').value.trim();
+  const email = document.getElementById('invite-email').value.trim();
+  if (!email) { toast('Email is required', 'error'); return; }
+
+  const r = await apiFetch('/api/admin/invite', { method: 'POST', body: { name, email } });
+  const d = await r.json().catch(() => ({}));
+  if (r.ok) {
+    toast('Invite sent — share the link below');
+    lastInviteLink = d.dashboard_url || '';
+    const resultEl = document.getElementById('invite-result');
+    document.getElementById('invite-result-url').textContent = lastInviteLink;
+    resultEl.classList.remove('hidden');
+    document.getElementById('invite-name').value = '';
+    document.getElementById('invite-email').value = '';
+    loadInvitees();
+  } else {
+    toast('Invite failed: ' + (d.error || 'unknown'), 'error');
+  }
+}
+
+function copyInviteLink() {
+  if (!lastInviteLink) return;
+  navigator.clipboard.writeText(lastInviteLink).then(() => toast('Link copied!')).catch(() => {
+    // Fallback
+    const el = document.createElement('textarea');
+    el.value = lastInviteLink;
+    document.body.appendChild(el);
+    el.select();
+    document.execCommand('copy');
+    document.body.removeChild(el);
+    toast('Link copied!');
+  });
+}
+
+async function loadInvitees() {
+  const tbody = document.getElementById('invitees-tbody');
+  if (!tbody) return;
+  tbody.innerHTML = '<tr><td colspan="5" class="loading"><div class="spinner"></div><br>Loading…</td></tr>';
+  const r = await apiFetch('/api/admin/invites');
+  if (!r.ok) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">Failed to load team members</td></tr>';
+    return;
+  }
+  const d = await r.json();
+  const invitees = d.invitees || [];
+  cachedInvitees = invitees;
+  if (invitees.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">No team members yet — invite someone above</td></tr>';
+    return;
+  }
+  tbody.innerHTML = invitees.map(inv => {
+    const link = `${window.location.origin}/admin/clients?admin_token=${encodeURIComponent(inv.token || '')}`;
+    return `<tr>
+      <td><strong>${esc(inv.name || '—')}</strong></td>
+      <td style="color:var(--text-dim);font-size:12px">${esc(inv.email)}</td>
+      <td><span class="badge" style="text-transform:capitalize">${esc(inv.role || 'viewer')}</span></td>
+      <td style="color:var(--text-dim);font-size:12px">${fmtDate(inv.created_at)}</td>
+      <td style="display:flex;gap:6px">
+        <button class="btn btn-ghost btn-sm" onclick="copyInviteeLink(${inv.id})">Copy Link</button>
+        <button class="btn btn-red btn-sm" onclick="revokeInvitee(${inv.id}, this)">Revoke</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+// Store invitee tokens by id for copy
+const _inviteeTokens = {};
+
+function copyInviteeLink(id) {
+  const inv = cachedInvitees.find(x => x.id === id);
+  if (!inv || !inv.token) { toast('Token not found — refresh the list', 'error'); return; }
+  const link = `${window.location.origin}/admin/clients?admin_token=${encodeURIComponent(inv.token)}`;
+  navigator.clipboard.writeText(link).then(() => toast('Link copied!')).catch(() => toast('Copy failed', 'error'));
+}
+
+async function revokeInvitee(id, btn) {
+  if (!confirm('Revoke this team member\'s access?')) return;
+  btn.disabled = true;
+  const r = await apiFetch('/api/admin/invite/revoke', { method: 'POST', body: { id } });
+  if (r.ok) {
+    toast('Access revoked');
+    loadInvitees();
+  } else {
+    const d = await r.json().catch(() => ({}));
+    toast('Revoke failed: ' + (d.error || 'unknown'), 'error');
+    btn.disabled = false;
+  }
+}
+
+// ── Boot ──
+window.addEventListener('DOMContentLoaded', () => {
+  // If viewer token, the auto-enter logic above handles it — don't double-enter
+  if (TOKEN && !VIEWER_TOKEN) {
+    enterApp();
+  }
+});
+
+// Auto-refresh every 30 seconds
+setInterval(loadAll, 30000);
+</script>
+</body>
+</html>

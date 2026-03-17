@@ -1,0 +1,831 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PUREBRAIN Referral Admin</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #080a12;
+    --bg2:       #0d1120;
+    --bg3:       #131929;
+    --border:    #1e2a40;
+    --blue:      #2a93c1;
+    --blue-dim:  #1c6a8f;
+    --orange:    #f1420b;
+    --orange-dim:#b03209;
+    --text:      #e8edf5;
+    --text-dim:  #7a8aaa;
+    --green:     #22c55e;
+    --yellow:    #f59e0b;
+    --red:       #ef4444;
+  }
+
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+
+  /* ── Auth Gate ── */
+  #auth-gate {
+    position: fixed; inset: 0;
+    background: var(--bg);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 9999;
+  }
+  #auth-gate.hidden { display: none; }
+  .auth-box {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 40px;
+    width: 100%;
+    max-width: 420px;
+    text-align: center;
+  }
+  .auth-box .logo { font-size: 24px; font-weight: 700; margin-bottom: 8px; }
+  .auth-box .logo .blue  { color: var(--blue); }
+  .auth-box .logo .orange { color: var(--orange); }
+  .auth-box p { color: var(--text-dim); margin-bottom: 24px; font-size: 13px; }
+  .auth-box input {
+    width: 100%;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    padding: 10px 14px;
+    font-size: 14px;
+    margin-bottom: 12px;
+    outline: none;
+  }
+  .auth-box input:focus { border-color: var(--blue); }
+  .auth-box .err { color: var(--red); font-size: 12px; margin-bottom: 8px; min-height: 16px; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    padding: 10px 20px;
+    border-radius: 8px;
+    border: none;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+    transition: opacity .15s, transform .1s;
+  }
+  .btn:hover { opacity: .88; }
+  .btn:active { transform: scale(.97); }
+  .btn-blue    { background: var(--blue);    color: #fff; }
+  .btn-orange  { background: var(--orange);  color: #fff; }
+  .btn-ghost   { background: var(--bg3);     color: var(--text); border: 1px solid var(--border); }
+  .btn-green   { background: var(--green);   color: #000; }
+  .btn-sm      { padding: 6px 12px; font-size: 12px; }
+  .btn-full    { width: 100%; }
+
+  /* ── Layout ── */
+  #app { display: none; flex-direction: column; min-height: 100vh; }
+  #app.visible { display: flex; }
+
+  header {
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+    height: 56px;
+    display: flex; align-items: center; justify-content: space-between;
+    position: sticky; top: 0; z-index: 100;
+  }
+  .header-logo { font-size: 18px; font-weight: 700; }
+  .header-logo .blue   { color: var(--blue); }
+  .header-logo .orange { color: var(--orange); }
+  .header-right { display: flex; align-items: center; gap: 12px; }
+  .header-link {
+    font-size: 12px; color: var(--text-dim); text-decoration: none;
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px 10px;
+    transition: color .15s, border-color .15s;
+  }
+  .header-link:hover { color: var(--blue); border-color: var(--blue); }
+  .badge {
+    display: inline-flex; align-items: center;
+    background: var(--bg3); border: 1px solid var(--border);
+    border-radius: 20px; padding: 3px 10px;
+    font-size: 11px; color: var(--text-dim);
+  }
+  .badge .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--green); margin-right: 6px;
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: .4; }
+  }
+
+  main { flex: 1; padding: 24px; max-width: 1400px; margin: 0 auto; width: 100%; }
+
+  /* ── Tabs ── */
+  .tabs {
+    display: flex; gap: 4px;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 4px;
+    margin-bottom: 24px;
+    width: fit-content;
+  }
+  .tab {
+    padding: 8px 18px;
+    border-radius: 7px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-dim);
+    transition: all .15s;
+    border: none; background: transparent;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { background: var(--blue); color: #fff; }
+
+  /* ── Cards / Stats ── */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+  }
+  .stat-label { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 8px; }
+  .stat-value { font-size: 28px; font-weight: 700; }
+  .stat-value.blue   { color: var(--blue); }
+  .stat-value.orange { color: var(--orange); }
+  .stat-value.green  { color: var(--green); }
+  .stat-value.yellow { color: var(--yellow); }
+
+  /* ── Panels ── */
+  .panel {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    margin-bottom: 24px;
+  }
+  .panel-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  .panel-title { font-size: 14px; font-weight: 600; }
+  .panel-body  { padding: 0; }
+
+  /* ── Table ── */
+  .tbl-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  thead { background: var(--bg3); }
+  th {
+    padding: 10px 16px;
+    text-align: left;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--text-dim);
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+  }
+  th:hover { color: var(--text); }
+  th.sort-asc::after  { content: " ▲"; font-size: 9px; }
+  th.sort-desc::after { content: " ▼"; font-size: 9px; }
+  td {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    vertical-align: middle;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(42,147,193,.04); }
+  .expand-row td { padding: 0; border-bottom: 1px solid var(--border); }
+  .expand-inner { padding: 16px 20px; background: var(--bg3); }
+
+  .code-chip {
+    display: inline-block;
+    background: rgba(42,147,193,.15);
+    color: var(--blue);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .status-chip {
+    display: inline-block;
+    border-radius: 20px;
+    padding: 2px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .status-pending  { background: rgba(245,158,11,.15); color: var(--yellow); }
+  .status-paid     { background: rgba(34,197,94,.15);  color: var(--green); }
+  .status-completed { background: rgba(34,197,94,.15); color: var(--green); }
+  .status-processing { background: rgba(42,147,193,.15); color: var(--blue); }
+
+  .paypal-link { color: var(--blue); text-decoration: none; font-size: 12px; }
+  .paypal-link:hover { text-decoration: underline; }
+
+  /* ── Leaderboard bars ── */
+  .lb-bar-wrap { display: flex; align-items: center; gap: 10px; }
+  .lb-bar-bg { flex: 1; height: 6px; background: var(--bg3); border-radius: 3px; overflow: hidden; }
+  .lb-bar-fill { height: 100%; background: var(--blue); border-radius: 3px; transition: width .4s; }
+  .lb-rank { font-size: 18px; font-weight: 800; color: var(--text-dim); width: 28px; text-align: right; }
+  .lb-rank.gold   { color: #f59e0b; }
+  .lb-rank.silver { color: #94a3b8; }
+  .lb-rank.bronze { color: #cd7f32; }
+
+  /* ── Payout form inline ── */
+  .notes-input {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 6px 10px;
+    font-size: 12px;
+    width: 200px;
+    outline: none;
+  }
+  .notes-input:focus { border-color: var(--blue); }
+
+  /* ── Loading / Empty ── */
+  .loading { text-align: center; padding: 40px; color: var(--text-dim); }
+  .spinner {
+    display: inline-block;
+    width: 24px; height: 24px;
+    border: 2px solid var(--border);
+    border-top-color: var(--blue);
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+    margin-bottom: 10px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .empty { text-align: center; padding: 40px; color: var(--text-dim); font-size: 13px; }
+
+  /* ── Toast ── */
+  #toast {
+    position: fixed; bottom: 24px; right: 24px;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 20px;
+    font-size: 13px;
+    max-width: 320px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.4);
+    transition: opacity .25s, transform .25s;
+    opacity: 0; transform: translateY(10px);
+    pointer-events: none;
+    z-index: 999;
+  }
+  #toast.show { opacity: 1; transform: translateY(0); }
+  #toast.success { border-left: 3px solid var(--green); }
+  #toast.error   { border-left: 3px solid var(--red); }
+
+  /* ── Refresh btn pulse ── */
+  .refresh-btn { cursor: pointer; color: var(--text-dim); font-size: 18px; border: none; background: none; transition: transform .3s; }
+  .refresh-btn:hover { color: var(--text); transform: rotate(180deg); }
+
+  @media (max-width: 640px) {
+    main { padding: 16px; }
+    .stats-grid { grid-template-columns: 1fr 1fr; }
+    header { padding: 0 16px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Auth Gate -->
+<div id="auth-gate">
+  <div class="auth-box">
+    <div class="logo"><span class="blue">PUREBR</span><span class="orange">AI</span><span class="blue">N</span></div>
+    <p>Referral Admin — Enter your portal token to continue</p>
+    <input type="password" id="token-input" placeholder="Portal bearer token" autocomplete="off">
+    <div class="err" id="auth-err"></div>
+    <button class="btn btn-blue btn-full" onclick="doAuth()">Unlock Admin</button>
+  </div>
+</div>
+
+<!-- Main App -->
+<div id="app">
+  <header>
+    <div class="header-logo"><span class="blue">PUREBR</span><span class="orange">AI</span><span class="blue">N</span> &nbsp;— Referral Admin &nbsp;<span style="font-size:11px;color:var(--text-dim);font-weight:400;">5% recurring commission model</span></div>
+    <div class="header-right">
+      <a class="header-link" href="/admin/clients">Client Dashboard &rarr;</a>
+      <div class="badge"><span class="dot"></span>Live</div>
+      <button class="refresh-btn" onclick="loadAll()" title="Refresh all data">↻</button>
+      <button class="btn btn-ghost btn-sm" onclick="logout()">Logout</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Tabs -->
+    <div class="tabs">
+      <button class="tab active" data-tab="overview" onclick="switchTab(this,'overview')">Overview</button>
+      <button class="tab" data-tab="affiliates" onclick="switchTab(this,'affiliates')">Affiliates</button>
+      <button class="tab" data-tab="payouts" onclick="switchTab(this,'payouts')">Payouts</button>
+      <button class="tab" data-tab="leaderboard" onclick="switchTab(this,'leaderboard')">Leaderboard</button>
+    </div>
+
+    <!-- OVERVIEW TAB -->
+    <div id="tab-overview">
+      <div class="stats-grid" id="stats-grid">
+        <div class="stat-card"><div class="stat-label">Total Affiliates</div><div class="stat-value blue" id="s-affiliates">—</div></div>
+        <div class="stat-card"><div class="stat-label">Total Clicks</div><div class="stat-value" id="s-clicks">—</div></div>
+        <div class="stat-card"><div class="stat-label">Conversions</div><div class="stat-value green" id="s-conversions">—</div></div>
+        <div class="stat-card"><div class="stat-label">Pending Referrals</div><div class="stat-value yellow" id="s-pending">—</div></div>
+        <div class="stat-card"><div class="stat-label">Total Earned</div><div class="stat-value orange" id="s-earned">—</div></div>
+        <div class="stat-card"><div class="stat-label">Paid Out</div><div class="stat-value green" id="s-paid">—</div></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header"><span class="panel-title">Recent Referrals Activity</span></div>
+        <div class="panel-body tbl-wrap">
+          <table id="recent-table">
+            <thead><tr>
+              <th>Affiliate</th>
+              <th>Referred</th>
+              <th>Status</th>
+              <th>Date</th>
+              <th>Earned</th>
+            </tr></thead>
+            <tbody id="recent-tbody"><tr><td colspan="5" class="loading"><div class="spinner"></div><br>Loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- AFFILIATES TAB -->
+    <div id="tab-affiliates" style="display:none">
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">All Affiliates</span>
+          <span class="badge" id="affiliate-count">—</span>
+        </div>
+        <div class="panel-body tbl-wrap">
+          <table id="affiliates-table">
+            <thead><tr>
+              <th onclick="sortTable('affiliates','name',this)">Name</th>
+              <th onclick="sortTable('affiliates','email',this)">Email</th>
+              <th onclick="sortTable('affiliates','code',this)">Code</th>
+              <th onclick="sortTable('affiliates','clicks',this)">Clicks</th>
+              <th onclick="sortTable('affiliates','completed',this)">Conversions</th>
+              <th onclick="sortTable('affiliates','earnings',this)">Earned</th>
+              <th>PayPal</th>
+              <th onclick="sortTable('affiliates','joined',this)">Joined</th>
+              <th></th>
+            </tr></thead>
+            <tbody id="affiliates-tbody"><tr><td colspan="9" class="loading"><div class="spinner"></div><br>Loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- PAYOUTS TAB -->
+    <div id="tab-payouts" style="display:none">
+      <div class="panel" style="margin-bottom:24px">
+        <div class="panel-header"><span class="panel-title">Pending Payout Requests</span></div>
+        <div class="panel-body tbl-wrap">
+          <table>
+            <thead><tr>
+              <th>Affiliate</th>
+              <th>Amount</th>
+              <th>PayPal</th>
+              <th>Requested</th>
+              <th>Notes</th>
+              <th>Action</th>
+            </tr></thead>
+            <tbody id="payouts-pending-tbody"><tr><td colspan="6" class="loading"><div class="spinner"></div><br>Loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header"><span class="panel-title">Paid / Completed</span></div>
+        <div class="panel-body tbl-wrap">
+          <table>
+            <thead><tr>
+              <th>Affiliate</th>
+              <th>Amount</th>
+              <th>PayPal</th>
+              <th>Requested</th>
+              <th>Paid At</th>
+              <th>Notes</th>
+            </tr></thead>
+            <tbody id="payouts-paid-tbody"><tr><td colspan="6" class="empty">No paid payouts yet</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- LEADERBOARD TAB -->
+    <div id="tab-leaderboard" style="display:none">
+      <div class="panel">
+        <div class="panel-header"><span class="panel-title">Top Affiliates by Conversions</span></div>
+        <div class="panel-body" style="padding:20px" id="leaderboard-body">
+          <div class="loading"><div class="spinner"></div><br>Loading…</div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ── State ──
+let TOKEN = localStorage.getItem('pb_admin_token') || localStorage.getItem('portal_token') || '';
+const BASE = window.location.origin; // same origin
+
+// Check for ?admin_token= in URL (read-only viewer access)
+const _urlParams = new URLSearchParams(window.location.search);
+const _adminToken = _urlParams.get('admin_token') || '';
+let IS_READONLY = false;
+
+if (_adminToken) {
+  TOKEN = '';  // viewer uses admin_token param, not bearer
+  IS_READONLY = true;
+}
+
+// ── Auth ──
+function doAuth() {
+  const t = document.getElementById('token-input').value.trim();
+  if (!t) return;
+  TOKEN = t;
+  IS_READONLY = false;
+  verifyToken();
+}
+document.getElementById('token-input').addEventListener('keydown', e => { if (e.key === 'Enter') doAuth(); });
+
+async function verifyToken() {
+  try {
+    const r = await apiFetch('/api/status');
+    if (r.ok) {
+      localStorage.setItem('pb_admin_token', TOKEN);
+      document.getElementById('auth-gate').classList.add('hidden');
+      document.getElementById('app').classList.add('visible');
+      if (IS_READONLY) {
+        document.querySelectorAll('.action-btn-write').forEach(el => el.style.display = 'none');
+        const banner = document.createElement('div');
+        banner.style.cssText = 'background:#1e2a40;color:#7a8aaa;text-align:center;padding:8px;font-size:12px;';
+        banner.textContent = 'Read-only view — action buttons are hidden';
+        document.getElementById('app').insertBefore(banner, document.getElementById('app').firstChild);
+      }
+      loadAll();
+    } else {
+      document.getElementById('auth-err').textContent = 'Invalid token — check your portal bearer token';
+    }
+  } catch(e) {
+    document.getElementById('auth-err').textContent = 'Connection error: ' + e.message;
+  }
+}
+
+function logout() {
+  localStorage.removeItem('pb_admin_token');
+  TOKEN = '';
+  document.getElementById('app').classList.remove('visible');
+  document.getElementById('auth-gate').classList.remove('hidden');
+  document.getElementById('token-input').value = '';
+  document.getElementById('auth-err').textContent = '';
+}
+
+// ── API helper ──
+async function apiFetch(path, opts = {}) {
+  let url = BASE + path;
+  if (_adminToken) {
+    // Viewer token — append as query param
+    const sep = url.includes('?') ? '&' : '?';
+    url += sep + 'admin_token=' + encodeURIComponent(_adminToken);
+  }
+  const headers = TOKEN ? { 'Authorization': 'Bearer ' + TOKEN, ...(opts.headers || {}) } : { ...(opts.headers || {}) };
+  if (opts.body && typeof opts.body === 'object') {
+    headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(opts.body);
+  }
+  return fetch(url, { ...opts, headers });
+}
+
+// ── Toast ──
+let toastTimer;
+function toast(msg, type = 'success') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show ' + type;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.className = '', 3000);
+}
+
+// ── Tabs ──
+function switchTab(btn, name) {
+  document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  ['overview','affiliates','payouts','leaderboard'].forEach(t => {
+    document.getElementById('tab-' + t).style.display = t === name ? '' : 'none';
+  });
+}
+
+// ── Sort state ──
+const sortState = {};
+function sortTable(tbl, col, th) {
+  const key = tbl + col;
+  const prev = sortState[key] || 'none';
+  const dir = prev === 'asc' ? 'desc' : 'asc';
+  sortState[key] = dir;
+  document.querySelectorAll(`#tab-${tbl === 'affiliates' ? 'affiliates' : tbl} th`).forEach(h => {
+    h.classList.remove('sort-asc','sort-desc');
+  });
+  th.classList.add('sort-' + dir);
+  renderAffiliates(col, dir);
+}
+
+// ── Data cache ──
+let allAffiliates = [];
+let allPayouts = [];
+let allLeaderboard = [];
+
+// ── Load everything ──
+async function loadAll() {
+  await Promise.all([ loadAffiliates(), loadPayouts(), loadLeaderboard() ]);
+}
+
+// ── Affiliates ──
+async function loadAffiliates() {
+  try {
+    const r = await apiFetch('/api/admin/affiliates');
+    if (!r.ok) { toast('Failed to load affiliates', 'error'); return; }
+    const data = await r.json();
+    allAffiliates = data.affiliates || [];
+    updateOverview(data);
+    renderAffiliates();
+  } catch(e) {
+    toast('Error loading affiliates: ' + e.message, 'error');
+  }
+}
+
+function updateOverview(data) {
+  document.getElementById('s-affiliates').textContent = allAffiliates.length;
+  const totalClicks = allAffiliates.reduce((s,a) => s + (a.clicks||0), 0);
+  const totalConv   = allAffiliates.reduce((s,a) => s + (a.completed||0), 0);
+  const totalPend   = allAffiliates.reduce((s,a) => s + (a.pending||0), 0);
+  const totalEarn   = allAffiliates.reduce((s,a) => s + (a.earnings||0), 0);
+  document.getElementById('s-clicks').textContent      = totalClicks;
+  document.getElementById('s-conversions').textContent = totalConv;
+  document.getElementById('s-pending').textContent     = totalPend;
+  document.getElementById('s-earned').textContent      = '$' + totalEarn.toFixed(2);
+  document.getElementById('affiliate-count').textContent = allAffiliates.length + ' total';
+
+  // Recent activity from all history
+  let allHistory = [];
+  allAffiliates.forEach(a => {
+    (a.history || []).forEach(h => allHistory.push({ ...h, affiliate_name: a.name, affiliate_code: a.code }));
+  });
+  allHistory.sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
+  const recent = allHistory.slice(0, 20);
+  const tbody = document.getElementById('recent-tbody');
+  if (recent.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">No referral activity yet</td></tr>';
+    return;
+  }
+  tbody.innerHTML = recent.map(h => `
+    <tr>
+      <td><span class="code-chip">${h.affiliate_code}</span> ${esc(h.affiliate_name)}</td>
+      <td>${esc(h.referred_name||'—')} <span style="color:var(--text-dim);font-size:11px">${esc(h.referred_email||'')}</span></td>
+      <td><span class="status-chip status-${h.status}">${h.status}</span></td>
+      <td style="color:var(--text-dim);font-size:12px">${fmtDate(h.created_at)}</td>
+      <td style="color:var(--green)">$${(h.earnings||0).toFixed(2)}</td>
+    </tr>`).join('');
+}
+
+let affiliateSortCol = null, affiliateSortDir = 'asc';
+function renderAffiliates(col, dir) {
+  if (col) { affiliateSortCol = col; affiliateSortDir = dir; }
+  let data = [...allAffiliates];
+  if (affiliateSortCol) {
+    const c = affiliateSortCol;
+    data.sort((a, b) => {
+      let va = a[c] ?? '', vb = b[c] ?? '';
+      if (typeof va === 'string') va = va.toLowerCase();
+      if (typeof vb === 'string') vb = vb.toLowerCase();
+      return affiliateSortDir === 'asc' ? (va > vb ? 1 : -1) : (va < vb ? 1 : -1);
+    });
+  }
+  const tbody = document.getElementById('affiliates-tbody');
+  if (data.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="9" class="empty">No affiliates yet</td></tr>';
+    return;
+  }
+  tbody.innerHTML = data.map((a,i) => `
+    <tr>
+      <td><strong>${esc(a.name)}</strong></td>
+      <td style="color:var(--text-dim);font-size:12px">${esc(a.email)}</td>
+      <td><span class="code-chip">${esc(a.code)}</span></td>
+      <td style="text-align:right">${a.clicks||0}</td>
+      <td style="text-align:right;color:var(--green)">${a.completed||0}</td>
+      <td style="text-align:right;color:var(--orange)"><strong>$${(a.earnings||0).toFixed(2)}</strong></td>
+      <td>${a.paypal_email ? `<a class="paypal-link" href="https://paypal.com" target="_blank">${esc(a.paypal_email)}</a>` : '<span style="color:var(--text-dim)">—</span>'}</td>
+      <td style="color:var(--text-dim);font-size:12px">${fmtDate(a.joined)}</td>
+      <td><button class="btn btn-ghost btn-sm" onclick="toggleExpand(${i})">Details ▾</button></td>
+    </tr>
+    <tr class="expand-row" id="expand-${i}" style="display:none">
+      <td colspan="9">
+        <div class="expand-inner">
+          <strong style="font-size:12px;color:var(--text-dim)">Referral link:</strong>
+          <code style="font-size:11px;color:var(--blue);margin-left:8px">https://purebrain.ai?ref=${esc(a.code)}</code>
+          <br><br>
+          ${renderHistoryTable(a.history || [])}
+        </div>
+      </td>
+    </tr>`).join('');
+}
+
+function toggleExpand(i) {
+  const row = document.getElementById('expand-' + i);
+  row.style.display = row.style.display === 'none' ? '' : 'none';
+}
+
+function renderHistoryTable(history) {
+  if (history.length === 0) return '<em style="color:var(--text-dim);font-size:12px">No referrals yet</em>';
+  return `<table style="width:100%;font-size:12px">
+    <thead><tr>
+      <th style="padding:6px 10px;color:var(--text-dim)">Name</th>
+      <th style="padding:6px 10px;color:var(--text-dim)">Email</th>
+      <th style="padding:6px 10px;color:var(--text-dim)">Status</th>
+      <th style="padding:6px 10px;color:var(--text-dim)">Date</th>
+      <th style="padding:6px 10px;color:var(--text-dim)">Earned</th>
+    </tr></thead>
+    <tbody>${history.map(h => `<tr>
+      <td style="padding:6px 10px">${esc(h.referred_name||'—')}</td>
+      <td style="padding:6px 10px;color:var(--text-dim)">${esc(h.referred_email||'—')}</td>
+      <td style="padding:6px 10px"><span class="status-chip status-${h.status}">${h.status}</span></td>
+      <td style="padding:6px 10px;color:var(--text-dim)">${fmtDate(h.created_at)}</td>
+      <td style="padding:6px 10px;color:var(--green)">$${(h.earnings||0).toFixed(2)}</td>
+    </tr>`).join('')}</tbody>
+  </table>`;
+}
+
+// ── Payouts ──
+async function loadPayouts() {
+  try {
+    const r = await apiFetch('/api/admin/payouts');
+    if (!r.ok) { toast('Failed to load payouts', 'error'); return; }
+    const data = await r.json();
+    allPayouts = data.requests || [];
+    renderPayouts();
+    // Update paid total in overview
+    const paidTotal = allPayouts.filter(p => p.status === 'paid').reduce((s,p) => s + (p.amount||0), 0);
+    document.getElementById('s-paid').textContent = '$' + paidTotal.toFixed(2);
+  } catch(e) {
+    toast('Error loading payouts: ' + e.message, 'error');
+  }
+}
+
+function renderPayouts() {
+  const pending = allPayouts.filter(p => p.status === 'pending' || p.status === 'processing');
+  const paid    = allPayouts.filter(p => p.status === 'paid');
+
+  const ptbody = document.getElementById('payouts-pending-tbody');
+  if (pending.length === 0) {
+    ptbody.innerHTML = '<tr><td colspan="6" class="empty">No pending payout requests</td></tr>';
+  } else {
+    ptbody.innerHTML = pending.map(p => `
+      <tr>
+        <td><span class="code-chip">${esc(p.referral_code||'?')}</span></td>
+        <td><strong style="color:var(--orange)">$${(p.amount||0).toFixed(2)}</strong></td>
+        <td>${p.paypal_email ? `<a class="paypal-link" href="https://www.paypal.com/myaccount/transfer/send/?to=${encodeURIComponent(p.paypal_email)}&amount=${p.amount}" target="_blank">${esc(p.paypal_email)} ↗</a>` : '—'}</td>
+        <td style="color:var(--text-dim);font-size:12px">${fmtDate(p.created_at)}</td>
+        <td><input class="notes-input" id="notes-${p.request_id}" placeholder="Payment notes…"></td>
+        <td><button class="btn btn-green btn-sm action-btn-write" onclick="markPaid('${esc(p.request_id)}')">Mark Paid</button></td>
+      </tr>`).join('');
+  }
+
+  const pdtbody = document.getElementById('payouts-paid-tbody');
+  if (paid.length === 0) {
+    pdtbody.innerHTML = '<tr><td colspan="6" class="empty">No completed payouts yet</td></tr>';
+  } else {
+    pdtbody.innerHTML = paid.map(p => `
+      <tr>
+        <td><span class="code-chip">${esc(p.referral_code||'?')}</span></td>
+        <td style="color:var(--green)"><strong>$${(p.amount||0).toFixed(2)}</strong></td>
+        <td style="color:var(--text-dim);font-size:12px">${esc(p.paypal_email||'—')}</td>
+        <td style="color:var(--text-dim);font-size:12px">${fmtDate(p.created_at)}</td>
+        <td style="color:var(--text-dim);font-size:12px">${fmtDate(p.paid_at)}</td>
+        <td style="color:var(--text-dim);font-size:12px">${esc(p.notes||'—')}</td>
+      </tr>`).join('');
+  }
+}
+
+async function markPaid(requestId) {
+  const notes = (document.getElementById('notes-' + requestId)?.value || '').trim();
+  const r = await apiFetch('/api/admin/payout/mark-paid', {
+    method: 'POST',
+    body: { request_id: requestId, notes }
+  });
+  if (r.ok) {
+    toast('Payout marked as paid');
+    await loadPayouts();
+  } else {
+    const d = await r.json().catch(() => ({}));
+    toast('Error: ' + (d.error || 'unknown'), 'error');
+  }
+}
+
+// ── Leaderboard ──
+async function loadLeaderboard() {
+  try {
+    const r = await apiFetch('/api/referral/leaderboard?limit=20');
+    if (!r.ok) return;
+    const data = await r.json();
+    allLeaderboard = data.leaderboard || [];
+    renderLeaderboard();
+  } catch(e) {}
+}
+
+function renderLeaderboard() {
+  const container = document.getElementById('leaderboard-body');
+  if (allLeaderboard.length === 0) {
+    container.innerHTML = '<div class="empty">No data yet — be the first to convert referrals!</div>';
+    return;
+  }
+  const maxConv = Math.max(...allLeaderboard.map(l => l.completed), 1);
+  const rankClass = i => i === 0 ? 'gold' : i === 1 ? 'silver' : i === 2 ? 'bronze' : '';
+  const rankEmoji = i => i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '';
+  container.innerHTML = allLeaderboard.map((l,i) => `
+    <div style="display:flex;align-items:center;gap:16px;padding:12px 0;border-bottom:1px solid var(--border)">
+      <span class="lb-rank ${rankClass(i)}">#${i+1}</span>
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:600;font-size:14px">${rankEmoji(i)} ${esc(l.name)}</div>
+        <div style="font-size:11px;color:var(--text-dim);margin-top:2px">
+          <span class="code-chip">${esc(l.referral_code)}</span>
+          &nbsp;${l.completed} conversion${l.completed !== 1 ? 's' : ''}
+          &nbsp;·&nbsp;$${l.total_earned.toFixed(2)} earned
+        </div>
+        <div class="lb-bar-wrap" style="margin-top:8px">
+          <div class="lb-bar-bg"><div class="lb-bar-fill" style="width:${Math.round(l.completed/maxConv*100)}%"></div></div>
+          <span style="font-size:11px;color:var(--text-dim);width:28px;text-align:right">${l.completed}</span>
+        </div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-size:20px;font-weight:800;color:var(--orange)">$${l.total_earned.toFixed(0)}</div>
+        <div style="font-size:10px;color:var(--text-dim)">earned</div>
+      </div>
+    </div>`).join('');
+}
+
+// ── Helpers ──
+function esc(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function fmtDate(d) {
+  if (!d) return '—';
+  try { return new Date(d).toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }); }
+  catch(e) { return d; }
+}
+
+// ── Boot ──
+window.addEventListener('DOMContentLoaded', () => {
+  if (_adminToken) {
+    // Viewer token from URL — auto-verify against admin/affiliates endpoint
+    IS_READONLY = true;
+    fetch(BASE + '/api/admin/affiliates?admin_token=' + encodeURIComponent(_adminToken))
+      .then(r => {
+        if (r.ok) {
+          document.getElementById('auth-gate').classList.add('hidden');
+          document.getElementById('app').classList.add('visible');
+          document.querySelectorAll('.action-btn-write').forEach(el => el.style.display = 'none');
+          const banner = document.createElement('div');
+          banner.style.cssText = 'background:#1e2a40;color:#7a8aaa;text-align:center;padding:8px;font-size:12px;';
+          banner.textContent = 'Read-only view — action buttons are hidden';
+          document.getElementById('app').insertBefore(banner, document.getElementById('app').firstChild);
+          loadAll();
+        } else {
+          document.getElementById('auth-err').textContent = 'Invalid viewer token';
+        }
+      })
+      .catch(e => {
+        document.getElementById('auth-err').textContent = 'Connection error: ' + e.message;
+      });
+  } else if (TOKEN) {
+    document.getElementById('auth-gate').classList.add('hidden');
+    document.getElementById('app').classList.add('visible');
+    loadAll();
+  }
+});
+
+// Auto-refresh every 60s
+setInterval(loadAll, 60000);
+</script>
+</body>
+</html>

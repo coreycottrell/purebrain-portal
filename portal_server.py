@@ -3903,8 +3903,49 @@ async def api_admin_invite(request: Request) -> JSONResponse:
         "email": email,
         "name": name,
         "role": "viewer",
-        "dashboard_url": f"https://portal.purebrain.ai/admin/referrals?admin_token={token}",
+        "dashboard_url": f"https://portal.purebrain.ai/admin/clients?admin_token={token}",
     })
+
+
+async def api_admin_invites_list(request: Request) -> JSONResponse:
+    """GET /api/admin/invites — list all active admin viewer tokens. Main bearer only."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    async with _referral_db() as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT id, token, email, name, role, created_at FROM admin_tokens ORDER BY created_at DESC"
+        )
+        rows = await cur.fetchall()
+        invitees = [dict(r) for r in rows]
+
+    return JSONResponse({"ok": True, "invitees": invitees})
+
+
+async def api_admin_invite_revoke(request: Request) -> JSONResponse:
+    """POST /api/admin/invite/revoke — delete an admin viewer token by id. Main bearer only."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    token_id = body.get("id")
+    if not token_id:
+        return JSONResponse({"error": "id required"}, status_code=400)
+
+    async with _referral_db() as db:
+        cur = await db.execute("SELECT id FROM admin_tokens WHERE id = ?", (token_id,))
+        row = await cur.fetchone()
+        if not row:
+            return JSONResponse({"error": "token not found"}, status_code=404)
+        await db.execute("DELETE FROM admin_tokens WHERE id = ?", (token_id,))
+        await db.commit()
+
+    return JSONResponse({"ok": True, "id": token_id})
 
 
 async def api_referral_payout_approve(request: Request) -> JSONResponse:
@@ -4178,9 +4219,15 @@ async def serve_admin_clients(request: Request) -> Response:
 
 
 async def api_admin_clients(request: Request) -> JSONResponse:
-    """GET /api/admin/clients — list all clients with stats. Bearer auth required."""
+    """GET /api/admin/clients — list all clients with stats. Bearer auth or viewer token required."""
+    admin_token_param = request.query_params.get("admin_token", "")
+    is_viewer = False
     if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
+        # Check viewer token
+        if admin_token_param and await _is_valid_admin_token(admin_token_param):
+            is_viewer = True
+        else:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
 
     async with _clients_db() as db:
         db.row_factory = aiosqlite.Row
@@ -4215,7 +4262,7 @@ async def api_admin_clients(request: Request) -> JSONResponse:
 
 
 async def api_admin_clients_update(request: Request) -> JSONResponse:
-    """POST /api/admin/clients/update — update notes and/or status for a client. Bearer auth required."""
+    """POST /api/admin/clients/update — update client fields. Bearer auth required."""
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
@@ -4228,25 +4275,65 @@ async def api_admin_clients_update(request: Request) -> JSONResponse:
     if not client_id:
         return JSONResponse({"error": "id required"}, status_code=400)
 
-    notes  = str(body.get("notes",  "")).strip()
-    status = str(body.get("status", "")).strip()
-
+    # Validate status
+    status = str(body.get("status", "")).strip().lower()
     allowed_statuses = {"active", "onboarding", "churned", "trial", ""}
     if status and status not in allowed_statuses:
-        return JSONResponse({"error": "invalid status"}, status_code=400)
+        return JSONResponse({"error": "invalid status — must be one of: active, onboarding, trial, churned"}, status_code=400)
 
+    # Validate tier
+    tier = str(body.get("tier", "")).strip().lower()
+    allowed_tiers = {"awakened", "bonded", "partnered", "brainiac", "unknown", ""}
+    if tier and tier not in allowed_tiers:
+        return JSONResponse({"error": "invalid tier — must be one of: awakened, bonded, partnered, brainiac, unknown"}, status_code=400)
+
+    # Email uniqueness check (if email is being changed)
+    new_email = str(body.get("email", "")).strip().lower()
+    if new_email:
+        async with _clients_db() as db:
+            cur = await db.execute(
+                "SELECT id FROM clients WHERE LOWER(email) = ? AND id != ?",
+                (new_email, client_id)
+            )
+            existing = await cur.fetchone()
+        if existing:
+            return JSONResponse({"error": "email already in use by another client"}, status_code=409)
+
+    # Build dynamic update — only include fields present in body
     now = datetime.now(timezone.utc).isoformat()
+    fields = ["updated_at = ?"]
+    params: list = [now]
+
+    text_fields = {
+        "name":    body.get("name"),
+        "goes_by": body.get("goes_by"),
+        "email":   new_email if new_email else None,
+        "ai_name": body.get("ai_name"),
+        "company": body.get("company"),
+        "role":    body.get("role"),
+        "goal":    body.get("goal"),
+        "notes":   body.get("notes"),
+    }
+    for col, val in text_fields.items():
+        if val is not None:
+            fields.append(f"{col} = ?")
+            params.append(str(val).strip())
+
+    if status:
+        fields.append("status = ?")
+        params.append(status)
+    elif "status" in body:
+        # Allow explicit empty to keep existing — skip
+        pass
+
+    if tier:
+        fields.append("tier = ?")
+        params.append(tier)
+    elif "tier" in body:
+        pass
+
+    params.append(client_id)
     async with _clients_db() as db:
-        # Build dynamic update
-        fields = ["updated_at = ?"]
-        params: list = [now]
-        if notes is not None:
-            fields.append("notes = ?")
-            params.append(notes)
-        if status:
-            fields.append("status = ?")
-            params.append(status)
-        params.append(client_id)
         await db.execute(f"UPDATE clients SET {', '.join(fields)} WHERE id = ?", params)
         await db.commit()
 
@@ -5513,6 +5600,8 @@ routes = [
     Route("/api/admin/payout/mark-paid", endpoint=api_admin_payout_mark_paid, methods=["POST"]),
     Route("/api/referral/payout-approve", endpoint=api_referral_payout_approve, methods=["POST"]),
     Route("/api/admin/invite", endpoint=api_admin_invite, methods=["POST"]),
+    Route("/api/admin/invites", endpoint=api_admin_invites_list, methods=["GET"]),
+    Route("/api/admin/invite/revoke", endpoint=api_admin_invite_revoke, methods=["POST"]),
     Route("/api/admin/affiliates", endpoint=api_admin_affiliates),
     Route("/api/admin/payouts", endpoint=api_admin_payouts),
     Route("/admin/referrals", endpoint=serve_admin_referrals),

@@ -1,0 +1,39 @@
+# Secrets
+.env
+.portal-token
+
+# Python
+__pycache__/
+*.pyc
+
+# Databases (contain user data)
+*.db
+*.db.bak-*
+
+# Logs
+*.log
+*.log.*.gz
+portal.log.*
+
+# Backups
+*.bak
+*.bak-*
+
+# Temp/patch scripts
+_fix_*.py
+_patch_*.py
+_portal_tail.py
+_run_patches.sh
+_validate_and_restart.sh
+apply_*.py
+apply_*.sh
+patch_portal.py
+deploy_*.sh
+
+# Runtime data
+*.jsonl
+scheduled_tasks.json
+user-settings.json
+
+# Uploads
+portal_uploads/
