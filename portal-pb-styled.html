@@ -45,6 +45,150 @@
     --sidebar-w: 150px;
   }
 
+  /* ===== LIGHT MODE THEME ===== */
+  body.light-mode {
+    --bg:        #f4f5f7;
+    --surface:   #ffffff;
+    --surface2:  #eef0f4;
+    --surface3:  #e2e5eb;
+    --border:    #d1d5de;
+    --border2:   #bcc2cf;
+    --gold:      #1a7ba3;
+    --gold-dim:  #15638a;
+    --gold-glow: rgba(26,123,163,0.12);
+    --gold-glow2:rgba(26,123,163,0.06);
+    --teal:      #d13a0a;
+    --teal-dim:  #a82e08;
+    --teal-glow: rgba(209,58,10,0.10);
+    --term-green:#16a34a;
+    --term-bg:   #f8f9fb;
+    --text:      #1a1d2b;
+    --text-dim:  #6b7186;
+    --text-mid:  #4a4f6a;
+    --online:    #16a34a;
+    --offline:   #dc2626;
+    --warn:      #d13a0a;
+    --orange:    #d13a0a;
+    --green:     #16a34a;
+    --accent:    #1a7ba3;
+  }
+  body.light-mode #loginOverlay {
+    --pb-card-bg: rgba(255, 255, 255, 0.92);
+    --pb-field-bg: rgba(0, 0, 0, 0.04);
+    --pb-field-border: rgba(0, 0, 0, 0.12);
+    --pb-glow-orange: rgba(209, 58, 10, 0.20);
+    --pb-glow-blue: rgba(26, 123, 163, 0.20);
+  }
+  body.light-mode .msg.ai { background: #eef4f8 !important; }
+  body.light-mode .msg.human { background: #f0f7ee !important; }
+  body.light-mode .msg.system { background: #f5f0e8 !important; }
+  body.light-mode input, body.light-mode textarea, body.light-mode select {
+    color: #1a1d2b !important;
+  }
+  body.light-mode input::placeholder, body.light-mode textarea::placeholder {
+    color: #8a8fa6 !important;
+  }
+  body.light-mode code, body.light-mode pre {
+    background: #e8ecf2 !important;
+    color: #1a1d2b !important;
+  }
+  /* ===== LIGHT MODE — GLOBAL TEXT & SURFACE OVERRIDES ===== */
+  /* Force all text dark in light mode — catches hardcoded #e8ecf4, #fff, #b0b8c8, etc. */
+  body.light-mode,
+  body.light-mode div,
+  body.light-mode span,
+  body.light-mode p,
+  body.light-mode label,
+  body.light-mode li,
+  body.light-mode td,
+  body.light-mode th,
+  body.light-mode button,
+  body.light-mode a {
+    color: #1a1d2b;
+  }
+  /* Preserve accent colors */
+  body.light-mode .nav-item.active,
+  body.light-mode [style*="color:var(--gold)"],
+  body.light-mode [style*="color:var(--teal)"],
+  body.light-mode [style*="color:var(--accent)"] {
+    color: var(--gold) !important;
+  }
+  /* Dimmed text — medium gray, not invisible */
+  body.light-mode .text-dim,
+  body.light-mode [style*="color:var(--text-dim)"],
+  body.light-mode [style*="#6b7099"],
+  body.light-mode [style*="#7a8499"],
+  body.light-mode [style*="#b0b8c8"],
+  body.light-mode [style*="#9498c0"],
+  body.light-mode [style*="#94a3b8"],
+  body.light-mode [style*="#a1a1aa"],
+  body.light-mode [style*="#71717a"],
+  body.light-mode [style*="#e8ecf4"],
+  body.light-mode [style*="#e0e0e0"],
+  body.light-mode [style*="#e4e4e7"] {
+    color: #505672 !important;
+  }
+  /* Status colors stay vivid */
+  body.light-mode [style*="color:var(--online)"],
+  body.light-mode [style*="#22c55e"],
+  body.light-mode [style*="#4ade80"],
+  body.light-mode [style*="color:var(--green)"] {
+    color: #16a34a !important;
+  }
+  body.light-mode [style*="color:var(--offline)"],
+  body.light-mode [style*="#ef4444"],
+  body.light-mode [style*="#f87171"],
+  body.light-mode [style*="#ff6b6b"] {
+    color: #dc2626 !important;
+  }
+  body.light-mode [style*="color:var(--teal)"],
+  body.light-mode [style*="#f1420b"],
+  body.light-mode [style*="color:var(--warn)"],
+  body.light-mode [style*="color:var(--orange)"] {
+    color: #d13a0a !important;
+  }
+  /* White text on colored buttons should stay white */
+  body.light-mode button[style*="background:var(--gold)"],
+  body.light-mode button[style*="background:linear-gradient"],
+  body.light-mode button[style*="background:#2a93c1"],
+  body.light-mode button[style*="color:#fff"],
+  body.light-mode button[style*="color: #fff"],
+  body.light-mode button[style*="color:#000"],
+  body.light-mode button[style*="color: #000"] {
+    color: #fff !important;
+  }
+  /* Sidebar */
+  body.light-mode .settings-btn { color: #4a4f6a !important; }
+  body.light-mode #settings-modal > div { background: var(--surface) !important; }
+  body.light-mode .nav-item { color: #4a4f6a !important; }
+  body.light-mode .nav-item:hover { color: var(--text) !important; background: var(--gold-glow2) !important; }
+  body.light-mode .nav-item.active { color: var(--gold) !important; }
+  body.light-mode .sidebar { background: var(--surface) !important; border-right-color: var(--border) !important; }
+  body.light-mode .sidebar-section { color: var(--text-dim) !important; }
+  /* Header */
+  body.light-mode header { background: var(--surface) !important; border-bottom-color: var(--border) !important; }
+  body.light-mode .logo, body.light-mode .subtitle { color: var(--text) !important; }
+  /* Mobile menu */
+  body.light-mode .tab-menu-item { color: var(--text) !important; }
+  body.light-mode .tab-menu { background: var(--surface) !important; border-color: var(--border) !important; }
+  /* Panels & messages */
+  body.light-mode .panel { background: var(--bg) !important; }
+  body.light-mode .msg { color: var(--text) !important; }
+  body.light-mode .chat-queue-btn { color: var(--text) !important; }
+  body.light-mode .sched-refresh-btn { color: var(--text) !important; }
+  /* Inputs & forms */
+  body.light-mode input, body.light-mode textarea, body.light-mode select {
+    background: var(--surface2) !important;
+    color: #1a1d2b !important;
+    border-color: var(--border) !important;
+  }
+  body.light-mode input::placeholder, body.light-mode textarea::placeholder {
+    color: #6b7186 !important;
+  }
+  /* Scrollbar for light mode */
+  body.light-mode ::-webkit-scrollbar-thumb { background: #bcc2cf !important; }
+  body.light-mode ::-webkit-scrollbar-track { background: var(--surface) !important; }
+
   html {
     overflow-x: hidden;
     max-width: 100vw;
@@ -3935,6 +4079,20 @@
     <div style="display:flex;align-items:center;justify-content:space-between;flex-shrink:0;">
       <span style="font-size:1.1rem;font-weight:700;color:var(--gold);">&#x2699; Portal Settings</span>
       <button id="settings-close-btn" style="background:none;border:none;color:#e8ecf4;font-size:1.4rem;cursor:pointer;padding:2px 8px;">&#x2715;</button>
+    </div>
+
+    <!-- Appearance Section -->
+    <div style="border:1px solid var(--border);border-radius:10px;padding:16px;display:flex;flex-direction:column;gap:12px;">
+      <div style="font-size:0.95rem;font-weight:700;color:var(--text);letter-spacing:0.04em;">&#x1F3A8; Appearance</div>
+      <p style="font-size:0.85rem;color:#e8ecf4;margin:0;">Switch between dark and light portal themes. Saved in browser.</p>
+      <div style="display:flex;align-items:center;gap:12px;">
+        <div id="theme-toggle" style="display:flex;align-items:center;gap:0;border:1px solid rgba(42,147,193,0.3);border-radius:4px;overflow:hidden;">
+          <button id="theme-dark-btn" class="theme-toggle-btn active" onclick="window._setTheme('dark')" style="padding:6px 14px;font-size:0.82rem;font-family:var(--font-mono);letter-spacing:0.05em;cursor:pointer;transition:all 0.2s;background:rgba(42,147,193,0.2);color:#2a93c1;border:none;text-transform:uppercase;">&#x1F319; Dark</button>
+          <div style="width:1px;height:20px;background:rgba(42,147,193,0.3);"></div>
+          <button id="theme-light-btn" class="theme-toggle-btn" onclick="window._setTheme('light')" style="padding:6px 14px;font-size:0.82rem;font-family:var(--font-mono);letter-spacing:0.05em;cursor:pointer;transition:all 0.2s;background:transparent;color:rgba(255,255,255,0.4);border:none;text-transform:uppercase;">&#x2600; Light</button>
+        </div>
+        <span id="theme-status" style="font-size:0.78rem;color:var(--text-dim);font-family:var(--font-mono);">Dark mode</span>
+      </div>
     </div>
 
     <!-- Quick Fire Pills Section -->
@@ -8565,9 +8723,403 @@
   })();
   // ===== END MESSAGE QUEUE =====
 
+  // ===== SCHEDULE TASK MODAL =====
+  // Deferred: modal HTML is below the script block, so we must wait for DOM to be ready
+  function _initScheduleTaskModal() {
+    var overlay       = document.getElementById('schedModalOverlay');
+    var closeBtn      = document.getElementById('schedModalClose');
+    var cancelBtn     = document.getElementById('schedCancelBtn');
+    var createBtn     = document.getElementById('schedCreateBtn');
+    var schedSelect   = document.getElementById('sched-schedule');
+    var onceRow       = document.getElementById('sched-once-row');
+    var dailyRow      = document.getElementById('sched-daily-row');
+    var weeklyRow     = document.getElementById('sched-weekly-row');
+    var advToggle     = document.getElementById('sched-advanced-toggle');
+    var advArrow      = document.getElementById('sched-advanced-arrow');
+    var advPanel      = document.getElementById('sched-advanced-panel');
+    var dayChips      = document.querySelectorAll('.sched-day-chip');
+
+    // ── Open / Close ─────────────────────────────────────────────
+    function openModal() {
+      if (!overlay) return;
+      overlay.classList.add('visible');
+      // Pre-fill task name from chat input if any
+      var chatInput = document.getElementById('chat-input');
+      var taskNameEl = document.getElementById('sched-task-name');
+      if (chatInput && chatInput.value.trim() && taskNameEl && !taskNameEl.value.trim()) {
+        taskNameEl.value = chatInput.value.trim();
+      }
+      // Focus task name
+      if (taskNameEl) { setTimeout(function() { taskNameEl.focus(); }, 60); }
+    }
+
+    function closeModal() {
+      if (!overlay) return;
+      overlay.classList.remove('visible');
+    }
+
+    // Expose globally so queue-btn click handler can call it
+    window.openScheduleTaskModal = openModal;
+
+    // ── Schedule type → show relevant date/time pickers ──────────
+    function updateScheduleUI(val) {
+      onceRow.classList.remove('visible');
+      dailyRow.classList.remove('visible');
+      weeklyRow.classList.remove('visible');
+      if (val === 'once')   onceRow.classList.add('visible');
+      if (val === 'daily')  dailyRow.classList.add('visible');
+      if (val === 'weekly') weeklyRow.classList.add('visible');
+    }
+
+    if (schedSelect) {
+      schedSelect.addEventListener('change', function() {
+        updateScheduleUI(this.value);
+      });
+    }
+
+    // ── Day chip toggles ──────────────────────────────────────────
+    dayChips.forEach(function(chip) {
+      chip.addEventListener('click', function() {
+        this.classList.toggle('active');
+      });
+    });
+
+    // ── Advanced options toggle ───────────────────────────────────
+    if (advToggle) {
+      advToggle.addEventListener('click', function() {
+        var open = advPanel.classList.toggle('open');
+        advArrow.classList.toggle('open', open);
+      });
+    }
+
+    // ── Build schedule label for message ─────────────────────────
+    function buildScheduleLabel() {
+      var val = schedSelect ? schedSelect.value : 'now';
+      if (val === 'now') return 'Run Now';
+      if (val === 'once') {
+        var d = document.getElementById('sched-once-date').value;
+        var t = document.getElementById('sched-once-time').value;
+        return 'Once: ' + (d || 'TBD') + (t ? ' at ' + t : '');
+      }
+      if (val === 'daily') {
+        var t2 = document.getElementById('sched-daily-time').value;
+        return 'Daily' + (t2 ? ' at ' + t2 : '');
+      }
+      if (val === 'weekly') {
+        var active = [];
+        dayChips.forEach(function(c) { if (c.classList.contains('active')) active.push(c.dataset.day); });
+        var t3 = document.getElementById('sched-weekly-time').value;
+        return 'Weekly' + (active.length ? ' on ' + active.join('/') : '') + (t3 ? ' at ' + t3 : '');
+      }
+      return val;
+    }
+
+    // ── Create Task ───────────────────────────────────────────────
+    if (createBtn) {
+      createBtn.addEventListener('click', function() {
+        var taskName     = (document.getElementById('sched-task-name').value || '').trim();
+        var instructions = (document.getElementById('sched-instructions').value || '').trim();
+        var assign       = (document.getElementById('sched-assign').value || '').trim();
+        var priority     = document.getElementById('sched-priority').value || 'Normal';
+        var retries      = document.getElementById('sched-retries').value || '0';
+        var timeout      = document.getElementById('sched-timeout').value || '30';
+        var incMem       = document.getElementById('sched-include-memories').checked;
+        var schedLabel   = buildScheduleLabel();
+
+        // Validation
+        if (!taskName) {
+          document.getElementById('sched-task-name').focus();
+          document.getElementById('sched-task-name').style.borderColor = 'var(--teal)';
+          setTimeout(function() { document.getElementById('sched-task-name').style.borderColor = ''; }, 1500);
+          return;
+        }
+        if (!instructions) {
+          document.getElementById('sched-instructions').focus();
+          document.getElementById('sched-instructions').style.borderColor = 'var(--teal)';
+          setTimeout(function() { document.getElementById('sched-instructions').style.borderColor = ''; }, 1500);
+          return;
+        }
+
+        // Build structured message
+        var lines = ['[SCHEDULED TASK] ' + taskName];
+        if (assign) lines.push('Assign: ' + assign);
+        lines.push('Priority: ' + priority);
+        lines.push('Schedule: ' + schedLabel);
+        if (retries !== '0') lines.push('Retries: ' + retries);
+        lines.push('Timeout: ' + timeout + 'min');
+        if (incMem) lines.push('Include Memories: Yes');
+        lines.push('');
+        lines.push(instructions);
+
+        var fullMessage = lines.join('\n');
+
+        // Determine if task should fire now or later
+        var schedType = schedSelect ? schedSelect.value : 'now';
+        if (schedType === 'now') {
+          // Fire immediately — close modal first, then inject and send
+          closeModal();
+          var chatInput = document.getElementById('chat-input');
+          if (chatInput) {
+            chatInput.value = fullMessage;
+            chatInput.dispatchEvent(new Event('input', { bubbles: true }));
+            setTimeout(function() {
+              if (typeof sendChat === 'function') {
+                sendChat();
+              } else {
+                // Fallback: click the send button
+                var sendBtn = document.getElementById('send-btn');
+                if (sendBtn) sendBtn.click();
+              }
+            }, 150);
+          }
+        } else {
+          // Schedule for future — compute fire_at ISO timestamp and recurrence info
+          // IMPORTANT: sendChat() is NEVER called here — future tasks go to server only
+          var fireAt = null;
+          var recurType = null;
+          var recurDays = null;
+          var recurTime = null;
+
+          if (schedType === 'once') {
+            var dateVal = document.getElementById('sched-once-date') ? document.getElementById('sched-once-date').value : '';
+            var timeVal = document.getElementById('sched-once-time') ? document.getElementById('sched-once-time').value : '';
+            if (!dateVal) {
+              alert('Please pick a date for the "Once Later" schedule.');
+              return;
+            }
+            var timeStr = timeVal || '09:00';
+            fireAt = new Date(dateVal + 'T' + timeStr + ':00').toISOString();
+
+          } else if (schedType === 'daily') {
+            var dailyTime = document.getElementById('sched-daily-time') ? document.getElementById('sched-daily-time').value : '';
+            if (!dailyTime) {
+              alert('Please pick a time for the daily schedule.');
+              return;
+            }
+            recurType = 'daily';
+            recurTime = dailyTime;
+            // Next occurrence: today at that time, or tomorrow if already past
+            var nowD = new Date();
+            var dParts = dailyTime.split(':');
+            var candidate = new Date(nowD.getFullYear(), nowD.getMonth(), nowD.getDate(), parseInt(dParts[0], 10), parseInt(dParts[1], 10), 0, 0);
+            if (candidate <= nowD) {
+              candidate.setDate(candidate.getDate() + 1);
+            }
+            fireAt = candidate.toISOString();
+
+          } else if (schedType === 'weekly') {
+            var weeklyTime = document.getElementById('sched-weekly-time') ? document.getElementById('sched-weekly-time').value : '';
+            var activeDays = [];
+            dayChips.forEach(function(c) { if (c.classList.contains('active')) activeDays.push(c.dataset.day); });
+            if (activeDays.length === 0) {
+              alert('Please select at least one day for the weekly schedule.');
+              return;
+            }
+            if (!weeklyTime) {
+              alert('Please pick a time for the weekly schedule.');
+              return;
+            }
+            recurType = 'weekly';
+            recurDays = activeDays;
+            recurTime = weeklyTime;
+            var dayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+            var targetNums = activeDays.map(function(d) { return dayMap[d] !== undefined ? dayMap[d] : -1; }).filter(function(n) { return n >= 0; });
+            var nowW = new Date();
+            var wParts = weeklyTime.split(':');
+            var best = null;
+            for (var di = 0; di < 8; di++) {
+              var checkDate = new Date(nowW.getFullYear(), nowW.getMonth(), nowW.getDate() + di, parseInt(wParts[0], 10), parseInt(wParts[1], 10), 0, 0);
+              if (targetNums.indexOf(checkDate.getDay()) >= 0 && checkDate > nowW) {
+                best = checkDate;
+                break;
+              }
+            }
+            if (!best) {
+              alert('Could not compute next weekly occurrence. Please check day/time selection.');
+              return;
+            }
+            fireAt = best.toISOString();
+          }
+
+          if (!fireAt) {
+            // Safety net — should not reach here since all paths above either set fireAt or return early
+            alert('Could not compute a future schedule time. Please check your schedule settings.');
+            return;
+          }
+
+          // POST to server for real scheduling — NEVER call sendChat() for future tasks
+          // Convert recurTime from local to UTC so server rescheduling fires at correct local time
+          var recurTimeUTC = recurTime;
+          if (recurTime) {
+            var rtParts = recurTime.split(':');
+            var rtLocal = new Date();
+            rtLocal.setHours(parseInt(rtParts[0], 10), parseInt(rtParts[1], 10), 0, 0);
+            recurTimeUTC = ('0' + rtLocal.getUTCHours()).slice(-2) + ':' + ('0' + rtLocal.getUTCMinutes()).slice(-2);
+          }
+          var schedPayload = { message: fullMessage, fire_at: fireAt };
+          if (recurType) {
+            schedPayload.recur_type = recurType;
+            schedPayload.recur_time = recurTimeUTC;
+            if (recurDays) schedPayload.recur_days = recurDays;
+          }
+          fetch('/api/schedule-task', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(schedPayload)
+          })
+          .then(function(res) { return res.json(); })
+          .then(function(data) {
+            if (data.ok) {
+              closeModal();
+              // Show local-only confirmation toast — do NOT send to chat
+              var toast = document.createElement('div');
+              toast.style.cssText = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:rgba(34,197,94,0.95);color:#fff;padding:12px 24px;border-radius:8px;font-size:14px;z-index:99999;box-shadow:0 4px 20px rgba(0,0,0,0.3);';
+              toast.textContent = 'Task scheduled: "' + taskName + '" — fires at ' + schedLabel;
+              document.body.appendChild(toast);
+              setTimeout(function() { toast.remove(); }, 4000);
+            } else {
+              alert('Failed to schedule: ' + (data.error || 'unknown error'));
+            }
+          })
+          .catch(function(err) {
+            alert('Schedule error: ' + err.message);
+          });
+        }
+
+        // Reset form for next use
+        document.getElementById('sched-task-name').value = '';
+        document.getElementById('sched-instructions').value = '';
+        document.getElementById('sched-assign').value = '';
+        document.getElementById('sched-priority').value = 'Normal';
+        if (schedSelect) { schedSelect.value = 'now'; updateScheduleUI('now'); }
+        document.getElementById('sched-retries').value = '0';
+        document.getElementById('sched-timeout').value = '30';
+        document.getElementById('sched-include-memories').checked = true;
+        dayChips.forEach(function(c) { c.classList.remove('active'); });
+        if (advPanel.classList.contains('open')) {
+          advPanel.classList.remove('open');
+          advArrow.classList.remove('open');
+        }
+      });
+    }
+
+    // ── Close handlers ────────────────────────────────────────────
+    if (closeBtn)  closeBtn.addEventListener('click', closeModal);
+    if (cancelBtn) cancelBtn.addEventListener('click', closeModal);
+
+    // Click outside modal to close
+    if (overlay) {
+      overlay.addEventListener('click', function(e) {
+        if (e.target === overlay) closeModal();
+      });
+    }
+
+    // Escape key to close
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape' && overlay && overlay.classList.contains('visible')) {
+        closeModal();
+      }
+    });
+
+    console.log('[PureBrain Portal] Schedule Task Modal loaded');
+  }
+  // Init after DOM is ready (modal HTML is below this script tag)
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _initScheduleTaskModal);
+  } else {
+    _initScheduleTaskModal();
+  }
+  // ===== END SCHEDULE TASK MODAL =====
+
 })();
 </script>
 
+<!-- Theme Toggle — standalone global script (outside IIFE so onclick can reach it) -->
+<script>
+(function() {
+  // Load saved theme on page load
+  var saved = localStorage.getItem('pb_theme_mode') || 'dark';
+  if (saved === 'light') document.body.classList.add('light-mode');
+
+  window._setTheme = function(mode) {
+    var darkBtn = document.getElementById('theme-dark-btn');
+    var lightBtn = document.getElementById('theme-light-btn');
+    var status = document.getElementById('theme-status');
+    if (mode === 'light') {
+      document.body.classList.add('light-mode');
+      localStorage.setItem('pb_theme_mode', 'light');
+      if (darkBtn) { darkBtn.style.background = 'transparent'; darkBtn.style.color = 'rgba(0,0,0,0.4)'; }
+      if (lightBtn) { lightBtn.style.background = 'rgba(42,147,193,0.2)'; lightBtn.style.color = '#1a7ba3'; }
+      if (status) status.textContent = 'Light mode';
+    } else {
+      document.body.classList.remove('light-mode');
+      localStorage.setItem('pb_theme_mode', 'dark');
+      if (darkBtn) { darkBtn.style.background = 'rgba(42,147,193,0.2)'; darkBtn.style.color = '#2a93c1'; }
+      if (lightBtn) { lightBtn.style.background = 'transparent'; lightBtn.style.color = 'rgba(255,255,255,0.4)'; }
+      if (status) status.textContent = 'Dark mode';
+    }
+    // Sync to server if available
+    if (typeof window._syncSettingsToServer === 'function') {
+      window._syncSettingsToServer({ theme_mode: mode });
+    }
+  };
+
+  // Apply on DOM ready (buttons might not exist yet at script parse time)
+  document.addEventListener('DOMContentLoaded', function() {
+    if (saved === 'light') window._setTheme('light');
+  });
+})();
+</script>
+
+<!-- Training Hacks — standalone global script (outside IIFE so onclick can reach it) -->
+<script>
+window._fireTrainingHacks = function() {
+  // Switch to chat panel — click the Chat tab directly
+  var chatTab = document.querySelector('[data-panel="chat"]') || document.getElementById('panel-chat');
+  if (chatTab) chatTab.click();
+
+  // Visual feedback on button
+  var btn = document.getElementById('training-hacks-btn');
+  if (btn) {
+    btn.classList.remove('firing', 'done-flash');
+    btn.classList.add('scanning');
+    var lbl = btn.querySelector('.th-label');
+    if (lbl) lbl.textContent = 'Scanning...';
+  }
+  window._trainingHacksScanning = true;
+
+  // Build and send the prompt
+  var prompt = '[BACKGROUND TASK] AI Training Ingestion\n\nPlease scan the Brainiac Mastermind Training page at https://purebrain.ai/brainiac-mastermind-training/?bypass=portal for any new training modules or content.\n\nInstructions:\n1. Fetch the page and look for the AI Training Manifest (id="ai-training-manifest") which lists all available modules\n2. Check which modules you have already ingested (search your memory for "brainiac-training" or "module" learnings)\n3. For any NEW modules you have not seen before, read the AI Training Snippet sections (data-ai-training="module-N")\n4. Ingest the core concepts, key techniques, implementation checklists, and key insights\n5. Save what you learned to your memory\n6. Come back and suggest 3-5 actionable things based on what you learned that could help me right now\n\nSkip any modules you have already learned from. Focus on what is new.\nThis is a background task - do not interrupt any other conversations.';
+
+  var input = document.getElementById('chat-input');
+  if (!input) { alert('Chat input not found'); return; }
+  input.value = prompt;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+
+  setTimeout(function() {
+    var sendBtn = document.getElementById('send-btn');
+    if (sendBtn) sendBtn.click();
+  }, 100);
+
+  // Toast — use window.showToast if exposed, otherwise skip
+  if (typeof window.showToast === 'function') window.showToast('Training scan initiated...', 3000);
+};
+
+window._trainingHacksDone = function() {
+  if (!window._trainingHacksScanning) return;
+  window._trainingHacksScanning = false;
+  var btn = document.getElementById('training-hacks-btn');
+  if (!btn) return;
+  btn.classList.remove('scanning');
+  btn.classList.add('done-flash');
+  var lbl = btn.querySelector('.th-label');
+  if (lbl) lbl.textContent = 'Done!';
+  setTimeout(function() {
+    btn.classList.remove('done-flash');
+    if (lbl) lbl.textContent = 'AI Training Hacks';
+  }, 2000);
+};
+</script>
 
 <!-- ============================================================
      3D NEURAL NETWORK — login background
