@@ -1,0 +1,16 @@
+[Unit]
+Description=Aether Portal Server - per-CIV portal UI on port 8097
+After=network.target
+
+[Service]
+Type=simple
+User={USER}
+WorkingDirectory=/home/{USER}/purebrain_portal
+ExecStart=/usr/bin/python3 /home/{USER}/purebrain_portal/portal_server.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/{USER}/projects/AI-CIV/{CIV_NAME}/logs/portal_server.log
+StandardError=append:/home/{USER}/projects/AI-CIV/{CIV_NAME}/logs/portal_server.log
+
+[Install]
+WantedBy=multi-user.target
