@@ -297,6 +297,45 @@
 
   /* ── Refresh btn pulse ── */
   .refresh-btn { cursor: pointer; color: var(--text-dim); font-size: 18px; border: none; background: none; transition: transform .3s; }
+
+  /* ── Icon buttons ── */
+  .btn-icon {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 28px; height: 28px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg3); color: var(--text-dim); cursor: pointer;
+    font-size: 13px; transition: all .15s; padding: 0;
+  }
+  .btn-icon:hover { color: var(--text); border-color: var(--blue); background: rgba(42,147,193,.1); }
+  .btn-icon.danger:hover { color: var(--red); border-color: var(--red); background: rgba(239,68,68,.1); }
+
+  /* ── Inline edit form ── */
+  .inline-edit-row td { padding: 12px 16px; background: rgba(42,147,193,.06); }
+  .inline-edit-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+  .inline-edit-form .field { display: flex; flex-direction: column; gap: 4px; min-width: 160px; }
+  .inline-edit-form label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .04em; }
+  .inline-edit-form input {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); padding: 6px 10px; font-size: 13px; outline: none;
+  }
+  .inline-edit-form input:focus { border-color: var(--blue); }
+  .inline-edit-form .actions { display: flex; gap: 6px; padding-bottom: 1px; }
+
+  /* ── Confirm dialog ── */
+  #confirm-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.6);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 500; display: none;
+  }
+  #confirm-overlay.show { display: flex; }
+  .confirm-box {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
+    padding: 28px 32px; max-width: 420px; width: 100%;
+  }
+  .confirm-box h3 { font-size: 16px; margin-bottom: 10px; }
+  .confirm-box p { color: var(--text-dim); font-size: 13px; margin-bottom: 16px; line-height: 1.6; }
+  .confirm-box .confirm-check { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 20px; color: var(--text-dim); }
+  .confirm-box .confirm-check input[type=checkbox] { width: 14px; height: 14px; cursor: pointer; }
+  .confirm-box .confirm-actions { display: flex; gap: 10px; justify-content: flex-end; }
   .refresh-btn:hover { color: var(--text); transform: rotate(180deg); }
 
   @media (max-width: 640px) {
@@ -386,9 +425,10 @@
               <th onclick="sortTable('affiliates','earnings',this)">Earned</th>
               <th>PayPal</th>
               <th onclick="sortTable('affiliates','joined',this)">Joined</th>
-              <th></th>
+              <th>Details</th>
+              <th>Actions</th>
             </tr></thead>
-            <tbody id="affiliates-tbody"><tr><td colspan="9" class="loading"><div class="spinner"></div><br>Loading…</td></tr></tbody>
+            <tbody id="affiliates-tbody"><tr><td colspan="10" class="loading"><div class="spinner"></div><br>Loading…</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -444,6 +484,22 @@
 </div>
 
 <div id="toast"></div>
+
+<!-- Confirm Delete Dialog -->
+<div id="confirm-overlay">
+  <div class="confirm-box">
+    <h3 id="confirm-title">Confirm Delete</h3>
+    <p id="confirm-body"></p>
+    <div class="confirm-check">
+      <input type="checkbox" id="confirm-del-referrals">
+      <label for="confirm-del-referrals">Also delete their referral records (clicks, rewards, commissions)</label>
+    </div>
+    <div class="confirm-actions">
+      <button class="btn btn-ghost btn-sm" onclick="closeConfirm()">Cancel</button>
+      <button class="btn btn-sm" id="confirm-ok-btn" style="background:var(--red);color:#fff">Delete</button>
+    </div>
+  </div>
+</div>
 
 <script>
 // ── State ──
@@ -624,11 +680,11 @@ function renderAffiliates(col, dir) {
   }
   const tbody = document.getElementById('affiliates-tbody');
   if (data.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9" class="empty">No affiliates yet</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="empty">No affiliates yet</td></tr>';
     return;
   }
   tbody.innerHTML = data.map((a,i) => `
-    <tr>
+    <tr id="aff-row-${i}">
       <td><strong>${esc(a.name)}</strong></td>
       <td style="color:var(--text-dim);font-size:12px">${esc(a.email)}</td>
       <td><span class="code-chip">${esc(a.code)}</span></td>
@@ -638,14 +694,33 @@ function renderAffiliates(col, dir) {
       <td>${a.paypal_email ? `<a class="paypal-link" href="https://paypal.com" target="_blank">${esc(a.paypal_email)}</a>` : '<span style="color:var(--text-dim)">—</span>'}</td>
       <td style="color:var(--text-dim);font-size:12px">${fmtDate(a.joined)}</td>
       <td><button class="btn btn-ghost btn-sm" onclick="toggleExpand(${i})">Details ▾</button></td>
+      <td>
+        <div style="display:flex;gap:6px">
+          <button class="btn-icon action-btn-write" title="Edit affiliate" onclick="openAffiliateEdit(${i})" style="display:${IS_READONLY?'none':''}">✏️</button>
+          <button class="btn-icon danger action-btn-write" title="Delete affiliate" onclick="openAffiliateDelete(${i})" style="display:${IS_READONLY?'none':''}">🗑️</button>
+        </div>
+      </td>
+    </tr>
+    <tr class="inline-edit-row" id="aff-edit-${i}" style="display:none">
+      <td colspan="10">
+        <div class="inline-edit-form">
+          <div class="field"><label>Name</label><input id="aff-edit-name-${i}" value="${esc(a.name)}" placeholder="Affiliate name"></div>
+          <div class="field"><label>Email</label><input id="aff-edit-email-${i}" value="${esc(a.email)}" placeholder="user@email.com" type="email"></div>
+          <div class="field"><label>PayPal Email</label><input id="aff-edit-paypal-${i}" value="${esc(a.paypal_email||'')}" placeholder="paypal@email.com" type="email"></div>
+          <div class="actions">
+            <button class="btn btn-blue btn-sm" onclick="saveAffiliateEdit(${i},'${esc(a.code)}')">Save</button>
+            <button class="btn btn-ghost btn-sm" onclick="closeAffiliateEdit(${i})">Cancel</button>
+          </div>
+        </div>
+      </td>
     </tr>
     <tr class="expand-row" id="expand-${i}" style="display:none">
-      <td colspan="9">
+      <td colspan="10">
         <div class="expand-inner">
           <strong style="font-size:12px;color:var(--text-dim)">Referral link:</strong>
           <code style="font-size:11px;color:var(--blue);margin-left:8px">https://purebrain.ai?ref=${esc(a.code)}</code>
           <br><br>
-          ${renderHistoryTable(a.history || [])}
+          ${renderHistoryTable(a.history || [], i)}
         </div>
       </td>
     </tr>`).join('');
@@ -656,8 +731,123 @@ function toggleExpand(i) {
   row.style.display = row.style.display === 'none' ? '' : 'none';
 }
 
-function renderHistoryTable(history) {
+function openAffiliateEdit(i) {
+  // Close any other open edit rows
+  document.querySelectorAll('[id^="aff-edit-"]').forEach(r => r.style.display = 'none');
+  document.getElementById('aff-edit-' + i).style.display = '';
+  document.getElementById('aff-edit-name-' + i).focus();
+}
+
+function closeAffiliateEdit(i) {
+  document.getElementById('aff-edit-' + i).style.display = 'none';
+}
+
+async function saveAffiliateEdit(i, code) {
+  const name    = document.getElementById('aff-edit-name-' + i).value.trim();
+  const email   = document.getElementById('aff-edit-email-' + i).value.trim();
+  const paypal  = document.getElementById('aff-edit-paypal-' + i).value.trim();
+
+  const body = { referral_code: code };
+  if (name)   body.user_name    = name;
+  if (email)  body.user_email   = email;
+  if (paypal) body.paypal_email = paypal;
+
+  if (Object.keys(body).length === 1) { toast('No changes to save', 'error'); return; }
+
+  const r = await apiFetch('/api/admin/affiliate/update', { method: 'PUT', body });
+  if (r.ok) {
+    const d = await r.json();
+    toast('Affiliate updated (' + d.updated_fields.join(', ') + ')');
+    closeAffiliateEdit(i);
+    await loadAffiliates();
+  } else {
+    const d = await r.json().catch(() => ({}));
+    toast('Error: ' + (d.error || 'unknown'), 'error');
+  }
+}
+
+let _confirmCallback = null;
+function openAffiliateDelete(i) {
+  const a = allAffiliates[i];
+  if (!a) return;
+  document.getElementById('confirm-title').textContent = 'Delete Affiliate';
+  document.getElementById('confirm-body').textContent  =
+    `Delete affiliate ${a.name} (${a.code})? This cannot be undone.`;
+  document.getElementById('confirm-del-referrals').checked = false;
+
+  _confirmCallback = async () => {
+    const delRefs = document.getElementById('confirm-del-referrals').checked;
+    const r = await apiFetch('/api/admin/affiliate/delete', {
+      method: 'DELETE',
+      body: { referral_code: a.code, delete_referrals: delRefs }
+    });
+    if (r.ok) {
+      const d = await r.json();
+      const extra = d.referrals_deleted ? ` and ${d.referrals_deleted} referral record(s)` : '';
+      toast(`Deleted ${a.code}${extra}`);
+      closeConfirm();
+      await loadAffiliates();
+    } else {
+      const d = await r.json().catch(() => ({}));
+      toast('Error: ' + (d.error || 'unknown'), 'error');
+      closeConfirm();
+    }
+  };
+
+  document.getElementById('confirm-ok-btn').onclick = _confirmCallback;
+  document.getElementById('confirm-overlay').classList.add('show');
+}
+
+function closeConfirm() {
+  document.getElementById('confirm-overlay').classList.remove('show');
+  _confirmCallback = null;
+}
+
+// Close confirm on overlay background click
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('confirm-overlay').addEventListener('click', e => {
+    if (e.target === document.getElementById('confirm-overlay')) closeConfirm();
+  });
+});
+
+function renderHistoryTable(history, affIdx) {
   if (history.length === 0) return '<em style="color:var(--text-dim);font-size:12px">No referrals yet</em>';
+  const editColHeader = IS_READONLY ? '' : '<th style="padding:6px 10px;color:var(--text-dim)"></th>';
+  const rows = history.map((h, hi) => {
+    const editBtn = IS_READONLY ? '' :
+      `<td style="padding:6px 10px">
+        <button class="btn-icon action-btn-write" title="Edit referral" onclick="openReferralEdit(${affIdx},${hi})" style="font-size:11px">✏️</button>
+       </td>`;
+    return `<tr id="ref-row-${affIdx}-${hi}">
+      <td style="padding:6px 10px">${esc(h.referred_name||'—')}</td>
+      <td style="padding:6px 10px;color:var(--text-dim)">${esc(h.referred_email||'—')}</td>
+      <td style="padding:6px 10px"><span class="status-chip status-${h.status}">${h.status}</span></td>
+      <td style="padding:6px 10px;color:var(--text-dim)">${fmtDate(h.created_at)}</td>
+      <td style="padding:6px 10px;color:var(--green)">$${(h.earnings||0).toFixed(2)}</td>
+      ${editBtn}
+    </tr>
+    <tr id="ref-edit-row-${affIdx}-${hi}" style="display:none">
+      <td colspan="${IS_READONLY ? 5 : 6}" style="padding:10px 12px;background:rgba(42,147,193,.06)">
+        <div class="inline-edit-form">
+          <div class="field"><label>Name</label><input id="ref-edit-name-${affIdx}-${hi}" value="${esc(h.referred_name||'')}" placeholder="Referred name"></div>
+          <div class="field"><label>Email</label><input id="ref-edit-email-${affIdx}-${hi}" value="${esc(h.referred_email||'')}" placeholder="referred@email.com" type="email"></div>
+          <div class="field"><label>Status</label>
+            <select id="ref-edit-status-${affIdx}-${hi}" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:6px 10px;font-size:13px">
+              <option value="">— keep current —</option>
+              <option value="pending"${h.status==='pending'?' selected':''}>pending</option>
+              <option value="completed"${h.status==='completed'?' selected':''}>completed</option>
+              <option value="rejected"${h.status==='rejected'?' selected':''}>rejected</option>
+            </select>
+          </div>
+          <div class="actions">
+            <button class="btn btn-blue btn-sm" onclick="saveReferralEdit(${affIdx},${hi},${h.id||'null'})">Save</button>
+            <button class="btn btn-ghost btn-sm" onclick="closeReferralEdit(${affIdx},${hi})">Cancel</button>
+          </div>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+
   return `<table style="width:100%;font-size:12px">
     <thead><tr>
       <th style="padding:6px 10px;color:var(--text-dim)">Name</th>
@@ -665,15 +855,45 @@ function renderHistoryTable(history) {
       <th style="padding:6px 10px;color:var(--text-dim)">Status</th>
       <th style="padding:6px 10px;color:var(--text-dim)">Date</th>
       <th style="padding:6px 10px;color:var(--text-dim)">Earned</th>
+      ${editColHeader}
     </tr></thead>
-    <tbody>${history.map(h => `<tr>
-      <td style="padding:6px 10px">${esc(h.referred_name||'—')}</td>
-      <td style="padding:6px 10px;color:var(--text-dim)">${esc(h.referred_email||'—')}</td>
-      <td style="padding:6px 10px"><span class="status-chip status-${h.status}">${h.status}</span></td>
-      <td style="padding:6px 10px;color:var(--text-dim)">${fmtDate(h.created_at)}</td>
-      <td style="padding:6px 10px;color:var(--green)">$${(h.earnings||0).toFixed(2)}</td>
-    </tr>`).join('')}</tbody>
+    <tbody>${rows}</tbody>
   </table>`;
+}
+
+function openReferralEdit(affIdx, hi) {
+  document.querySelectorAll('[id^="ref-edit-row-"]').forEach(r => r.style.display = 'none');
+  document.getElementById(`ref-edit-row-${affIdx}-${hi}`).style.display = '';
+  document.getElementById(`ref-edit-name-${affIdx}-${hi}`).focus();
+}
+
+function closeReferralEdit(affIdx, hi) {
+  document.getElementById(`ref-edit-row-${affIdx}-${hi}`).style.display = 'none';
+}
+
+async function saveReferralEdit(affIdx, hi, referralId) {
+  if (!referralId) { toast('No referral ID — cannot save', 'error'); return; }
+  const name   = document.getElementById(`ref-edit-name-${affIdx}-${hi}`).value.trim();
+  const email  = document.getElementById(`ref-edit-email-${affIdx}-${hi}`).value.trim();
+  const status = document.getElementById(`ref-edit-status-${affIdx}-${hi}`).value;
+
+  const body = { referral_id: referralId };
+  if (name)   body.referred_name  = name;
+  if (email)  body.referred_email = email;
+  if (status) body.status         = status;
+
+  if (Object.keys(body).length === 1) { toast('No changes to save', 'error'); return; }
+
+  const r = await apiFetch('/api/admin/referral/update', { method: 'PUT', body });
+  if (r.ok) {
+    const d = await r.json();
+    toast('Referral updated (' + d.updated_fields.join(', ') + ')');
+    closeReferralEdit(affIdx, hi);
+    await loadAffiliates();
+  } else {
+    const d = await r.json().catch(() => ({}));
+    toast('Error: ' + (d.error || 'unknown'), 'error');
+  }
 }
 
 // ── Payouts ──

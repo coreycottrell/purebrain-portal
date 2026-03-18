@@ -2035,6 +2035,8 @@ async def _scheduled_task_checker() -> None:
 
 async def api_schedule_task(request) -> JSONResponse:
     """POST /api/schedule-task — schedule a message for future delivery."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -2364,11 +2366,15 @@ async def api_777_chat(request) -> JSONResponse:
 
 async def api_scheduled_tasks_list(request) -> JSONResponse:
     """GET /api/scheduled-tasks — list pending scheduled tasks."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
     return JSONResponse({"tasks": _scheduled_tasks})
 
 
 async def api_delete_scheduled_task(request) -> JSONResponse:
     """DELETE /api/scheduled-tasks/{task_id} — cancel a pending scheduled task."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
     task_id = request.path_params.get("task_id", "")
     global _scheduled_tasks
     before = len(_scheduled_tasks)
@@ -4113,7 +4119,7 @@ async def api_admin_affiliates(request: Request) -> JSONResponse:
             clicks = (await cur2.fetchone())[0]
 
             cur2 = await db.execute(
-                """SELECT ref.referred_name, ref.referred_email, ref.status, ref.created_at,
+                """SELECT ref.id, ref.referred_name, ref.referred_email, ref.status, ref.created_at,
                           COALESCE(rw.reward_value, 0) AS earnings
                    FROM referrals ref
                    LEFT JOIN rewards rw ON rw.referral_id = ref.id
@@ -4155,6 +4161,227 @@ async def api_admin_payouts(request: Request) -> JSONResponse:
     requests_list = _read_payout_requests()
     requests_list.sort(key=lambda r: r.get("created_at_ts", 0), reverse=True)
     return JSONResponse({"requests": requests_list, "count": len(requests_list)})
+
+
+async def api_admin_affiliate_update(request: Request) -> JSONResponse:
+    """PUT /api/admin/affiliate/update — update affiliate name, email, or PayPal email."""
+    if request.method == "OPTIONS":
+        return Response(status_code=204)
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    referral_code = str(body.get("referral_code", "")).strip()
+    if not referral_code:
+        return JSONResponse({"error": "referral_code required"}, status_code=400)
+
+    user_name    = body.get("user_name")
+    user_email   = body.get("user_email")
+    paypal_email = body.get("paypal_email")
+
+    # Validate emails if provided
+    def _valid_email(e: str) -> bool:
+        return "@" in e and "." in e.split("@")[-1]
+
+    if user_email is not None:
+        user_email = str(user_email).strip().lower()
+        if user_email and not _valid_email(user_email):
+            return JSONResponse({"error": "invalid user_email format"}, status_code=400)
+
+    if paypal_email is not None:
+        paypal_email = str(paypal_email).strip().lower()
+        if paypal_email and not _valid_email(paypal_email):
+            return JSONResponse({"error": "invalid paypal_email format"}, status_code=400)
+
+    fields: list[str] = []
+    params: list = []
+
+    if user_name is not None:
+        fields.append("user_name = ?")
+        params.append(str(user_name).strip())
+    if user_email is not None:
+        fields.append("user_email = ?")
+        params.append(user_email)
+    if paypal_email is not None:
+        fields.append("paypal_email = ?")
+        params.append(paypal_email)
+
+    if not fields:
+        return JSONResponse({"error": "no fields to update"}, status_code=400)
+
+    params.append(referral_code)
+
+    async with _referral_db() as db:
+        cur = await db.execute(
+            "SELECT id FROM referrers WHERE referral_code = ? COLLATE NOCASE", (referral_code,)
+        )
+        row = await cur.fetchone()
+        if not row:
+            return JSONResponse({"error": "affiliate not found"}, status_code=404)
+
+        await db.execute(
+            f"UPDATE referrers SET {', '.join(fields)} WHERE referral_code = ? COLLATE NOCASE",
+            params,
+        )
+        await db.commit()
+
+    updated_fields = []
+    if user_name is not None:
+        updated_fields.append("user_name")
+    if user_email is not None:
+        updated_fields.append("user_email")
+    if paypal_email is not None:
+        updated_fields.append("paypal_email")
+
+    print(f"[admin] Affiliate updated: {referral_code} — fields: {updated_fields}")
+    return JSONResponse({"ok": True, "updated_fields": updated_fields})
+
+
+async def api_admin_affiliate_delete(request: Request) -> JSONResponse:
+    """DELETE /api/admin/affiliate/delete — delete an affiliate and optionally their referral records."""
+    if request.method == "OPTIONS":
+        return Response(status_code=204)
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    referral_code    = str(body.get("referral_code", "")).strip()
+    delete_referrals = bool(body.get("delete_referrals", False))
+
+    if not referral_code:
+        return JSONResponse({"error": "referral_code required"}, status_code=400)
+
+    referrals_deleted = 0
+
+    async with _referral_db() as db:
+        cur = await db.execute(
+            "SELECT id FROM referrers WHERE referral_code = ? COLLATE NOCASE", (referral_code,)
+        )
+        row = await cur.fetchone()
+        if not row:
+            return JSONResponse({"error": "affiliate not found"}, status_code=404)
+
+        referrer_id = row[0]
+
+        if delete_referrals:
+            # Count referrals first
+            cur2 = await db.execute(
+                "SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (referrer_id,)
+            )
+            referrals_deleted = (await cur2.fetchone())[0]
+
+            # Delete dependent records
+            await db.execute(
+                """DELETE FROM commission_payments
+                   WHERE referral_id IN (SELECT id FROM referrals WHERE referrer_id = ?)""",
+                (referrer_id,),
+            )
+            await db.execute(
+                "DELETE FROM rewards WHERE referrer_id = ?", (referrer_id,)
+            )
+            await db.execute(
+                "DELETE FROM referral_clicks WHERE referral_code = ? COLLATE NOCASE", (referral_code,)
+            )
+            await db.execute(
+                "DELETE FROM referrals WHERE referrer_id = ?", (referrer_id,)
+            )
+
+        await db.execute(
+            "DELETE FROM referrers WHERE id = ?", (referrer_id,)
+        )
+        await db.commit()
+
+    print(f"[admin] Affiliate deleted: {referral_code} (referrals_deleted={referrals_deleted})")
+    return JSONResponse({
+        "ok": True,
+        "deleted": referral_code,
+        "referrals_deleted": referrals_deleted,
+    })
+
+
+async def api_admin_referral_update(request: Request) -> JSONResponse:
+    """PUT /api/admin/referral/update — update a specific referral record."""
+    if request.method == "OPTIONS":
+        return Response(status_code=204)
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    referral_id = body.get("referral_id")
+    if referral_id is None:
+        return JSONResponse({"error": "referral_id required"}, status_code=400)
+
+    try:
+        referral_id = int(referral_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "referral_id must be an integer"}, status_code=400)
+
+    referred_email = body.get("referred_email")
+    referred_name  = body.get("referred_name")
+    status         = body.get("status")
+
+    allowed_statuses = {"pending", "completed", "rejected"}
+    if status is not None:
+        status = str(status).strip().lower()
+        if status not in allowed_statuses:
+            return JSONResponse(
+                {"error": f"invalid status — must be one of: {', '.join(sorted(allowed_statuses))}"},
+                status_code=400,
+            )
+
+    fields: list[str] = []
+    params: list = []
+
+    if referred_email is not None:
+        referred_email = str(referred_email).strip().lower()
+        fields.append("referred_email = ?")
+        params.append(referred_email)
+    if referred_name is not None:
+        fields.append("referred_name = ?")
+        params.append(str(referred_name).strip())
+    if status is not None:
+        fields.append("status = ?")
+        params.append(status)
+
+    if not fields:
+        return JSONResponse({"error": "no fields to update"}, status_code=400)
+
+    params.append(referral_id)
+
+    async with _referral_db() as db:
+        cur = await db.execute("SELECT id FROM referrals WHERE id = ?", (referral_id,))
+        row = await cur.fetchone()
+        if not row:
+            return JSONResponse({"error": "referral not found"}, status_code=404)
+
+        await db.execute(
+            f"UPDATE referrals SET {', '.join(fields)} WHERE id = ?",
+            params,
+        )
+        await db.commit()
+
+    updated_fields = []
+    if referred_email is not None:
+        updated_fields.append("referred_email")
+    if referred_name is not None:
+        updated_fields.append("referred_name")
+    if status is not None:
+        updated_fields.append("status")
+
+    print(f"[admin] Referral {referral_id} updated — fields: {updated_fields}")
+    return JSONResponse({"ok": True, "updated_fields": updated_fields})
 
 
 async def serve_admin_referrals(request: Request) -> Response:
@@ -5603,6 +5830,9 @@ routes = [
     Route("/api/admin/invites", endpoint=api_admin_invites_list, methods=["GET"]),
     Route("/api/admin/invite/revoke", endpoint=api_admin_invite_revoke, methods=["POST"]),
     Route("/api/admin/affiliates", endpoint=api_admin_affiliates),
+    Route("/api/admin/affiliate/update", endpoint=api_admin_affiliate_update, methods=["PUT", "OPTIONS"]),
+    Route("/api/admin/affiliate/delete", endpoint=api_admin_affiliate_delete, methods=["DELETE", "OPTIONS"]),
+    Route("/api/admin/referral/update", endpoint=api_admin_referral_update, methods=["PUT", "OPTIONS"]),
     Route("/api/admin/payouts", endpoint=api_admin_payouts),
     Route("/admin/referrals", endpoint=serve_admin_referrals),
     Route("/admin/clients", endpoint=serve_admin_clients),

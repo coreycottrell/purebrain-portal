@@ -52,10 +52,17 @@ print(json.dumps({'path':sys.argv[1],'name':sys.argv[2],'message':sys.argv[3]}))
 " "$FILE_PATH" "$ORIGINAL_NAME" "$CAPTION")
 
 # POST to /api/deliverable — server handles file copy + JSONL write
-RESULT=$(curl -sf -X POST "$PORTAL_URL/api/deliverable" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "$PAYLOAD" 2>/dev/null) || RESULT='{"ok":false}'
+# Retry up to 3 times with 2s delay to avoid broken fallback rendering
+for _attempt in 1 2 3; do
+  RESULT=$(curl -sf -X POST "$PORTAL_URL/api/deliverable" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$PAYLOAD" 2>/dev/null) || RESULT='{"ok":false}'
+  if echo "$RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('ok') else 1)" 2>/dev/null; then
+    break
+  fi
+  [ "$_attempt" -lt 3 ] && sleep 2
+done
 
 if echo "$RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('ok') else 1)" 2>/dev/null; then
   STORED=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('filename','unknown'))" 2>/dev/null || echo "unknown")
