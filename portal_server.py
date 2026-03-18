@@ -767,7 +767,10 @@ def check_auth(request: Request) -> bool:
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
         return auth[7:] == BEARER_TOKEN
-    return request.query_params.get("token") == BEARER_TOKEN
+    # Allow query param token ONLY for WebSocket paths (browsers cannot set headers on WS upgrade)
+    if "/ws" in request.url.path:
+        return request.query_params.get("token") == BEARER_TOKEN
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -2255,7 +2258,7 @@ async def api_777_chat(request) -> JSONResponse:
     # CORS for Vercel-hosted 777
     origin = request.headers.get("origin", "")
     cors_origin = origin if (
-        origin.endswith(".vercel.app") or origin == "https://777-command-center.vercel.app"
+        origin == "https://777-command-center.vercel.app"
     ) else "https://777-command-center.vercel.app"
     cors = {
         "Access-Control-Allow-Origin": cors_origin,
@@ -2756,22 +2759,36 @@ async def _execute_paypal_payout(paypal_email: str, amount: float, request_id: s
 
 
 def _hash_affiliate_password(password: str, salt: str = "") -> str:
-    """SHA-256 hash of password+salt. Returns hex digest."""
-    if not salt:
-        salt = secrets.token_hex(16)
-    h = hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
-    return f"{salt}:{h}"
+    """Bcrypt hash of password. Returns bcrypt hash string.
+    The `salt` param is ignored (kept for call-site compatibility with old code).
+    """
+    import bcrypt as _bcrypt
+    return _bcrypt.hashpw(password.encode("utf-8"), _bcrypt.gensalt(rounds=12)).decode("utf-8")
 
 
 def _verify_affiliate_password(password: str, stored_hash: str) -> bool:
-    """Verify password against stored salt:hash string."""
-    if not stored_hash or ":" not in stored_hash:
+    """Verify password against stored hash.
+    Supports both bcrypt (new, starts with $2b$) and legacy SHA-256 (salt:hash).
+    On successful legacy verify, the caller should migrate to bcrypt.
+    """
+    import bcrypt as _bcrypt
+    if not stored_hash:
+        return False
+    if stored_hash.startswith("$2b$") or stored_hash.startswith("$2a$"):
+        # Bcrypt hash
+        try:
+            return _bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8"))
+        except Exception:
+            return False
+    # Legacy SHA-256 format: salt:hexdigest
+    if ":" not in stored_hash:
         return False
     parts = stored_hash.split(":", 1)
     if len(parts) != 2:
         return False
-    salt, _ = parts
-    return _hash_affiliate_password(password, salt) == stored_hash
+    salt_val, expected_hex = parts
+    h = hashlib.sha256(f"{salt_val}:{password}".encode()).hexdigest()
+    return h == expected_hex
 
 
 # ── Password reset tokens (in-memory, expire after 1 hour) ──────────────────
@@ -3032,6 +3049,15 @@ async def api_referral_login(request: Request) -> JSONResponse:
             await db.commit()
     elif not _verify_affiliate_password(password, stored_hash):
         return JSONResponse({"error": "incorrect password"}, status_code=401)
+    elif not (stored_hash.startswith("$2b$") or stored_hash.startswith("$2a$")):
+        # Auto-migrate legacy SHA-256 hash to bcrypt on successful login
+        migrated_hash = _hash_affiliate_password(password)
+        async with _referral_db() as db:
+            await db.execute(
+                "UPDATE referrers SET password_hash = ? WHERE referral_code = ? COLLATE NOCASE",
+                (migrated_hash, row["referral_code"])
+            )
+            await db.commit()
 
     return JSONResponse({"ok": True, "referral_code": row["referral_code"]})
 
@@ -3088,8 +3114,29 @@ async def api_referral_session(request: Request) -> JSONResponse:
                 (pw_hash, row["referral_code"])
             )
             await db.commit()
+        # FIX 3: Log and notify on first-login password claim
+        _code_for_log = row["referral_code"]
+        print(f"[SECURITY] First-login password claim for affiliate code {_code_for_log} from IP {client_ip}")
+        _tg_send = Path(__file__).parent.parent / "projects" / "AI-CIV" / "aether" / "tools" / "tg_send.sh"
+        if _tg_send.exists():
+            try:
+                subprocess.Popen(
+                    [str(_tg_send), f"[SECURITY] First-login claim: affiliate {_code_for_log} from IP {client_ip}. Verify this is legitimate."],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            except Exception as _e:
+                print(f"[SECURITY] TG notify failed: {_e}")
     elif not _verify_affiliate_password(password, stored_hash):
         return JSONResponse({"error": "incorrect password"}, status_code=401)
+    elif not (stored_hash.startswith("$2b$") or stored_hash.startswith("$2a$")):
+        # Auto-migrate legacy SHA-256 hash to bcrypt on successful login
+        migrated_hash = _hash_affiliate_password(password)
+        async with _referral_db() as db:
+            await db.execute(
+                "UPDATE referrers SET password_hash = ? WHERE referral_code = ? COLLATE NOCASE",
+                (migrated_hash, row["referral_code"])
+            )
+            await db.commit()
 
     referral_code = row["referral_code"]
     session_token = _create_affiliate_session(referral_code)
@@ -3498,7 +3545,21 @@ async def api_referral_paypal_email(request: Request) -> JSONResponse:
         )
         await db.commit()
         if cur.rowcount == 0:
-            return JSONResponse({"error": "referrer not found"}, status_code=404)
+            # If the caller is authenticated via portal bearer token but has no
+            # referrer row yet (auto-registration hasn't run or raced), create
+            # one now so the PayPal save succeeds on first attempt.
+            if portal_authed:
+                code = await _generate_unique_code(db)
+                now  = datetime.now(timezone.utc).isoformat()
+                name = email.split("@")[0]
+                pw_hash = _hash_affiliate_password(secrets.token_urlsafe(16))
+                await db.execute(
+                    "INSERT INTO referrers (user_name, user_email, referral_code, password_hash, paypal_email, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (name, email, code, pw_hash, paypal_email, now)
+                )
+                await db.commit()
+            else:
+                return JSONResponse({"error": "referrer not found"}, status_code=404)
 
     return JSONResponse({"ok": True})
 
@@ -5752,7 +5813,11 @@ INVESTOR_INQUIRIES_FILE = SCRIPT_DIR / "investor_inquiries.jsonl"
 
 async def api_investor_question(request: Request) -> JSONResponse:
     """POST /api/investor/question — accept investor inquiry form submissions.
-    No auth required (public endpoint). Validates, logs, and injects tmux notification."""
+    Auth required. Validates, sanitizes, logs, and injects tmux notification."""
+    # Auth guard
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
     # CORS preflight
     if request.method == "OPTIONS":
         return Response(
@@ -5770,11 +5835,14 @@ async def api_investor_question(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid json"}, status_code=400,
                             headers={"Access-Control-Allow-Origin": "*"})
 
-    name     = str(body.get("name",     "")).strip()
-    company  = str(body.get("company",  "")).strip()
-    email    = str(body.get("email",    "")).strip()
-    inv_range = str(body.get("range",    "")).strip()
-    question = str(body.get("question", "")).strip()
+    import re as _re
+    _strip_ctrl = lambda s: _re.sub(r'[\x00-\x1f\x7f]', ' ', s).strip()
+
+    name      = _strip_ctrl(str(body.get("name",     "")))[:100]
+    company   = _strip_ctrl(str(body.get("company",  "")))[:100]
+    email     = _strip_ctrl(str(body.get("email",    "")))[:254]
+    inv_range = _strip_ctrl(str(body.get("range",    "")))[:50]
+    question  = _strip_ctrl(str(body.get("question", "")))[:2000]
 
     # Validate required fields
     if not email or not question:
@@ -5819,11 +5887,12 @@ async def api_investor_question(request: Request) -> JSONResponse:
     # Inject into tmux session so Aether sees it immediately
     session = get_tmux_session()
     tmux_text = (
-        f"\n[INVESTOR INQUIRY] New question from {entry['name']} ({email}):\n"
+        f"\n[INVESTOR INQUIRY - EXTERNAL INPUT] New question from {entry['name']} ({email}):\n"
         f"Company: {company or 'Not provided'}\n"
         f"Investment Range: {inv_range or 'Not specified'}\n"
         f"Question: {question}\n"
-        f"---\nReply with: /respond-investor {email} Your response here"
+        f"--- END EXTERNAL INPUT ---\n"
+        f"Reply with: /respond-investor {email} Your response here"
     )
     try:
         await _run_subprocess_async(
