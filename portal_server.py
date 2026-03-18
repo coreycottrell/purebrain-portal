@@ -101,7 +101,7 @@ else:
     BEARER_TOKEN = secrets.token_urlsafe(32)
     TOKEN_FILE.write_text(BEARER_TOKEN)
     TOKEN_FILE.chmod(0o600)
-    print(f"[portal] Generated new bearer token: {BEARER_TOKEN}")
+    print(f"[portal] Generated new bearer token (saved to {TOKEN_FILE})")
 
 # ─── Affiliate login rate-limiting (in-memory, resets on restart) ───────────
 # { ip_hash: {"count": N, "window_start": epoch_float} }
@@ -112,6 +112,11 @@ _LOGIN_WINDOW_SECS  = 900         # 15 minutes
 # ─── Affiliate session tokens: { token: {"code": ..., "expires": epoch} } ───
 _AFFILIATE_SESSIONS: dict = {}
 _SESSION_TTL_SECS = 86400 * 7     # 7 days
+
+# ─── Referral track rate-limiting (prevents click-spam abuse) ────────────────
+_TRACK_RATE_LIMITS: dict = {}  # ip_hash -> {"count": N, "window_start": epoch}
+_TRACK_MAX_PER_WINDOW = 30    # max clicks per IP per window
+_TRACK_WINDOW_SECS = 300      # 5-minute window
 
 # ─── PayPal credentials ───────────────────────────────────────────────────────
 PAYPAL_SANDBOX = os.environ.get("PAYPAL_SANDBOX", "true").lower() != "false"
@@ -1270,6 +1275,10 @@ async def api_deliverable(request: Request) -> JSONResponse:
     if not src_path.exists() or not src_path.is_file():
         return JSONResponse({"error": f"file not found: {src_path_str}"}, status_code=404)
 
+    # HIGH-003: Restrict file access to allowed directories only
+    if not any(str(src_path).startswith(str(d.resolve())) for d in DOWNLOAD_ALLOWED_DIRS):
+        return JSONResponse({"error": "path not in allowed directories"}, status_code=403)
+
     if not display_name:
         display_name = src_path.name
     safe_name = "".join(c for c in display_name if c.isalnum() or c in "._-") or "deliverable"
@@ -2259,8 +2268,8 @@ async def api_777_chat(request) -> JSONResponse:
     if request.method == "OPTIONS":
         return Response("", status_code=204, headers=cors)
 
-    # Rate limit by IP
-    ip = request.headers.get("x-forwarded-for", request.client.host or "unknown").split(",")[0].strip()
+    # Rate limit by IP — use client.host (not X-Forwarded-For which can be spoofed)
+    ip = request.client.host or "unknown"
     now = time.time()
     entry = _777_RATE_LIMITS.get(ip)
     if not entry or now - entry["window_start"] > _777_RATE_WINDOW:
@@ -2776,8 +2785,11 @@ def _send_reset_email(to_email: str, reset_url: str) -> bool:
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
 
-    smtp_user = "purebrain@puremarketing.ai"
-    smtp_pass = "mldvztmeligxhyaw"
+    smtp_user = os.environ.get("SMTP_USER", "")
+    smtp_pass = os.environ.get("SMTP_PASS", "")
+    if not smtp_user or not smtp_pass:
+        print("[portal] WARNING: SMTP_USER/SMTP_PASS not set in environment — cannot send reset email")
+        return
 
     msg = MIMEMultipart("alternative")
     msg["From"] = f"PureBrain <{smtp_user}>"
@@ -3232,6 +3244,19 @@ async def api_referral_track(request: Request) -> JSONResponse:
     # Hash IP for privacy
     client_ip = request.client.host if request.client else ""
     ip_hash = hashlib.sha256(client_ip.encode()).hexdigest()[:16]
+
+    # HIGH-007: Rate limit click tracking to prevent spam/inflation
+    now_ts = time.time()
+    entry = _TRACK_RATE_LIMITS.get(ip_hash)
+    if entry is None:
+        _TRACK_RATE_LIMITS[ip_hash] = {"count": 1, "window_start": now_ts}
+    elif now_ts - entry["window_start"] > _TRACK_WINDOW_SECS:
+        _TRACK_RATE_LIMITS[ip_hash] = {"count": 1, "window_start": now_ts}
+    elif entry["count"] >= _TRACK_MAX_PER_WINDOW:
+        return JSONResponse({"error": "rate limited"}, status_code=429)
+    else:
+        entry["count"] += 1
+
     now = datetime.now(timezone.utc).isoformat()
 
     async with _referral_db() as db:
@@ -3253,6 +3278,8 @@ async def api_referral_track(request: Request) -> JSONResponse:
 
 async def api_referral_complete(request: Request) -> JSONResponse:
     """POST /api/referral/complete — mark a referral as completed and issue reward."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -3605,6 +3632,7 @@ async def api_referral_payout_request(request: Request) -> JSONResponse:
 
     # Auth: portal bearer OR valid affiliate session
     portal_authed = check_auth(request)
+    session_code = None
     if not portal_authed:
         session_token = (
             str(body.get("session_token", "")).strip()
@@ -3626,6 +3654,10 @@ async def api_referral_payout_request(request: Request) -> JSONResponse:
 
     if not referral_code:
         return JSONResponse({"error": "missing referral_code"}, status_code=400)
+
+    # IDOR fix: affiliate sessions can only request payouts for their own code
+    if not portal_authed and session_code and session_code.upper() != referral_code.upper():
+        return JSONResponse({"error": "access denied"}, status_code=403)
 
     if amount < PAYOUT_MIN_AMOUNT:
         return JSONResponse(
@@ -3758,6 +3790,7 @@ async def api_referral_payout_request(request: Request) -> JSONResponse:
 async def api_referral_payout_history(request: Request) -> JSONResponse:
     """GET /api/referral/payout-history?referral_code=XXX&session=TOKEN"""
     portal_authed = check_auth(request)
+    session_code = None
     if not portal_authed:
         session_token = (
             request.query_params.get("session", "").strip()
@@ -3770,6 +3803,10 @@ async def api_referral_payout_history(request: Request) -> JSONResponse:
     referral_code = request.query_params.get("referral_code", "").strip()
     if not referral_code:
         return JSONResponse({"error": "missing referral_code"}, status_code=400)
+
+    # HIGH-005: IDOR fix — affiliate sessions can only view their own payout history
+    if not portal_authed and session_code and session_code.upper() != referral_code.upper():
+        return JSONResponse({"error": "access denied"}, status_code=403)
 
     all_requests = _read_payout_requests()
     user_requests = [r for r in all_requests if r.get("referral_code") == referral_code]
@@ -4907,6 +4944,9 @@ REACTION_LOG = Path.home() / "purebrain_portal" / "reaction-sentiment.jsonl"
 
 async def api_reaction(request: Request) -> JSONResponse:
     """Log emoji reaction as sentiment data point."""
+    # MED-005: Require auth to prevent unauthenticated sentiment manipulation
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -5034,6 +5074,36 @@ async def api_user_settings(request: Request) -> JSONResponse:
     settings.update(body)
     _save_settings(settings)
     return JSONResponse({"ok": True, "settings": settings})
+
+# ---------------------------------------------------------------------------
+# Bookmarks API (server-side persistence, syncs across devices)
+# ---------------------------------------------------------------------------
+BOOKMARKS_FILE = SCRIPT_DIR / "bookmarks.json"
+
+def _load_bookmarks() -> list:
+    try:
+        return json.loads(BOOKMARKS_FILE.read_text()) if BOOKMARKS_FILE.exists() else []
+    except Exception:
+        return []
+
+def _save_bookmarks(data: list):
+    BOOKMARKS_FILE.write_text(json.dumps(data, indent=2))
+
+async def api_bookmarks(request: Request) -> JSONResponse:
+    """GET returns saved bookmarks array, POST saves bookmarks array (server wins)."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if request.method == "GET":
+        return JSONResponse(_load_bookmarks())
+    # POST — replace bookmarks with the full array sent by client
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    if not isinstance(body, list):
+        return JSONResponse({"error": "expected array"}, status_code=400)
+    _save_bookmarks(body)
+    return JSONResponse({"ok": True, "count": len(body)})
 
 # ---------------------------------------------------------------------------
 # Agents, Commands & Shortcuts API
@@ -5311,9 +5381,14 @@ async def api_agents_update_status(request: Request) -> JSONResponse:
     Body (JSON):
         { "agent": "<agent-id>", "status": "active|idle|working|offline",
           "task": "<description>"  [optional, cleared when idle]  }
-    No auth required so hook scripts can call it without a bearer token.
+    Accepts bearer token OR localhost-only requests (hook scripts).
     """
     import json as _j
+    # HIGH-006: Restrict to authenticated users or localhost callers
+    if not check_auth(request):
+        client_ip = request.client.host if request.client else ""
+        if client_ip not in ("127.0.0.1", "::1", "localhost"):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -5865,6 +5940,7 @@ routes = [
     Route("/api/whatsapp/qr", endpoint=api_whatsapp_qr),
     Route("/api/whatsapp/status", endpoint=api_whatsapp_status),
     Route("/api/settings", endpoint=api_user_settings, methods=["GET", "POST", "PUT"]),
+    Route("/api/bookmarks", endpoint=api_bookmarks, methods=["GET", "POST"]),
     WebSocketRoute("/ws/chat", endpoint=ws_chat),
     WebSocketRoute("/ws/terminal", endpoint=ws_terminal),
 ]
@@ -5877,7 +5953,7 @@ app = Starlette(
             CORSMiddleware,
             allow_origins=["https://purebrain.ai", "https://www.purebrain.ai", "https://app.purebrain.ai", "https://777-command-center.vercel.app"],
             allow_methods=["GET", "POST", "OPTIONS"],
-            allow_headers=["Content-Type"],
+            allow_headers=["Content-Type", "Authorization", "X-Affiliate-Session"],
         ),
     ],
 )
@@ -5894,5 +5970,5 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 8097))
     print(f"[portal] Starting PureBrain Portal on port {port}")
-    print(f"[portal] Bearer token: {BEARER_TOKEN}")
+    print(f"[portal] Bearer token: {BEARER_TOKEN[:8]}...{BEARER_TOKEN[-4:]}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

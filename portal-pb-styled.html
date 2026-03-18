@@ -6610,6 +6610,43 @@
 
   var bookmarks = JSON.parse(localStorage.getItem('purebrain_bookmarks') || '[]');
 
+  // ===== BOOKMARK SERVER SYNC =====
+  function _syncBookmarksToServer() {
+    if (!token) return;
+    fetch('/api/bookmarks', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify(bookmarks)
+    }).catch(function() {});
+  }
+
+  function _loadBookmarksFromServer() {
+    if (!token) return;
+    fetch('/api/bookmarks', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    }).then(function(r) { return r.json(); }).then(function(serverBMs) {
+      if (!Array.isArray(serverBMs)) return;
+      // Merge: server items + any local-only items (by id), server wins for conflicts
+      var merged = serverBMs.slice();
+      var serverIds = new Set(serverBMs.map(function(b) { return b.id; }));
+      bookmarks.forEach(function(b) {
+        if (!serverIds.has(b.id)) merged.push(b);
+      });
+      bookmarks = merged;
+      localStorage.setItem('purebrain_bookmarks', JSON.stringify(bookmarks));
+      renderBookmarks();
+      // Re-apply bookmarked state on already-rendered messages
+      merged.forEach(function(bm) {
+        var msgEl = typeof chatMessages !== 'undefined' && chatMessages
+          ? chatMessages.querySelector('[data-id="' + bm.id + '"]') : null;
+        if (msgEl) {
+          var btn = msgEl.querySelector('.bookmark-btn');
+          if (btn) btn.classList.add('bookmarked');
+        }
+      });
+    }).catch(function() {});
+  }
+
   // ===== EMOJI REACTIONS STATE (Task 10) =====
   // reactions: { [msgId]: { [emoji]: count } }  — only 'You' can react, so count is 0 or 1
   var reactions = JSON.parse(localStorage.getItem('purebrain_reactions') || '{}');
@@ -7188,8 +7225,14 @@
     s = s.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
     s = s.replace(/(?<![a-zA-Z0-9])_([^_\n]+)_(?![a-zA-Z0-9])/g, '<em>$1</em>');
 
-    // 7. Links [text](url) — no inline color; CSS handles user vs assistant bubble link colors
-    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    // 7. Links [text](url) — validate URL scheme to prevent javascript: XSS
+    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, function(m, text, url) {
+      var u = url.trim().toLowerCase();
+      if (u.startsWith('http://') || u.startsWith('https://') || u.startsWith('/') || u.startsWith('mailto:')) {
+        return '<a href="' + url + '" target="_blank" rel="noopener">' + text + '</a>';
+      }
+      return text + ' (' + url + ')'; // render as plain text if suspicious scheme
+    });
 
     // 7b. Auto-link bare URLs — split on existing <a> blocks to avoid double-linking
     s = (function linkifyOutsideAnchors(html) {
@@ -7443,6 +7486,7 @@
     renderSidebarCmds();
     renderFleet();
     loadTeams();
+    setTimeout(_loadBookmarksFromServer, 600);
     fetchReleaseNotes();
     if (!teamsInterval) teamsInterval = setInterval(loadTeams, 5000);
 
@@ -10019,7 +10063,7 @@
     }
     fetch('/api/reaction', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (localStorage.getItem('purebrain_token') || '') },
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (token || localStorage.getItem('portal_token') || '') },
       body: JSON.stringify({ msg_id: msgId, emoji: emoji, action: action, msg_preview: msgPreview, msg_role: msgRole })
     }).catch(function() {});
   }
@@ -10156,6 +10200,7 @@
       showToast('Bookmarked!');
     }
     localStorage.setItem('purebrain_bookmarks', JSON.stringify(bookmarks));
+    _syncBookmarksToServer();
     renderBookmarks();
   }
 
@@ -10257,6 +10302,7 @@
             if (bmBtn) bmBtn.classList.remove('bookmarked');
           }
           localStorage.setItem('purebrain_bookmarks', JSON.stringify(bookmarks));
+          _syncBookmarksToServer();
           showToast('Bookmark removed');
           renderBookmarks();
         }
@@ -11688,7 +11734,10 @@
     try { return JSON.parse(localStorage.getItem('purebrain_portal_cmds')) || DEFAULT_CMDS.slice(); }
     catch(e) { return DEFAULT_CMDS.slice(); }
   }
-  function saveCmds(cmds) { localStorage.setItem('purebrain_portal_cmds', JSON.stringify(cmds)); }
+  function saveCmds(cmds) {
+    localStorage.setItem('purebrain_portal_cmds', JSON.stringify(cmds));
+    if (token) _syncSettingsToServer({ purebrain_portal_cmds: cmds });
+  }
 
   function moveCmdUp(i) {
     var cmds = loadCmds();
@@ -12765,9 +12814,10 @@
             schedPayload.recur_time = recurTime;
             if (recurDays) schedPayload.recur_days = recurDays;
           }
+          var schedToken = token || localStorage.getItem('portal_token') || '';
           fetch('/api/schedule-task', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + schedToken },
             body: JSON.stringify(schedPayload)
           })
           .then(function(res) { return res.json(); })
@@ -14483,45 +14533,52 @@ console.log('[PureBrain Neural 3D] Initialized — login background active');
     fetch('/api/settings', {
       headers: { 'Authorization': 'Bearer ' + token }
     }).then(function(r) { return r.json(); }).then(function(s) {
-      var localKey = localStorage.getItem('elevenlabs_api_key');
-      var localVoice = localStorage.getItem('elevenlabs_voice_id');
-      var localEngine = localStorage.getItem('hmi_engine');
+      // Server is source of truth — apply server values and update localStorage to match
 
-      // Server → Local: pull settings we don't have locally
-      if (s.elevenlabs_api_key && !localKey) {
+      if (s.elevenlabs_api_key) {
         _elApiKey = s.elevenlabs_api_key;
         localStorage.setItem('elevenlabs_api_key', _elApiKey);
+        window._elApiKeyGlobal = _elApiKey;
       }
-      if (s.elevenlabs_voice_id && !localVoice) {
+      if (s.elevenlabs_voice_id) {
         _elVoiceId = s.elevenlabs_voice_id;
         localStorage.setItem('elevenlabs_voice_id', _elVoiceId);
+        window._elVoiceIdGlobal = _elVoiceId;
       }
-      if (s.hmi_engine && !localEngine) {
+      if (s.hmi_engine) {
         localStorage.setItem('hmi_engine', s.hmi_engine);
       }
-
-      // Server → Local: pull send word if we don't have it locally
-      var localSendWord = localStorage.getItem('hmi_send_word');
-      if (s.hmi_send_word && !localSendWord) {
+      if (s.hmi_send_word) {
         _hmiSendWord = s.hmi_send_word;
         localStorage.setItem('hmi_send_word', s.hmi_send_word);
         var swInput = document.getElementById('hmiSendWord');
         if (swInput) swInput.value = _hmiSendWord;
       }
+      if (s.purebrain_portal_cmds) {
+        localStorage.setItem('purebrain_portal_cmds', JSON.stringify(s.purebrain_portal_cmds));
+      }
 
-      // Local → Server: push settings we have locally but server doesn't
+      // If server has no settings yet, seed it from localStorage (first-device bootstrap)
+      var localKey = localStorage.getItem('elevenlabs_api_key');
+      var localVoice = localStorage.getItem('elevenlabs_voice_id');
+      var localEngine = localStorage.getItem('hmi_engine');
+      var localSendWord = localStorage.getItem('hmi_send_word');
+      var localCmds = localStorage.getItem('purebrain_portal_cmds');
       var pushData = {};
-      if (localKey && !s.elevenlabs_api_key) pushData.elevenlabs_api_key = localKey;
-      if (localVoice && !s.elevenlabs_voice_id) pushData.elevenlabs_voice_id = localVoice;
-      if (localEngine && !s.hmi_engine) pushData.hmi_engine = localEngine;
-      if (localSendWord && !s.hmi_send_word) pushData.hmi_send_word = localSendWord;
+      if (!s.elevenlabs_api_key && localKey) pushData.elevenlabs_api_key = localKey;
+      if (!s.elevenlabs_voice_id && localVoice) pushData.elevenlabs_voice_id = localVoice;
+      if (!s.hmi_engine && localEngine) pushData.hmi_engine = localEngine;
+      if (!s.hmi_send_word && localSendWord) pushData.hmi_send_word = localSendWord;
+      if (!s.purebrain_portal_cmds && localCmds) {
+        try { pushData.purebrain_portal_cmds = JSON.parse(localCmds); } catch(e) {}
+      }
       if (Object.keys(pushData).length > 0) _syncSettingsToServer(pushData);
 
-      // If EL settings available (from either source), activate EL engine
-      if ((s.hmi_engine === 'elevenlabs' || localEngine === 'elevenlabs') && _elApiKey && typeof _elSwitchEngine === 'function') {
+      // Activate EL engine if server says it's enabled
+      var activeEngine = s.hmi_engine || localStorage.getItem('hmi_engine');
+      if (activeEngine === 'elevenlabs' && _elApiKey && typeof _elSwitchEngine === 'function') {
         setTimeout(function() {
           _elSwitchEngine(true);
-          // Fetch user's custom voices on load so they appear in dropdowns
           if (typeof _elFetchCustomVoices === 'function') _elFetchCustomVoices(_elApiKey);
           console.log('[EL] Server settings restored: engine=elevenlabs, voice=' + _elVoiceId);
         }, 500);
