@@ -9432,7 +9432,7 @@
 
         var fd = new FormData();
         fd.append('file', file);
-        // Include the typed message as caption so Aether receives INSTRUCTIONS from Jared
+        // Include the typed message as caption so the AI receives instructions with the file
         if (fullMsg) { fd.append('caption', fullMsg); }
         fetch('/api/chat/upload', {
           method: 'POST',
@@ -10834,7 +10834,7 @@
         // Show success toast
         var toast = document.getElementById('toast');
         if (toast) {
-          toast.textContent = 'Payout request submitted! Jared will process within 2 business days.';
+          toast.textContent = 'Payout request submitted! Your payout will be processed within 2 business days.';
           toast.classList.add('show');
           setTimeout(function() { toast.classList.remove('show'); }, 5000);
         }
@@ -13876,8 +13876,7 @@ console.log('[PureBrain Neural 3D] Initialized — login background active');
         <input class="el-modal-input" type="password" id="elApiKeyInput" placeholder="Paste your ElevenLabs API key here" autocomplete="off" spellcheck="false" />
         <label class="el-modal-label" for="elVoiceSelectModal">Voice</label>
         <select class="el-voice-select" id="elVoiceSelectModal">
-            <option value="RX0kjGhuL9AMRVJm2dG5" selected>Aether — custom voice ✦</option>
-            <option value="pNInz6obpgDQGcFmaJgB">Adam — deep, authoritative</option>
+            <option value="pNInz6obpgDQGcFmaJgB" selected>Adam — deep, authoritative</option>
             <option value="ErXwobaYiN019PkySvjV">Antoni — warm, professional</option>
             <option value="TxGEqnHWrfWFTfGW9XjX">Josh — deep, narrative</option>
             <option value="VR6AewLTigWG4xSOukaG">Arnold — powerful, commanding</option>
@@ -14462,7 +14461,7 @@ console.log('[PureBrain Neural 3D] Initialized — login background active');
   // === ELEVENLABS TTS ===
   var _elEnabled = false; // true when ElevenLabs engine is active
   var _elApiKey = localStorage.getItem('elevenlabs_api_key') || '';
-  var _elVoiceId = localStorage.getItem('elevenlabs_voice_id') || 'RX0kjGhuL9AMRVJm2dG5';
+  var _elVoiceId = localStorage.getItem('elevenlabs_voice_id') || 'pNInz6obpgDQGcFmaJgB';
   // Expose to window for inline onclick handlers (Save/Cancel buttons)
   window._elApiKeyGlobal = _elApiKey;
   window._elVoiceIdGlobal = _elVoiceId;
@@ -14871,7 +14870,6 @@ console.log('[PureBrain Neural 3D] Initialized — login background active');
 
     // Stock ElevenLabs voices (always available)
     var _elStockVoices = [
-      { id: 'RX0kjGhuL9AMRVJm2dG5', label: 'Aether — custom voice ✦' },
       { id: 'pNInz6obpgDQGcFmaJgB', label: 'Adam — deep, authoritative' },
       { id: 'ErXwobaYiN019PkySvjV', label: 'Antoni — warm, professional' },
       { id: 'TxGEqnHWrfWFTfGW9XjX', label: 'Josh — deep, narrative' },

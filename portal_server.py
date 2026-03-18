@@ -2073,7 +2073,7 @@ async def api_schedule_task(request) -> JSONResponse:
     return JSONResponse({"ok": True, "task_id": task_id, "fire_at": fire_at, "recur_type": recur_type})
 
 
-BOOP_STATE_FILE = Path("/home/jared/projects/AI-CIV/aether/.claude/scheduled-tasks-state.json")
+BOOP_STATE_FILE = Path(os.environ.get("CIV_ROOT", str(Path.home() / "projects/AI-CIV/aether"))) / ".claude/scheduled-tasks-state.json"
 
 async def api_boops_list(request) -> JSONResponse:
     """GET /api/boops — list all BOOPs from boop_executor config."""
@@ -2274,7 +2274,7 @@ async def api_777_chat(request) -> JSONResponse:
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
         # Try loading from .env
-        env_path = Path("/home/jared/projects/AI-CIV/aether/.env")
+        env_path = Path(os.environ.get("CIV_ROOT", str(Path.home()))) / ".env"
         if env_path.exists():
             for line in env_path.read_text().splitlines():
                 if line.startswith("ANTHROPIC_API_KEY="):
@@ -3095,7 +3095,7 @@ async def api_referral_dashboard(request: Request) -> JSONResponse:
     code     = request.query_params.get("code", "").strip().upper()
     email    = request.query_params.get("email", "").strip().lower()
     password = request.query_params.get("password", "").strip()
-    # Portal owner (Jared) can see any dashboard without affiliate password
+    # Portal owner (admin) can see any dashboard without affiliate password
     portal_authed = check_auth(request)
 
     if not code and not email:
@@ -3116,7 +3116,7 @@ async def api_referral_dashboard(request: Request) -> JSONResponse:
             return JSONResponse({"error": "referrer not found"}, status_code=404)
 
         # Security: dashboard requires either:
-        #   1. Portal bearer token (Jared / admin)
+        #   1. Portal bearer token (admin)
         #   2. A valid affiliate session token (?session=TOKEN, or X-Affiliate-Session header)
         #   3. Direct password param (?password=...) as fallback for API callers
         if not portal_authed:
@@ -5250,7 +5250,7 @@ async def _seed_aether_agents(db) -> None:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 agent_id,
-                "jared",
+                CIV_NAME,
                 name,
                 description[:500] if description else "",
                 agent_type,
@@ -5348,7 +5348,7 @@ async def api_agents_update_status(request: Request) -> JSONResponse:
                 """INSERT OR IGNORE INTO agents
                    (id, user_id, name, status, current_task, last_completed, created_at, last_active)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (agent_id, "jared", name, status, task, "", now, now),
+                (agent_id, CIV_NAME, name, status, task, "", now, now),
             )
         else:
             if status == "idle":
