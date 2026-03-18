@@ -1,0 +1,48 @@
+tunnel: fa55839c-e753-4a96-935c-cc58cf24b4b8
+credentials-file: /root/.cloudflared/fa55839c-e753-4a96-935c-cc58cf24b4b8.json
+
+ingress:
+  # Admin portal — Jared's internal portal at portal.purebrain.ai
+  - hostname: portal.purebrain.ai
+    service: http://localhost:8099
+    originRequest:
+      connectTimeout: 30s
+      tcpKeepAlive: 3600s
+
+  # Main API / log server
+  - hostname: api.purebrain.ai
+    service: https://localhost:8443
+    originRequest:
+      noTLSVerify: true
+      connectTimeout: 30s
+      tcpKeepAlive: 30s
+
+  # Video management GUI
+  - hostname: video.purebrain.ai
+    service: http://localhost:8765
+    originRequest:
+      connectTimeout: 60s
+      tcpKeepAlive: 30s
+
+  # Command Center / Comms Gateway
+  - hostname: cc.purebrain.ai
+    service: http://localhost:8870
+    originRequest:
+      connectTimeout: 30s
+      tcpKeepAlive: 30s
+  - hostname: comms.purebrain.ai
+    service: http://localhost:8870
+    originRequest:
+      connectTimeout: 30s
+      tcpKeepAlive: 30s
+
+  # Customer portals — wildcard *.purebrain.ai → nginx dynamic router on 8099
+  # nginx then routes each subdomain to the correct container on Witness infrastructure
+  - hostname: '*.purebrain.ai'
+    service: http://localhost:8099
+    originRequest:
+      connectTimeout: 30s
+      tcpKeepAlive: 3600s
+
+  # Fallback
+  - service: http_status:404

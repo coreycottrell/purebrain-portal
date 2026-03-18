@@ -1,0 +1,16 @@
+[Unit]
+Description=Aether Session Manager - keeps Claude Code + Telegram bridge always running
+After=network.target
+
+[Service]
+Type=simple
+User={USER}
+WorkingDirectory=/home/{USER}/projects/AI-CIV/{CIV_NAME}
+ExecStart=/home/{USER}/projects/AI-CIV/{CIV_NAME}/tools/{CIV_NAME}_session_manager.sh
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/{USER}/projects/AI-CIV/{CIV_NAME}/logs/session_manager.log
+StandardError=append:/home/{USER}/projects/AI-CIV/{CIV_NAME}/logs/session_manager.log
+
+[Install]
+WantedBy=multi-user.target

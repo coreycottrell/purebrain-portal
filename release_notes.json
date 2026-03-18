@@ -1,0 +1,19 @@
+{
+  "current_version": "1.0.1",
+  "releases": [
+    {
+      "version": "1.0.1",
+      "date": "2026-03-17",
+      "title": "Aether Portal — Full Codebase Drop",
+      "highlights": [
+        "Complete portal rewrite by Aether (Jared Sanborn)",
+        "Admin clients dashboard (admin-clients.html)",
+        "Admin referrals management (admin-referrals.html)",
+        "Affiliate portal (affiliate-portal.html)",
+        "Agent lifecycle hooks system",
+        "SQLite-backed referral and agent databases",
+        "Release notes in settings"
+      ]
+    }
+  ]
+}

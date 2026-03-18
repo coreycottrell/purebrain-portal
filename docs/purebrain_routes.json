@@ -1,0 +1,12 @@
+{
+  "keenjared": {
+    "subdomain": "keenjared",
+    "portal_url": "https://keenjared.ai-civ.com",
+    "container": "aiciv-12",
+    "human_email": "demo@puretechnology.nyc",
+    "human_name": "Jared Sanborn",
+    "civ_name": "keen",
+    "purebrain_url": "https://keenjared.purebrain.ai",
+    "created_at": "2026-03-04T09:03:28.101328+00:00"
+  }
+}

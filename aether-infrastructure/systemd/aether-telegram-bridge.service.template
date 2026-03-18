@@ -1,0 +1,17 @@
+[Unit]
+Description=Aether Telegram Bridge
+After=network.target
+
+[Service]
+Type=simple
+User={USER}
+WorkingDirectory=/home/{USER}/projects/AI-CIV/{CIV_NAME}
+ExecStartPre=/bin/touch /home/{USER}/tg_bridge.log
+ExecStart=/usr/bin/python3 -u tools/telegram_bridge.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/{USER}/tg_bridge.log
+StandardError=append:/home/{USER}/tg_bridge.log
+
+[Install]
+WantedBy=multi-user.target
