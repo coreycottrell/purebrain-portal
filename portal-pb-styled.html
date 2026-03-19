@@ -8099,42 +8099,35 @@
   }
 
   // --- Smart scroll: only auto-scroll if user is near the bottom ---
-  // Track whether user has intentionally scrolled up to READ.
-  // When true, ALL auto-scrolling is suppressed until user returns to bottom.
-  var _userIsReading = false;
-  var _lastScrollTop = 0;
-  var _NEAR_BOTTOM_PX = 150; // px from bottom to count as "at bottom"
+  // _userWasNearBottom is updated on EVERY scroll event (including programmatic ones).
+  // This is the scroll-event-tracked flag approach from March 17 MVP — proven to work.
+  // Key insight: we track what the scroll position WAS, not whether the user "intends to read".
+  // Programmatic scrolls (history load, rAF) move position DOWN → flag stays true.
+  // User scroll UP → flag becomes false. User scrolls back down → flag becomes true again.
+  var _userWasNearBottom = true;
+  // _NEAR_BOTTOM_PX: generous threshold so we don't fight user at bottom of long threads
+  var _NEAR_BOTTOM_PX = 300;
   function isNearBottom(el, threshold) {
     if (!el) return true;
     threshold = threshold || _NEAR_BOTTOM_PX;
     return (el.scrollHeight - el.scrollTop - el.clientHeight) < threshold;
   }
-  // Detect user scrolling UP = they want to read, don't fight them
+  // Update the near-bottom flag on EVERY scroll event
   if (chatMessages) {
     chatMessages.addEventListener('scroll', function() {
-      var currentTop = chatMessages.scrollTop;
-      if (currentTop < _lastScrollTop - 5) {
-        // User scrolled UP — they're reading, leave them alone
-        _userIsReading = true;
-      } else if (isNearBottom(chatMessages, _NEAR_BOTTOM_PX)) {
-        // User scrolled back to bottom — resume auto-scroll
-        _userIsReading = false;
-      }
-      _lastScrollTop = currentTop;
+      _userWasNearBottom = isNearBottom(chatMessages, _NEAR_BOTTOM_PX);
     });
   }
   function smartScroll(el) {
-    // If user has scrolled up to read, NEVER auto-scroll
-    if (_userIsReading) {
-      requestAnimationFrame(function() { updateScrollToBottomBtn(); });
-      return;
-    }
-    // User is at the bottom (not reading) — always scroll to show new content.
-    // Previous bug: checking isNearBottom inside rAF failed because by the time
-    // rAF fires, new content has already pushed scroll position away from bottom.
-    // The _userIsReading flag (set by scroll listener) is the reliable guard.
+    // Use rAF to ensure DOM layout is complete before measuring/scrolling.
+    // Rely ONLY on the scroll-event-tracked _userWasNearBottom flag.
+    // Do NOT use isNearBottom() as a secondary guard inside rAF — doing so causes
+    // the forced-scroll bug where content growth below the viewport looks like
+    // the user scrolled away. Trust the event-tracked flag only.
     requestAnimationFrame(function() {
-      el.scrollTop = el.scrollHeight;
+      if (_userWasNearBottom) {
+        el.scrollTop = el.scrollHeight;
+      }
       updateScrollToBottomBtn();
     });
   }
@@ -8156,8 +8149,9 @@
     _scrollBtn.addEventListener('click', function() {
       if (chatMessages) {
         chatMessages.scrollTop = chatMessages.scrollHeight;
-        _userIsReading = false; // User clicked scroll-to-bottom — resume auto-scroll
+        _userWasNearBottom = true; // User clicked scroll-to-bottom — resume auto-scroll
         _scrollBtn.classList.remove('visible');
+        updateScrollToBottomBtn();
       }
     });
   }
@@ -8178,11 +8172,11 @@
     if (knownMsgIds.has(msgId)) return;
     knownMsgIds.add(msgId);
 
-    // CAPTURE scroll position BEFORE adding the message to the DOM.
-    // After adding, scrollHeight grows by the message height, which can
-    // trick isNearBottom into thinking the user scrolled up. By checking
-    // BEFORE, we know the user's true intent (at bottom = auto-scroll).
-    var _wasNearBottom = isNearBottom(chatMessages, 200);
+    // CAPTURE scroll state BEFORE adding the message to the DOM.
+    // Use the event-tracked _userWasNearBottom flag (not a fresh isNearBottom call)
+    // because after appending the message, scrollHeight grows — an isNearBottom
+    // call would incorrectly report "not near bottom" even if user was there.
+    var _wasNearBottom = _userWasNearBottom;
 
     // Fade the welcome hero when messages appear
     var hero = document.getElementById('welcomeHero');
@@ -8430,8 +8424,9 @@
       if (_amNewCard && _pfMatchAM) _amNewCard.setAttribute('data-portal-stored', _pfMatchAM[1].trim());
     }
     chatMessages.appendChild(div);
-    // Respect user reading state — never fight their scroll position
-    if (!_userIsReading && _wasNearBottom) {
+    // Scroll to bottom if user was near the bottom before this message was added.
+    // Uses the event-tracked _wasNearBottom flag (captured before DOM insert).
+    if (_wasNearBottom) {
       requestAnimationFrame(function() {
         chatMessages.scrollTop = chatMessages.scrollHeight;
         updateScrollToBottomBtn();
@@ -9575,9 +9570,9 @@
     lastSentOptimisticText = fullMsg;
     lastSentRawText = rawMsg || fullMsg;
     addThinkingIndicator(thinkingId);
-    // Force scroll to bottom after user sends — unconditional (not smartScroll)
-    // User just sent a message = they want to see the response, clear reading flag
-    _userIsReading = false;
+    // Force scroll to bottom after user sends — unconditional.
+    // User just sent a message = they want to see the response, resume auto-scroll.
+    _userWasNearBottom = true;
     requestAnimationFrame(function() { chatMessages.scrollTop = chatMessages.scrollHeight; });
     // Task 8: store thinkingId so chatWs.onmessage can hand it to startStreamingMessage
     // The streamer will remove the indicator on the first token, not when fetch completes
@@ -9594,6 +9589,11 @@
         window._pendingThinkingId = null;
         addMessage('Error: ' + data.error, 'assistant', null, 'err-' + Date.now());
         removeThinkingIndicator(thinkingId);
+      } else if (data.msg_id) {
+        // Pre-register the server-assigned message ID so the WS poll-loop echo
+        // (which arrives ~1.5s later with the same ID) is silently suppressed.
+        // This is the reliable fix for the duplicate-user-message bug.
+        knownMsgIds.add(data.msg_id);
       }
     })
     .catch(function(e) {

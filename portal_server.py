@@ -408,8 +408,12 @@ def _clean_user_text(text):
         idx = text.find("]")
         if idx > 0:
             return text[idx + 1:].strip()
-    if text.startswith("[PORTAL] "):
-        return text[9:]
+    # Strip portal injection prefixes (case-insensitive, handles both [portal] and [portal-react])
+    # These are added by api_chat_send before tmux injection: "[portal] message" or "[portal-react] message"
+    # The session JSONL records the tagged version, so we must strip the prefix for clean display.
+    cleaned = re.sub(r'^\[portal(?:-react)?\]\s*', '', text, flags=re.IGNORECASE)
+    if cleaned != text:
+        return cleaned
     return text
 
 
@@ -760,15 +764,42 @@ def _parse_all_messages(last_n=100):
             seen_idx[m["id"]] = i
     deduped = [all_messages[i] for i in sorted(seen_idx.values())]
 
-    return deduped[-last_n:] if len(deduped) > last_n else deduped
+    # Secondary dedup: remove portal-log entries whose cleaned text closely matches
+    # a session-JSONL entry within a 30s window. This prevents the double-message
+    # problem where the same user message appears from both sources (different IDs).
+    # Portal log is always subordinate — prefer session JSONL text.
+    final: list = []
+    session_texts_by_ts: list = []  # list of (ts, text_lower) from session entries
+    for m in deduped:
+        if m['_src'] == 'session':
+            session_texts_by_ts.append((m['timestamp'], (m.get('text') or '').strip().lower()))
+            final.append(m)
+        else:
+            # Portal entry: check if any session entry within 30s has the same text
+            m_ts = m['timestamp']
+            m_text = (m.get('text') or '').strip().lower()
+            is_dup = False
+            for s_ts, s_text in session_texts_by_ts:
+                if abs(m_ts - s_ts) <= 30 and s_text == m_text:
+                    is_dup = True
+                    break
+            if not is_dup:
+                final.append(m)
+
+    # Re-sort after secondary dedup (insertion order is already correct but be safe)
+    final.sort(key=lambda m: m['timestamp'])
+
+    return final[-last_n:] if len(final) > last_n else final
 
 
 def check_auth(request: Request) -> bool:
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
         return auth[7:] == BEARER_TOKEN
-    # Allow query param token ONLY for WebSocket paths (browsers cannot set headers on WS upgrade)
-    if "/ws" in request.url.path:
+    # Allow query param token for WebSocket paths (browsers cannot set headers on WS upgrade)
+    # and for /api/chat/uploads/ (inline images in chat rendered via <img src="...?token=">)
+    path = request.url.path
+    if "/ws" in path or "/api/chat/uploads/" in path:
         return request.query_params.get("token") == BEARER_TOKEN
     return False
 
@@ -923,7 +954,10 @@ async def api_chat_send(request: Request) -> JSONResponse:
         return JSONResponse({"error": "empty message"}, status_code=400)
 
     # Save to portal chat log for history
-    _save_portal_message(message, role="user")
+    # Return the saved entry's ID so the client can pre-register it in knownMsgIds,
+    # preventing the WS poll-loop echo from rendering the message a second time.
+    saved_entry = _save_portal_message(message, role="user")
+    msg_id = saved_entry["id"]
 
     # Tag injection source so tmux pane shows where input came from
     host = request.headers.get("referer", "")
@@ -947,7 +981,8 @@ async def api_chat_send(request: Request) -> JSONResponse:
                 await asyncio.sleep(0.5)
                 await _run_subprocess_async(["tmux", "send-keys", "-t", session, "Enter"])
         asyncio.ensure_future(_retry_enters())
-        return JSONResponse({"status": "sent", "timestamp": int(time.time())})
+        # Return msg_id so the client pre-registers it and WS echo is suppressed
+        return JSONResponse({"status": "sent", "timestamp": int(time.time()), "msg_id": msg_id})
     except Exception as e:
         return JSONResponse({"error": f"tmux error: {e}"}, status_code=500)
 
