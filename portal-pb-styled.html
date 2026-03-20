@@ -64,14 +64,16 @@
 
   body.light-mode::before { display: none !important; } /* overlay removed — canvas bg handles light mode */
   body.light-mode { background: transparent !important; } /* let particle canvas show through */
-  body.light-mode .sidebar { background: rgba(255,255,255,0.85) !important; backdrop-filter: blur(8px); }
-  body.light-mode .panel { background: rgba(255,255,255,0.65) !important; }
+  body.light-mode .sidebar { background: rgba(255,255,255,0.75) !important; backdrop-filter: blur(6px); }
+  body.light-mode .panel { background: transparent !important; }
   body.light-mode #chat-messages { background: transparent !important; }
-  body.light-mode .topbar { background: rgba(255,255,255,0.85) !important; backdrop-filter: blur(8px); }
+  body.light-mode .topbar { background: rgba(255,255,255,0.75) !important; backdrop-filter: blur(6px); }
+  body.light-mode .main { background: transparent !important; }
+  body.light-mode .content { background: transparent !important; }
 
   /* ===== LIGHT MODE BACKGROUND CANVAS ===== */
   #pb-light-canvas {
-    position: fixed;
+    position: absolute;
     inset: 0;
     width: 100%;
     height: 100%;
@@ -2820,6 +2822,7 @@
     width: 100% !important;
     height: 100% !important;
   }
+  body.light-mode #welcome-3d-container { display: none; }
   /* Text labels float above the 3D canvas */
   .welcome-hero__labels {
     position: relative;
@@ -6484,8 +6487,7 @@
 <!-- Shared tooltip element (Task 6) -->
 <div id="pb-tooltip" role="tooltip" aria-hidden="true"></div>
 
-<!-- Light mode background canvas — soft flowing gradient orbs -->
-<canvas id="pb-light-canvas" aria-hidden="true"></canvas>
+<!-- Light mode canvas moved inside #panel-chat below -->
 
 <!-- CTX Educational Popup -->
 <div class="ctx-popup-overlay" id="ctx-popup-overlay">
@@ -6757,6 +6759,7 @@
 
     <!-- Chat panel (DEFAULT ACTIVE) -->
     <div class="panel active" id="panel-chat">
+      <canvas id="pb-light-canvas" aria-hidden="true"></canvas>
       <div class="chat-header">
         <span class="chat-header-title">&#x25C8; Session Dialogue</span>
         <button class="search-toggle-btn" id="chat-search-toggle-btn" title="Search messages (Ctrl+F)" data-tooltip="Search chat history (Ctrl+F)"><svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>Search</button>
@@ -17666,8 +17669,9 @@ if (window.__welcome3DQueue) {
 
   // ── Resize handling ───────────────────────────────────────────────────────
   function resize() {
-    W    = window.innerWidth;
-    H    = window.innerHeight;
+    var parent = canvas.parentElement || document.body;
+    W    = parent.clientWidth || window.innerWidth;
+    H    = parent.clientHeight || window.innerHeight;
     _dpr = Math.min(window.devicePixelRatio || 1, 2);
     canvas.width  = Math.round(W * _dpr);
     canvas.height = Math.round(H * _dpr);
