@@ -45,6 +45,387 @@
     --sidebar-w: 150px;
   }
 
+  /* ===== LIGHT MODE OVERRIDES ===== */
+  body.light-mode {
+    --bg:        #f0f2f8;
+    --surface:   #ffffff;
+    --surface2:  #e8eaf2;
+    --surface3:  #dde0ee;
+    --border:    #c8ccdc;
+    --border2:   #b0b5cc;
+    --text:      #1a1d2e;
+    --text-dim:  #5a5e7a;
+    --text-mid:  #3a3e5a;
+    --term-bg:   #f8f9fc;
+    --gold-glow: rgba(42,147,193,0.10);
+    --gold-glow2:rgba(42,147,193,0.05);
+    --teal-glow: rgba(241,66,11,0.10);
+  }
+
+  body.light-mode::before { display: none !important; } /* overlay removed — canvas bg handles light mode */
+
+  /* ===== LIGHT MODE BACKGROUND CANVAS ===== */
+  #pb-light-canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 0;
+    pointer-events: none;
+    display: none; /* hidden by default (dark mode) */
+  }
+  body.light-mode #pb-light-canvas {
+    display: block;
+  }
+
+  /* ===== LIGHT MODE: SIDEBAR ===== */
+  body.light-mode .nav-item {
+    color: var(--text-mid);
+  }
+  body.light-mode .nav-item:hover {
+    color: var(--text);
+  }
+  body.light-mode .nav-item.active {
+    color: var(--gold);
+  }
+
+  /* ===== LIGHT MODE: TERMINAL CHROME ===== */
+  body.light-mode .terminal-chrome {
+    background: var(--surface2);
+  }
+  body.light-mode .term-tab-bar {
+    background: var(--surface3);
+  }
+
+  /* ===== LIGHT MODE: UPLOAD MODE MODAL ===== */
+  body.light-mode #upload-mode-overlay {
+    background: rgba(200, 204, 220, 0.72);
+  }
+  body.light-mode #upload-mode-modal {
+    background: #ffffff;
+    box-shadow: 0 0 0 1px rgba(42,147,193,0.12), 0 12px 40px rgba(0,0,0,0.15), 0 0 32px rgba(42,147,193,0.08);
+  }
+  body.light-mode #upload-mode-modal .upm-title {
+    color: var(--text);
+  }
+  body.light-mode #upload-mode-modal .upm-size-chip {
+    background: var(--surface2);
+  }
+
+  /* ===== LIGHT MODE: PAYOUT MODAL ===== */
+  body.light-mode #payout-modal {
+    background: rgba(200,204,220,0.80) !important;
+  }
+  body.light-mode #payout-modal > div {
+    background: #ffffff !important;
+    border-color: rgba(0,0,0,0.12) !important;
+    box-shadow: 0 24px 80px rgba(0,0,0,0.15) !important;
+  }
+  body.light-mode #payout-modal div[style*="border-bottom"] {
+    border-bottom-color: rgba(0,0,0,0.07) !important;
+  }
+
+  /* ===== LIGHT MODE: SHARE MODAL ===== */
+  body.light-mode #share-modal {
+    background: rgba(200,204,220,0.75) !important;
+  }
+  body.light-mode #share-modal > div {
+    background: #ffffff !important;
+    border-color: rgba(0,0,0,0.12) !important;
+    box-shadow: 0 24px 80px rgba(0,0,0,0.15) !important;
+  }
+
+  /* ===== LIGHT MODE: SCHEDULE TASK MODAL ===== */
+  body.light-mode .sched-modal-overlay {
+    background: rgba(200,204,220,0.65);
+  }
+
+  /* ===== LIGHT MODE: SCHEDULE EDIT MODAL ===== */
+  body.light-mode #sched-edit-modal {
+    background: rgba(200,204,220,0.88);
+  }
+  body.light-mode .sched-edit-box {
+    background: var(--surface, #ffffff);
+  }
+  body.light-mode .sched-edit-input,
+  body.light-mode .sched-edit-textarea {
+    background: var(--surface2);
+    color: var(--text);
+    border-color: var(--border2);
+  }
+
+  /* ===== LIGHT MODE: ELEVENLABS SETTINGS MODAL ===== */
+  body.light-mode #elSettingsModal {
+    background: rgba(200,204,220,0.85);
+  }
+  body.light-mode .el-modal-box {
+    background: #ffffff;
+    border-color: rgba(42,147,193,0.25);
+    box-shadow: 0 0 40px rgba(0,0,0,0.12);
+  }
+  body.light-mode .el-modal-sub,
+  body.light-mode .el-modal-label {
+    color: var(--text-dim);
+  }
+  body.light-mode .el-modal-input,
+  body.light-mode .el-voice-select {
+    background: var(--surface2);
+    color: var(--text);
+    border-color: var(--border2);
+  }
+  body.light-mode .el-modal-btn.cancel {
+    border-color: var(--border2);
+    color: var(--text-dim);
+  }
+  body.light-mode .el-modal-btn.cancel:hover {
+    border-color: var(--border);
+    color: var(--text);
+  }
+
+  /* ===== LIGHT MODE: VOICE OVERLAY ===== */
+  body.light-mode .hmi-voice-overlay {
+    background: radial-gradient(ellipse at center, #f0f4ff, #e8eaf2);
+  }
+  body.light-mode .hmi-voice-overlay__close {
+    color: var(--text-dim);
+  }
+  body.light-mode .hmi-voice-overlay__close:hover {
+    background: rgba(0,0,0,0.08);
+    color: var(--text);
+  }
+  body.light-mode .hmi-voice-overlay__tagline {
+    color: rgba(42,147,193,0.8);
+  }
+  body.light-mode .hmi-voice-overlay__readout {
+    color: rgba(42,147,193,0.9);
+  }
+  body.light-mode .hmi-voice-overlay__mic {
+    color: var(--text);
+    border-color: rgba(42,147,193,0.5);
+  }
+  body.light-mode .hmi-voice-overlay__mic-status {
+    color: var(--text-mid);
+  }
+  body.light-mode .hmi-voice-overlay__mic-status.listening {
+    color: #f1420b;
+  }
+  body.light-mode .hmi-voice-overlay__state-btn {
+    background: rgba(255,255,255,0.8);
+    border-color: rgba(42,147,193,0.3);
+    color: var(--text-mid);
+  }
+  body.light-mode .hmi-voice-overlay__state-btn:hover {
+    color: var(--text);
+    border-color: rgba(42,147,193,0.6);
+    box-shadow: 0 0 12px rgba(42,147,193,0.15);
+  }
+  body.light-mode .hmi-voice-overlay__state-btn.active {
+    background: linear-gradient(135deg, rgba(241,66,11,0.15), rgba(42,147,193,0.15));
+    border-color: #f1420b;
+    color: var(--text);
+    box-shadow: 0 0 16px rgba(241,66,11,0.15);
+  }
+
+  /* ===== LIGHT MODE: VOICE OVERLAY BOTTOM SECTION ===== */
+  /* Engine label, AI Voice label, Send word label — inline styles use white, override to dark */
+  body.light-mode .hmi-voice-overlay__voice-picker span,
+  body.light-mode .hmi-voice-overlay__voice-picker label {
+    color: #1a1d2e !important;
+  }
+  /* Hint text at bottom of voice picker */
+  body.light-mode .hmi-voice-overlay__voice-picker div[style*="rgba(255,255,255,0.3)"] {
+    color: rgba(30,34,60,0.55) !important;
+  }
+  /* Voice dropdown (#hmiVoiceSelect) — dark bg with teal text, invert for light */
+  body.light-mode #hmiVoiceSelect {
+    background: #f0f2f8 !important;
+    color: #1a1d2e !important;
+    border-color: rgba(42,147,193,0.4) !important;
+  }
+  /* Send word input (#hmiSendWord) */
+  body.light-mode #hmiSendWord {
+    background: #f0f2f8 !important;
+    color: #1a1d2e !important;
+    border-color: rgba(42,147,193,0.4) !important;
+  }
+  body.light-mode #hmiSendWord::placeholder {
+    color: rgba(30,34,60,0.4) !important;
+  }
+  /* Save button (#hmiSendWordSave) */
+  body.light-mode #hmiSendWordSave {
+    background: rgba(42,147,193,0.12) !important;
+    border-color: rgba(42,147,193,0.4) !important;
+    color: #1a5a7a !important;
+  }
+  /* Engine toggle buttons (Browser / ElevenLabs) */
+  body.light-mode .hmi-engine-btn {
+    color: rgba(30,34,60,0.5) !important;
+  }
+  body.light-mode .hmi-engine-btn.active {
+    background: rgba(42,147,193,0.15) !important;
+    color: #1a5a7a !important;
+  }
+  body.light-mode .hmi-engine-btn.active.el-active {
+    background: rgba(180,140,20,0.15) !important;
+    color: #7a5a00 !important;
+  }
+  body.light-mode .hmi-engine-toggle {
+    border-color: rgba(42,147,193,0.35) !important;
+  }
+  body.light-mode .hmi-engine-divider {
+    background: rgba(42,147,193,0.35) !important;
+  }
+  /* Gear button */
+  body.light-mode .hmi-el-gear-btn {
+    color: rgba(30,34,60,0.5) !important;
+    border-color: rgba(42,147,193,0.35) !important;
+  }
+  body.light-mode .hmi-el-gear-btn:hover {
+    background: rgba(42,147,193,0.1) !important;
+    color: #1a1d2e !important;
+  }
+  body.light-mode .hmi-el-gear-btn.active {
+    color: #7a5a00 !important;
+    border-color: #c9a227 !important;
+    background: rgba(180,140,20,0.12) !important;
+  }
+
+  /* ===== LIGHT MODE: COMMANDS PANEL ===== */
+  body.light-mode .cmd-panel-header {
+    background: var(--surface);
+    border-bottom-color: var(--border);
+  }
+  body.light-mode .cmd-section-title {
+    color: #1a6a91;
+    border-bottom-color: rgba(26,106,145,0.2);
+  }
+  body.light-mode .cmd-section-title.danger {
+    color: #c0392b;
+    border-bottom-color: rgba(192,57,43,0.2);
+  }
+  body.light-mode .cmd-card {
+    background: var(--surface);
+    border-color: var(--border);
+  }
+  body.light-mode .cmd-card.danger-card {
+    background: rgba(239,68,68,0.04);
+    border-color: rgba(239,68,68,0.25);
+  }
+  body.light-mode .cmd-label {
+    color: var(--text);
+  }
+  body.light-mode .cmd-label.danger {
+    color: #c0392b;
+  }
+  body.light-mode .cmd-block {
+    background: #f4f6fc;
+    border-color: var(--border);
+    color: #1a7a40;
+  }
+  body.light-mode .cmd-block code {
+    color: #1a7a40;
+  }
+  body.light-mode .cmd-block:hover {
+    border-color: rgba(26,122,64,0.4);
+  }
+  body.light-mode .cmd-copy-btn {
+    color: var(--text-dim);
+    border-color: var(--border);
+  }
+  body.light-mode .cmd-block:hover .cmd-copy-btn {
+    color: #1a7a40;
+    border-color: rgba(26,122,64,0.35);
+  }
+  body.light-mode .cmd-note {
+    color: var(--text-dim);
+  }
+  body.light-mode .cmd-warn {
+    background: rgba(180,130,0,0.08);
+    border-left-color: rgba(180,130,0,0.4);
+    color: #7a5800;
+  }
+  body.light-mode .cmd-step {
+    color: var(--text-mid);
+  }
+  body.light-mode .cmd-info-label {
+    color: var(--text-dim);
+  }
+  body.light-mode .cmd-info-value {
+    color: var(--text);
+  }
+  body.light-mode .cmd-info-sub {
+    color: var(--text-dim);
+  }
+  body.light-mode .cmd-ref-table th {
+    color: #1a6a91;
+    border-bottom-color: rgba(26,106,145,0.25);
+  }
+  body.light-mode .cmd-ref-table td {
+    border-bottom-color: var(--border);
+  }
+  body.light-mode .cmd-ref-table .ref-key {
+    color: var(--text-mid);
+  }
+  body.light-mode .cmd-ref-table .ref-val {
+    color: var(--text);
+  }
+
+  /* ===== LIGHT MODE: SHORTCUTS PANEL ===== */
+  body.light-mode .sc-panel-header {
+    background: var(--surface);
+    border-bottom-color: var(--border);
+  }
+  body.light-mode .sc-section-title {
+    color: #1a6a91;
+    border-bottom-color: rgba(26,106,145,0.2);
+  }
+  body.light-mode .sc-table th {
+    color: #1a6a91;
+    border-bottom-color: rgba(26,106,145,0.2);
+  }
+  body.light-mode .sc-table td {
+    border-bottom-color: var(--border);
+  }
+  body.light-mode .sc-table tr:hover {
+    background: rgba(42,147,193,0.06);
+  }
+  body.light-mode .sc-cmd {
+    background: rgba(26,106,145,0.08);
+    border-color: rgba(26,106,145,0.25);
+    color: #1a6a91;
+  }
+  body.light-mode .sc-key {
+    background: var(--surface3);
+    border-color: var(--border2);
+    color: var(--text);
+  }
+  body.light-mode .sc-plus {
+    color: var(--text-dim);
+  }
+  body.light-mode .sc-tab-card {
+    background: var(--surface);
+    border-color: var(--border);
+  }
+
+    /* Theme toggle button */
+  .theme-toggle-btn {
+    background: none;
+    border: 1px solid var(--border2);
+    border-radius: 6px;
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 0.85rem;
+    line-height: 1;
+    padding: 4px 7px;
+    transition: color 0.2s, border-color 0.2s, background 0.2s;
+    flex-shrink: 0;
+  }
+  .theme-toggle-btn:hover {
+    background: var(--surface2);
+    border-color: var(--gold);
+    color: var(--text);
+  }
+
   html {
     overflow-x: hidden;
     max-width: 100vw;
@@ -569,8 +950,10 @@
     transition: width 0.6s ease, background 0.3s;
   }
 
-  .ctx-bar-fill.warn  { background: var(--warn); }
-  .ctx-bar-fill.crit  { background: var(--offline); }
+  .ctx-bar-fill.warn  { background: #f59e0b; }  /* yellow-orange 60-80% */
+  .ctx-bar-fill.crit  { background: var(--offline); }  /* red 80-95% */
+  .ctx-bar-fill.flash { background: var(--offline); animation: ctx-flash 0.7s ease-in-out infinite; }  /* flashing red 95%+ */
+  @keyframes ctx-flash { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
 
   .ctx-gauge { cursor: pointer; }
 
@@ -601,8 +984,9 @@
   }
   .ctx-popup .ctx-zone { display: flex; align-items: center; justify-content: center; font-size: 0.72rem; font-weight: 600; padding: 0 4px; white-space: nowrap; }
   .ctx-popup .ctx-zone.green  { background: var(--term-green); color: #000; flex: 60; }
-  .ctx-popup .ctx-zone.yellow { background: #f59e0b;           color: #000; flex: 25; }
+  .ctx-popup .ctx-zone.yellow { background: #f59e0b;           color: #000; flex: 20; }
   .ctx-popup .ctx-zone.red    { background: #ef4444;           color: #fff; flex: 15; }
+  .ctx-popup .ctx-zone.red:last-child { flex: 5; }
   .ctx-popup .ctx-tips { margin: 14px 0 0; padding: 0; list-style: none; }
   .ctx-popup .ctx-tips li { font-size: 0.82rem; color: #ffffff; padding: 4px 0; padding-left: 18px; position: relative; }
   .ctx-popup .ctx-tips li::before { content: '\2713'; position: absolute; left: 0; color: var(--term-green); }
@@ -5673,6 +6057,9 @@
 <!-- Shared tooltip element (Task 6) -->
 <div id="pb-tooltip" role="tooltip" aria-hidden="true"></div>
 
+<!-- Light mode background canvas — soft flowing gradient orbs -->
+<canvas id="pb-light-canvas" aria-hidden="true"></canvas>
+
 <!-- CTX Educational Popup -->
 <div class="ctx-popup-overlay" id="ctx-popup-overlay">
   <div class="ctx-popup">
@@ -5680,12 +6067,14 @@
     <p>Your AI has a <strong>context window</strong> — the amount of conversation it can hold in active memory at once. Think of it like a whiteboard: the more you write, the less room remains.</p>
     <div class="ctx-zone-bar">
       <div class="ctx-zone green">0-60% Green</div>
-      <div class="ctx-zone yellow">60-85% Caution</div>
-      <div class="ctx-zone red">85%+</div>
+      <div class="ctx-zone yellow">60-80% Caution</div>
+      <div class="ctx-zone red">80-95% Low</div>
+      <div class="ctx-zone red" style="opacity:0.6">95%+ Critical</div>
     </div>
-    <p><strong>Green zone</strong> — Plenty of room. Your AI remembers everything in this conversation with full clarity.</p>
-    <p><strong>Yellow zone</strong> — Getting full. Your AI may start compressing older parts of the conversation. Consider wrapping up complex topics.</p>
-    <p><strong>Red zone</strong> — Near capacity. Your AI will need to restart soon to continue working effectively. Don't worry — your chat history is saved.</p>
+    <p><strong>Green (0-60%)</strong> — Plenty of room. Your AI remembers everything in this conversation with full clarity.</p>
+    <p><strong>Yellow (60-80%)</strong> — Getting full. Your AI may start compressing older parts of the conversation. Consider wrapping up complex topics.</p>
+    <p><strong>Red (80-95%)</strong> — Running low. Compaction is coming soon. Wrap up complex work or expect a context restart shortly.</p>
+    <p><strong>Flashing red (95%+)</strong> — Imminent compaction. Your AI will restart its context window very soon. Chat history is always saved.</p>
     <ul class="ctx-tips">
       <li>Long conversations naturally fill the window — this is normal</li>
       <li>Your AI's permanent memory persists across all conversations</li>
@@ -5828,6 +6217,7 @@
     </div>
     <button class="resume-btn" id="resume-btn" title="Resume your last conversation where you left off" data-tooltip="Pick up your last conversation where you left off">&#x21A9; Resume</button>
     <button class="restart-btn" id="restart-btn" title="Start a fresh conversation with Aether" data-tooltip="Start a fresh conversation — your history is saved">&#x27F3; Restart</button>
+    <button class="theme-toggle-btn" id="theme-toggle-btn" title="Toggle light/dark mode" aria-label="Toggle light/dark mode">&#9790;</button>
     <button class="settings-btn" id="settings-btn" title="Portal settings and preferences" data-tooltip="Customize your portal experience" style="position:relative;">&#x2699;<span id="settings-new-badge" style="display:none;position:absolute;top:-2px;right:-4px;background:var(--teal);color:#fff;font-size:0.45rem;font-weight:800;border-radius:50%;width:12px;height:12px;line-height:12px;text-align:center;">!</span></button>
     <button class="settings-btn" id="share-btn" title="Share &amp; Earn" data-tooltip="Share PureBrain and earn rewards for every referral" onclick="openShareModal()" style="color:var(--orange,#f1420b);">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
@@ -10426,12 +10816,14 @@
         var pct = d.pct;
         ctxBar.style.width = pct + '%';
         var totalK = Math.round((d.total_tokens || 0) / 1000);
-        ctxPct.textContent = totalK + 'k / 200k';
+        ctxPct.textContent = totalK + 'k / 1M';
         ctxBar.className = 'ctx-bar-fill';
-        if (pct >= 85) {
-          ctxBar.classList.add('crit');
+        if (pct >= 95) {
+          ctxBar.classList.add('flash');  // flashing red — imminent compaction
+        } else if (pct >= 80) {
+          ctxBar.classList.add('crit');   // solid red — running low
         } else if (pct >= 60) {
-          ctxBar.classList.add('warn');
+          ctxBar.classList.add('warn');   // yellow-orange — getting full
         }
         // Tooltip shows full breakdown
         var gauge = document.getElementById('ctx-gauge');
@@ -16189,7 +16581,10 @@ function initWelcome3D(container) {
   });
   renderer.setSize(W, H);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, PIXEL_RATIO_MAX));
-  renderer.setClearColor(C_BG, 1);
+  // Set background color based on current theme
+  const _isLightMode = document.body.classList.contains('light-mode');
+  const _bgColor = _isLightMode ? new THREE.Color(0xf0f2f8) : C_BG;
+  renderer.setClearColor(_bgColor, 1);
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.1;
   container.appendChild(renderer.domElement);
@@ -16197,8 +16592,12 @@ function initWelcome3D(container) {
 
   // Scene
   const scene = new THREE.Scene();
-  scene.background = C_BG;
-  scene.fog = new THREE.FogExp2(0x0a0e1a, isLowPower ? 0.045 : 0.038);
+  scene.background = _bgColor.clone();
+  scene.fog = new THREE.FogExp2(_isLightMode ? 0xf0f2f8 : 0x0a0e1a, isLowPower ? 0.045 : 0.038);
+
+  // Expose for theme toggle to update canvas background
+  window.__neuralRenderer = renderer;
+  window.__neuralScene = scene;
 
   // Camera — wider FOV for panel context
   const fov = (W / H) < 0.8 ? 70 : 55;
@@ -16645,6 +17044,222 @@ if (window.__welcome3DQueue) {
   initWelcome3D(window.__welcome3DQueue);
   window.__welcome3DQueue = null;
 }
+</script>
+
+<script>
+/* ===== LIGHT/DARK MODE TOGGLE ===== */
+(function() {
+  var STORAGE_KEY = 'pb_theme';
+  var LIGHT_CLASS = 'light-mode';
+  var btn = document.getElementById('theme-toggle-btn');
+
+  function applyTheme(isLight) {
+    if (isLight) {
+      document.body.classList.add(LIGHT_CLASS);
+      if (btn) btn.innerHTML = '&#9728;'; // sun = currently light, click for dark
+      if (btn) btn.title = 'Switch to dark mode';
+    } else {
+      document.body.classList.remove(LIGHT_CLASS);
+      if (btn) btn.innerHTML = '&#9790;'; // moon = currently dark, click for light
+      if (btn) btn.title = 'Switch to light mode';
+    }
+    // Update neural brain canvas background
+    var C_LIGHT = 0xf0f2f8;
+    var C_DARK  = 0x0a0e1a;
+    var bgHex = isLight ? C_LIGHT : C_DARK;
+    if (window.__neuralRenderer) {
+      window.__neuralRenderer.setClearColor(bgHex, 1);
+    }
+    if (window.__neuralScene) {
+      window.__neuralScene.background.set(bgHex);
+      window.__neuralScene.fog.color.set(bgHex);
+    }
+  }
+
+  // Apply saved preference on load
+  var saved = localStorage.getItem(STORAGE_KEY);
+  applyTheme(saved === 'light');
+
+  // Wire toggle button
+  if (btn) {
+    btn.addEventListener('click', function() {
+      var isLight = document.body.classList.toggle(LIGHT_CLASS);
+      localStorage.setItem(STORAGE_KEY, isLight ? 'light' : 'dark');
+      applyTheme(isLight);
+    });
+  }
+})();
+</script>
+
+<script>
+/* ===== LIGHT MODE BACKGROUND ANIMATION =====
+ * Soft flowing gradient orbs — 2D Canvas, no WebGL, low GPU cost.
+ * Only animates when body has .light-mode. Pauses when tab hidden.
+ * PureBrain colors at very low opacity — background, never distracting.
+ */
+(function() {
+  'use strict';
+
+  var canvas = document.getElementById('pb-light-canvas');
+  if (!canvas) return;
+
+  var ctx = canvas.getContext('2d');
+  var raf = null;
+  var running = false;
+  var W = 0, H = 0;
+
+  // ── Orb definitions ──────────────────────────────────────────────────────
+  // Each orb: center position expressed as fractions of W/H, size as fraction
+  // of the smaller dimension, hue and opacity, drift speed and phase offsets.
+  var orbs = [
+    // Blue orbs (PureBrain #2a93c1)
+    { cx: 0.15, cy: 0.20, r: 0.38, color: [42, 147, 193],  alpha: 0.08, sx: 0.00012, sy: 0.00009, px: 0.0,  py: 1.2,  pulse: 0.00007, pp: 0.0 },
+    { cx: 0.78, cy: 0.65, r: 0.42, color: [42, 147, 193],  alpha: 0.07, sx: 0.00010, sy: 0.00013, px: 2.3,  py: 0.8,  pulse: 0.00009, pp: 1.5 },
+    { cx: 0.50, cy: 0.85, r: 0.32, color: [42, 147, 193],  alpha: 0.05, sx: 0.00008, sy: 0.00011, px: 4.1,  py: 3.3,  pulse: 0.00006, pp: 3.0 },
+    // Orange orbs (PureBrain #f1420b)
+    { cx: 0.88, cy: 0.15, r: 0.30, color: [241, 66, 11],   alpha: 0.06, sx: 0.00011, sy: 0.00008, px: 1.6,  py: 2.7,  pulse: 0.00008, pp: 0.7 },
+    { cx: 0.22, cy: 0.78, r: 0.35, color: [241, 66, 11],   alpha: 0.05, sx: 0.00009, sy: 0.00010, px: 3.2,  py: 0.4,  pulse: 0.00007, pp: 2.1 },
+    // Soft neutral (lavender-blue) for depth
+    { cx: 0.62, cy: 0.35, r: 0.45, color: [100, 130, 220], alpha: 0.04, sx: 0.00007, sy: 0.00012, px: 5.0,  py: 1.9,  pulse: 0.00005, pp: 4.2 },
+    { cx: 0.35, cy: 0.50, r: 0.28, color: [42, 147, 193],  alpha: 0.04, sx: 0.00013, sy: 0.00007, px: 2.8,  py: 4.5,  pulse: 0.00010, pp: 1.0 },
+  ];
+
+  // ── Subtle grid of faint hexagonal dots ──────────────────────────────────
+  // Pre-computed at resize time, rendered once into an offscreen canvas.
+  var dotCanvas = null;
+  var dotCtx = null;
+
+  function buildDotPattern() {
+    // Offscreen canvas, same size as main
+    if (!dotCanvas) dotCanvas = document.createElement('canvas');
+    dotCanvas.width  = W;
+    dotCanvas.height = H;
+    dotCtx = dotCanvas.getContext('2d');
+    dotCtx.clearRect(0, 0, W, H);
+
+    // Hex grid geometry
+    var spacing = 44; // px between dot centers
+    var rows = Math.ceil(H / spacing) + 2;
+    var cols = Math.ceil(W / spacing) + 2;
+    var r = 1.5; // dot radius
+
+    dotCtx.fillStyle = 'rgba(42,100,180,0.07)';
+    for (var row = -1; row < rows; row++) {
+      for (var col = -1; col < cols; col++) {
+        var x = col * spacing + (row % 2 === 0 ? 0 : spacing * 0.5);
+        var y = row * spacing * 0.866; // sqrt(3)/2 for hex
+        dotCtx.beginPath();
+        dotCtx.arc(x, y, r, 0, Math.PI * 2);
+        dotCtx.fill();
+      }
+    }
+  }
+
+  // ── Resize handling ───────────────────────────────────────────────────────
+  var _dpr = 1;
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    _dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    canvas.width  = Math.round(W * _dpr);
+    canvas.height = Math.round(H * _dpr);
+    canvas.style.width  = W + 'px';
+    canvas.style.height = H + 'px';
+    // Reset transform before applying dpr scale (prevent accumulation on resize)
+    ctx.setTransform(_dpr, 0, 0, _dpr, 0, 0);
+    buildDotPattern();
+  }
+
+  // ── Frame render ──────────────────────────────────────────────────────────
+  var t = 0; // monotonic time in ms, only advances when running
+
+  function frame(now) {
+    if (!running) return;
+
+    t = now;
+    raf = requestAnimationFrame(frame);
+
+    // Clear to light bg color
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#f0f2f8';
+    ctx.fillRect(0, 0, W, H);
+
+    // Draw dot grid (static pattern, pre-baked into offscreen canvas)
+    if (dotCanvas) ctx.drawImage(dotCanvas, 0, 0);
+
+    // Draw each orb
+    for (var i = 0; i < orbs.length; i++) {
+      var o = orbs[i];
+
+      // Slow sinusoidal drift — orbs barely move, very calming
+      var drift  = 0.06; // max fraction of screen dimension
+      var cx = (o.cx + Math.sin(t * o.sx + o.px) * drift) * W;
+      var cy = (o.cy + Math.cos(t * o.sy + o.py) * drift) * H;
+
+      // Gentle breathing — radius oscillates ±8%
+      var breathe = 1.0 + Math.sin(t * o.pulse + o.pp) * 0.08;
+      var radius  = o.r * Math.min(W, H) * breathe;
+
+      // Radial gradient — feathered soft orb
+      var grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
+      var c = o.color;
+      grad.addColorStop(0,   'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + o.alpha + ')');
+      grad.addColorStop(0.5, 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + (o.alpha * 0.4) + ')');
+      grad.addColorStop(1,   'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',0)');
+
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, radius, radius * 0.82, t * 0.00003, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
+  function start() {
+    if (running) return;
+    running = true;
+    resize();
+    raf = requestAnimationFrame(frame);
+  }
+
+  function stop() {
+    running = false;
+    if (raf) { cancelAnimationFrame(raf); raf = null; }
+    // Clear canvas so it doesn't ghost when hidden
+    if (ctx && W && H) ctx.clearRect(0, 0, W, H);
+  }
+
+  // Tab visibility — pause when hidden to save battery/CPU
+  document.addEventListener('visibilitychange', function() {
+    if (!document.body.classList.contains('light-mode')) return;
+    if (document.hidden) stop();
+    else start();
+  });
+
+  // Resize
+  var resizeTimer;
+  window.addEventListener('resize', function() {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function() {
+      if (running) resize();
+    }, 200);
+  });
+
+  // Hook into theme toggle — start/stop as theme changes
+  // We watch classList mutations on body
+  var themeObserver = new MutationObserver(function(mutations) {
+    var isLight = document.body.classList.contains('light-mode');
+    if (isLight && !running) start();
+    else if (!isLight && running) stop();
+  });
+  themeObserver.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+
+  // Initial check — if page loads in light mode, start immediately
+  if (document.body.classList.contains('light-mode')) {
+    start();
+  }
+})();
 </script>
 
 
