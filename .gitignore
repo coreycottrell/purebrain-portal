@@ -37,3 +37,18 @@ user-settings.json
 
 # Uploads
 portal_uploads/
+
+# Personal/sensitive config (use *.example.json templates instead)
+portal_owner.json
+investor_config.json
+
+# Runtime bookmarks (use [] default)
+bookmarks.json
+
+# Additional backup patterns
+*.bak.*
+*.bak_*
+*.task*-backup-*
+*.mvp-backup-*
+release_notes.json.local
+run_portal_patch.sh

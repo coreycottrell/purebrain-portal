@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PureBrain Portal — Light Mode Background Prototype</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --blue: #2a93c1;
+  --orange: #f1420b;
+  --bg: #f0f2f8;
+  --surface: #ffffff;
+  --text: #1a1d2e;
+  --text-dim: #5a5e7a;
+  --border: #c8ccdc;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  background: var(--bg);
+}
+
+/* ── Background canvas ── */
+#bg-canvas {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+}
+
+/* ── Preview overlay — shows what portal content looks like on top ── */
+.preview-ui {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.preview-card {
+  pointer-events: auto;
+  background: rgba(255,255,255,0.82);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(42,147,193,0.18);
+  border-radius: 16px;
+  padding: 32px 40px;
+  max-width: 480px;
+  width: 90%;
+  box-shadow: 0 8px 32px rgba(42,147,193,0.10), 0 2px 8px rgba(0,0,0,0.07);
+}
+
+.preview-card h2 {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
+  letter-spacing: -0.3px;
+}
+
+.preview-card p {
+  font-size: 14px;
+  color: var(--text-dim);
+  line-height: 1.6;
+  margin-bottom: 20px;
+}
+
+.preview-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: rgba(42,147,193,0.10);
+  color: var(--blue);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 5px 12px;
+  border-radius: 20px;
+  border: 1px solid rgba(42,147,193,0.20);
+  margin-bottom: 20px;
+}
+
+.preview-badge::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--blue);
+}
+
+.preview-stat-row {
+  display: flex;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.stat-box {
+  flex: 1;
+  background: rgba(240,242,248,0.80);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+
+.stat-box .val {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1;
+  margin-bottom: 4px;
+}
+
+.stat-box .val.blue { color: var(--blue); }
+.stat-box .val.orange { color: var(--orange); }
+
+.stat-box .label {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* ── Controls (prototype only) ── */
+.controls {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: auto;
+}
+
+.ctrl-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: right;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.ctrl-btn {
+  background: rgba(255,255,255,0.9);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.ctrl-btn:hover { border-color: var(--blue); color: var(--blue); }
+.ctrl-btn.active { background: rgba(42,147,193,0.12); border-color: var(--blue); color: var(--blue); }
+
+.variant-label {
+  position: fixed;
+  bottom: 24px;
+  left: 24px;
+  z-index: 20;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: rgba(255,255,255,0.80);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 14px;
+  letter-spacing: 0.4px;
+}
+
+.variant-label strong { color: var(--blue); }
+</style>
+</head>
+<body>
+
+<canvas id="bg-canvas"></canvas>
+
+<div class="preview-ui">
+  <div class="preview-card">
+    <div class="preview-badge">Light Mode Active</div>
+    <h2>Good morning, Jared</h2>
+    <p>Your AI team has completed 3 tasks overnight. Agent performance is nominal across all departments.</p>
+    <div class="preview-stat-row">
+      <div class="stat-box">
+        <div class="val blue">12</div>
+        <div class="label">Tasks Running</div>
+      </div>
+      <div class="stat-box">
+        <div class="val">98%</div>
+        <div class="label">Uptime</div>
+      </div>
+      <div class="stat-box">
+        <div class="val orange">3</div>
+        <div class="label">Alerts</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="controls">
+  <div class="ctrl-label">Variant</div>
+  <button class="ctrl-btn active" onclick="setVariant('network')">Particle Network</button>
+  <button class="ctrl-btn" onclick="setVariant('waves')">Soft Waves</button>
+  <button class="ctrl-btn" onclick="setVariant('grid')">Grid Pulse</button>
+</div>
+
+<div class="variant-label">
+  Viewing: <strong id="variant-name">Particle Network</strong>
+</div>
+
+<script>
+(function() {
+'use strict';
+
+var canvas  = document.getElementById('bg-canvas');
+var ctx     = canvas.getContext('2d');
+var W = 0, H = 0, dpr = 1;
+var raf = null;
+var t0 = performance.now();
+var variant = 'network';
+
+// ── Brand colors ──────────────────────────────────────────────────────────────
+var BLUE   = { r: 42,  g: 147, b: 193 };
+var ORANGE = { r: 241, g: 66,  b: 11  };
+var LAVENDER = { r: 100, g: 120, b: 210 };
+
+// ── Variant: Particle Network ─────────────────────────────────────────────────
+var NET = {
+  particles: [],
+  N: 0,           // set on resize
+  linkDist: 0,    // set on resize
+};
+
+function initNetwork() {
+  NET.N       = Math.min(Math.floor((W * H) / 14000), 90); // density cap
+  NET.linkDist = Math.min(W, H) * 0.22;
+  NET.particles = [];
+
+  for (var i = 0; i < NET.N; i++) {
+    // Most particles white/grey — only accent colors for a few
+    var colorRoll = Math.random();
+    var col;
+    if (colorRoll < 0.08)       col = ORANGE;
+    else if (colorRoll < 0.28)  col = BLUE;
+    else                         col = LAVENDER;
+
+    NET.particles.push({
+      x:  Math.random() * W,
+      y:  Math.random() * H,
+      vx: (Math.random() - 0.5) * 0.28,
+      vy: (Math.random() - 0.5) * 0.28,
+      r:  1.2 + Math.random() * 1.8,
+      col: col,
+      // opacity breathes gently
+      oBase: 0.30 + Math.random() * 0.25,
+      oPhase: Math.random() * Math.PI * 2,
+      oSpeed: 0.0004 + Math.random() * 0.0003,
+    });
+  }
+}
+
+function drawNetwork(elapsed) {
+  var p, q, i, j, dx, dy, dist, alpha, lineAlpha;
+  var n = NET.particles.length;
+  var linkDist = NET.linkDist;
+
+  // Update particle positions
+  for (i = 0; i < n; i++) {
+    p = NET.particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    // Wrap gently — re-enter from opposite edge with slight y-jitter
+    if (p.x < -20)   { p.x = W + 20; p.y = Math.random() * H; }
+    if (p.x > W + 20) { p.x = -20;   p.y = Math.random() * H; }
+    if (p.y < -20)   { p.y = H + 20; p.x = Math.random() * W; }
+    if (p.y > H + 20) { p.y = -20;   p.x = Math.random() * W; }
+  }
+
+  // Draw connections
+  ctx.lineWidth = 0.8;
+  for (i = 0; i < n; i++) {
+    p = NET.particles[i];
+    for (j = i + 1; j < n; j++) {
+      q = NET.particles[j];
+      dx = q.x - p.x;
+      dy = q.y - p.y;
+      dist = Math.sqrt(dx*dx + dy*dy);
+      if (dist >= linkDist) continue;
+
+      // Fade line by distance — very subtle
+      lineAlpha = (1 - dist / linkDist) * 0.07;
+
+      // Line color: interpolate between the two particle colors
+      var cr = Math.round((p.col.r + q.col.r) * 0.5);
+      var cg = Math.round((p.col.g + q.col.g) * 0.5);
+      var cb = Math.round((p.col.b + q.col.b) * 0.5);
+      ctx.strokeStyle = 'rgba(' + cr + ',' + cg + ',' + cb + ',' + lineAlpha + ')';
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(q.x, q.y);
+      ctx.stroke();
+    }
+  }
+
+  // Draw particle dots
+  for (i = 0; i < n; i++) {
+    p = NET.particles[i];
+    alpha = p.oBase + Math.sin(elapsed * p.oSpeed + p.oPhase) * 0.10;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(' + p.col.r + ',' + p.col.g + ',' + p.col.b + ',' + alpha + ')';
+    ctx.fill();
+  }
+}
+
+// ── Variant: Soft Waves ────────────────────────────────────────────────────────
+var WAVES = {
+  lines: [],
+};
+
+function initWaves() {
+  WAVES.lines = [];
+  var count = 7;
+  for (var i = 0; i < count; i++) {
+    var frac = i / (count - 1);
+    var colorRoll = Math.random();
+    var col = (colorRoll < 0.25) ? ORANGE :
+              (colorRoll < 0.65) ? BLUE : LAVENDER;
+    WAVES.lines.push({
+      yBase: H * (0.15 + frac * 0.70), // spread across most of the viewport
+      amp:   20 + Math.random() * 35,
+      freq:  0.003 + Math.random() * 0.004,
+      phase: Math.random() * Math.PI * 2,
+      speed: 0.00025 + Math.random() * 0.00020,
+      alpha: 0.05 + Math.random() * 0.06,
+      thick: 1.0 + Math.random() * 1.2,
+      col:   col,
+    });
+  }
+}
+
+function drawWaves(elapsed) {
+  for (var i = 0; i < WAVES.lines.length; i++) {
+    var w = WAVES.lines[i];
+    var c = w.col;
+    ctx.beginPath();
+    ctx.lineWidth = w.thick;
+    ctx.strokeStyle = 'rgba(' + c.r + ',' + c.g + ',' + c.b + ',' + w.alpha + ')';
+
+    var step = 4; // px between path points — smooth enough, cheap enough
+    for (var x = 0; x <= W; x += step) {
+      var y = w.yBase
+            + Math.sin(x * w.freq + elapsed * w.speed + w.phase) * w.amp
+            + Math.sin(x * w.freq * 1.7 + elapsed * w.speed * 0.6 + w.phase + 1.2) * w.amp * 0.35;
+      if (x === 0) ctx.moveTo(x, y);
+      else          ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+}
+
+// ── Variant: Grid Pulse ────────────────────────────────────────────────────────
+var GRID = {
+  spacing: 48,
+  pulses: [],
+  nextPulse: 0,
+};
+
+function initGrid() {
+  GRID.spacing = 48;
+  GRID.pulses  = [];
+  GRID.nextPulse = 0;
+}
+
+function spawnPulse(elapsed) {
+  if (elapsed < GRID.nextPulse) return;
+  GRID.nextPulse = elapsed + 1800 + Math.random() * 2200;
+  // Pick a random grid node as origin
+  var cols = Math.ceil(W / GRID.spacing) + 1;
+  var rows = Math.ceil(H / GRID.spacing) + 1;
+  var cx = Math.floor(Math.random() * cols) * GRID.spacing;
+  var cy = Math.floor(Math.random() * rows) * GRID.spacing;
+  var col = Math.random() < 0.3 ? ORANGE : BLUE;
+  GRID.pulses.push({ cx: cx, cy: cy, r: 0, maxR: Math.min(W, H) * 0.55, born: elapsed, col: col });
+}
+
+function drawGrid(elapsed) {
+  var spacing = GRID.spacing;
+  var cols = Math.ceil(W / spacing) + 2;
+  var rows = Math.ceil(H / spacing) + 2;
+  var i, j, x, y;
+
+  // Background grid dots — very faint
+  ctx.fillStyle = 'rgba(42,100,180,0.055)';
+  for (j = -1; j < rows; j++) {
+    for (i = -1; i < cols; i++) {
+      x = i * spacing;
+      y = j * spacing;
+      ctx.beginPath();
+      ctx.arc(x, y, 1.4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // Spawn + draw expanding ring pulses
+  spawnPulse(elapsed);
+  var alive = [];
+  for (i = 0; i < GRID.pulses.length; i++) {
+    var p = GRID.pulses[i];
+    var age = elapsed - p.born;
+    p.r = age * 0.085; // px per ms — slow ripple
+    var progress = p.r / p.maxR;
+    if (progress >= 1.0) continue; // dead
+
+    var alpha = (1 - progress) * (1 - progress) * 0.12; // quadratic fade
+
+    // Highlight grid nodes near the ring edge
+    var ringW = spacing * 0.6;
+    for (j = -1; j < rows; j++) {
+      for (var k = -1; k < cols; k++) {
+        x = k * spacing;
+        y = j * spacing;
+        var dx = x - p.cx;
+        var dy = y - p.cy;
+        var dist = Math.sqrt(dx*dx + dy*dy);
+        var diff = Math.abs(dist - p.r);
+        if (diff > ringW) continue;
+        var nodeAlpha = alpha * (1 - diff / ringW);
+        ctx.beginPath();
+        ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(' + p.col.r + ',' + p.col.g + ',' + p.col.b + ',' + nodeAlpha * 8 + ')';
+        ctx.fill();
+      }
+    }
+
+    // Draw the arc itself (faint ring)
+    ctx.beginPath();
+    ctx.arc(p.cx, p.cy, p.r, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(' + p.col.r + ',' + p.col.g + ',' + p.col.b + ',' + alpha * 0.7 + ')';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    alive.push(p);
+  }
+  GRID.pulses = alive;
+}
+
+// ── Shared gradient orbs (all variants) ───────────────────────────────────────
+// These appear behind everything as ambient color wash — very low opacity
+var ORBS = [];
+
+function initOrbs() {
+  ORBS = [
+    { cx: 0.12, cy: 0.18, r: 0.36, col: BLUE,     alpha: 0.055, sx: 0.000095, sy: 0.000075, px: 0.0, py: 1.1, pulse: 0.000065, pp: 0.0 },
+    { cx: 0.82, cy: 0.72, r: 0.40, col: BLUE,     alpha: 0.045, sx: 0.000080, sy: 0.000100, px: 2.1, py: 0.7, pulse: 0.000080, pp: 1.4 },
+    { cx: 0.90, cy: 0.12, r: 0.28, col: ORANGE,   alpha: 0.050, sx: 0.000090, sy: 0.000065, px: 1.5, py: 2.5, pulse: 0.000070, pp: 0.6 },
+    { cx: 0.18, cy: 0.82, r: 0.32, col: ORANGE,   alpha: 0.038, sx: 0.000070, sy: 0.000085, px: 3.0, py: 0.3, pulse: 0.000060, pp: 2.0 },
+    { cx: 0.55, cy: 0.45, r: 0.42, col: LAVENDER, alpha: 0.030, sx: 0.000060, sy: 0.000095, px: 4.8, py: 1.8, pulse: 0.000045, pp: 4.0 },
+  ];
+}
+
+function drawOrbs(elapsed) {
+  for (var i = 0; i < ORBS.length; i++) {
+    var o = ORBS[i];
+    var drift = 0.055;
+    var cx = (o.cx + Math.sin(elapsed * o.sx + o.px) * drift) * W;
+    var cy = (o.cy + Math.cos(elapsed * o.sy + o.py) * drift) * H;
+    var breathe = 1.0 + Math.sin(elapsed * o.pulse + o.pp) * 0.07;
+    var radius  = o.r * Math.min(W, H) * breathe;
+
+    var grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
+    var c = o.col;
+    grad.addColorStop(0,   'rgba(' + c.r + ',' + c.g + ',' + c.b + ',' + o.alpha + ')');
+    grad.addColorStop(0.45,'rgba(' + c.r + ',' + c.g + ',' + c.b + ',' + (o.alpha * 0.35) + ')');
+    grad.addColorStop(1,   'rgba(' + c.r + ',' + c.g + ',' + c.b + ',0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// ── Resize ─────────────────────────────────────────────────────────────────────
+function resize() {
+  W   = window.innerWidth;
+  H   = window.innerHeight;
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width  = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  canvas.style.width  = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  initOrbs();
+  if (variant === 'network') initNetwork();
+  if (variant === 'waves')   initWaves();
+  if (variant === 'grid')    initGrid();
+}
+
+// ── Main render loop ───────────────────────────────────────────────────────────
+function frame(now) {
+  raf = requestAnimationFrame(frame);
+  var elapsed = now - t0;
+
+  // Clear to light background
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#f0f2f8';
+  ctx.fillRect(0, 0, W, H);
+
+  // Layer 1: ambient gradient orbs (very low opacity wash)
+  drawOrbs(elapsed);
+
+  // Layer 2: variant-specific animation
+  if (variant === 'network') drawNetwork(elapsed);
+  if (variant === 'waves')   drawWaves(elapsed);
+  if (variant === 'grid')    drawGrid(elapsed);
+}
+
+// ── Variant switching (prototype controls) ─────────────────────────────────────
+window.setVariant = function(v) {
+  variant = v;
+  document.getElementById('variant-name').textContent = {
+    network: 'Particle Network',
+    waves:   'Soft Waves',
+    grid:    'Grid Pulse',
+  }[v] || v;
+
+  document.querySelectorAll('.ctrl-btn').forEach(function(btn) {
+    btn.classList.toggle('active', btn.textContent.toLowerCase().indexOf(
+      v === 'network' ? 'particle' : v === 'waves' ? 'wave' : 'grid'
+    ) !== -1);
+  });
+
+  // Re-init variant data
+  if (v === 'network') initNetwork();
+  if (v === 'waves')   initWaves();
+  if (v === 'grid')    initGrid();
+};
+
+// ── Init ───────────────────────────────────────────────────────────────────────
+resize();
+
+var resizeTimer;
+window.addEventListener('resize', function() {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(resize, 150);
+});
+
+// Pause on hidden tab
+document.addEventListener('visibilitychange', function() {
+  if (document.hidden) {
+    if (raf) { cancelAnimationFrame(raf); raf = null; }
+  } else {
+    if (!raf) raf = requestAnimationFrame(frame);
+  }
+});
+
+raf = requestAnimationFrame(frame);
+
+})();
+</script>
+
+</body>
+</html>

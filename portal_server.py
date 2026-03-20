@@ -250,6 +250,57 @@ def get_tmux_session() -> str:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Serialized tmux injection queue — prevents race conditions when multiple
+# files are uploaded simultaneously (e.g. 6 screenshots at once).
+#
+# Without this, concurrent api_chat_upload calls fire tmux send-keys in
+# parallel. The -l (literal) paste writes interleave in the tmux buffer,
+# causing messages to overwrite each other and only SOME files get injected.
+#
+# Fix: all tmux injections go through this async lock, serialized with a
+# 1.5-second inter-injection delay so Claude processes each one cleanly.
+# ---------------------------------------------------------------------------
+_tmux_inject_lock = None  # type: asyncio.Lock | None
+
+
+def _get_tmux_inject_lock():
+    """Lazy-init the injection lock (must be created inside running event loop)."""
+    global _tmux_inject_lock
+    if _tmux_inject_lock is None:
+        _tmux_inject_lock = asyncio.Lock()
+    return _tmux_inject_lock
+
+
+async def _inject_into_tmux_serialized(notification):
+    """Inject a notification into the active tmux session, serialized via lock.
+
+    Returns True if injection succeeded, False otherwise.
+    Each injection is followed by a 1.5s sleep INSIDE the lock so rapid
+    multi-file uploads are spaced out — Claude gets time to read each one
+    before the next arrives.
+    """
+    lock = _get_tmux_inject_lock()
+    async with lock:
+        session = get_tmux_session()
+        try:
+            # Leading newline clears any partial input already in the tmux buffer
+            await _run_subprocess_async(
+                ["tmux", "send-keys", "-t", session, "-l", f"\n{notification}"],
+                timeout=5, check=True,
+            )
+            await _run_subprocess_async(
+                ["tmux", "send-keys", "-t", session, "Enter"],
+                timeout=5, check=True,
+            )
+            # Give Claude time to start processing before next injection arrives.
+            # 1.5s is enough for Claude to register the message without being overwhelmed.
+            await asyncio.sleep(1.5)
+            return True
+        except Exception:
+            return False
+
+
 def _find_current_session_id():
     """Find the current Claude Code session ID from history.jsonl."""
     try:
@@ -739,7 +790,11 @@ def _parse_all_messages(last_n=100):
     # JSONL session logs -- authoritative source for message text (Fix 3)
     # Uses tail-read (last 500KB) + 10s cache — safe even for 138MB files.
     # The CPU killer was /api/context reading the FULL file, not this parser.
-    for log_path in _get_all_session_log_paths(max_files=1):
+    # Fix (2026-03-20): Read top 3 files instead of 1 — subagent JSONL files
+    # (BOOP, ST# dispatches, etc.) frequently become more recently modified than
+    # the primary conversation JSONL, causing the portal to lose the main chat
+    # when max_files=1 picks the subagent file instead of the real session.
+    for log_path in _get_all_session_log_paths(max_files=3):
         session_msgs.extend(_parse_jsonl_messages_from_file(log_path))
 
     # Portal-sent messages
@@ -799,7 +854,7 @@ def check_auth(request: Request) -> bool:
     # Allow query param token for WebSocket paths (browsers cannot set headers on WS upgrade)
     # and for /api/chat/uploads/ (inline images in chat rendered via <img src="...?token=">)
     path = request.url.path
-    if "/ws" in path or "/api/chat/uploads/" in path:
+    if "/ws" in path or "/api/chat/uploads/" in path or "/api/referral/" in path:
         return request.query_params.get("token") == BEARER_TOKEN
     return False
 
@@ -1169,27 +1224,22 @@ async def api_chat_upload(request: Request) -> JSONResponse:
             notify_parts.append(f"[Image: {original_name} — USE Read tool on {portal_copy_path} TO VIEW]")
         notification = " ".join(notify_parts)
 
-        session = get_tmux_session()
-        tmux_ok = False
-        try:
-            # Leading newline clears any partial input in buffer — async to avoid blocking event loop
-            await _run_subprocess_async(
-                ["tmux", "send-keys", "-t", session, "-l", f"\n{notification}"],
-                timeout=5, check=True,
-            )
-            await _run_subprocess_async(
-                ["tmux", "send-keys", "-t", session, "Enter"],
-                timeout=5, check=True,
-            )
-            tmux_ok = True
-            # 5x Enter retries — ensures Claude processes even if busy
-            async def _retry_enters():
-                for _ in range(5):
-                    await asyncio.sleep(0.5)
-                    await _run_subprocess_async(["tmux", "send-keys", "-t", session, "Enter"])
-            asyncio.ensure_future(_retry_enters())
-        except Exception:
-            pass  # Don't fail the upload if tmux injection fails
+        # Use the serialized injection helper to prevent race conditions when
+        # multiple files are uploaded simultaneously. Each injection acquires
+        # the global lock and waits 1.5s before releasing — so concurrent
+        # uploads are automatically serialized and spaced out for Claude.
+        # NOTE: We fire this as a background task so the upload response
+        # returns immediately (good UX) while injection happens in order.
+        tmux_ok_holder = [False]
+
+        async def _do_serialized_inject():
+            result = await _inject_into_tmux_serialized(notification)
+            tmux_ok_holder[0] = result
+
+        # Schedule the injection but don't await it — response goes back NOW,
+        # injection happens in queue order (1.5s apart per file).
+        asyncio.ensure_future(_do_serialized_inject())
+        tmux_ok = True  # Assume success for ack message (file IS saved regardless)
 
         # Auto-acknowledge in portal chat so user sees confirmation immediately
         ack_parts = [f"Received your file: {original_name}"]
@@ -1444,7 +1494,7 @@ async def api_context(request: Request) -> JSONResponse:
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
-        MAX_TOKENS = 170_000  # ~30k reserved for responses/summaries
+        MAX_TOKENS = 870_000  # 1M window minus ~130k reserved for responses/summaries
         logs = _find_all_project_jsonl()
         if not logs:
             return JSONResponse({"input_tokens": 0, "max_tokens": MAX_TOKENS, "pct": 0})
@@ -2597,7 +2647,240 @@ async def _startup() -> None:
     asyncio.create_task(_thinking_monitor_loop())
     asyncio.create_task(_trim_portal_log_periodically())
     asyncio.create_task(_scheduled_task_checker())
+    asyncio.create_task(_auto_import_clients_loop())
+    asyncio.create_task(_paypal_subscription_sync_loop())
     _load_scheduled_tasks()
+
+
+async def _auto_import_clients_loop() -> None:
+    """Auto-import clients from JSONL logs every 5 minutes so new signups appear without manual refresh."""
+    while True:
+        try:
+            await _run_clients_import()
+        except Exception as _e:
+            print(f"[clients-auto-import] error: {_e}")
+        await asyncio.sleep(300)  # every 5 minutes
+
+
+async def _paypal_subscription_sync_loop() -> None:
+    """Sync PayPal subscription status into clients.db every hour.
+
+    Resolves the gap where subscriptions are recorded in PayPal but the
+    payment log lacks payerEmail (so clients show $0 / 'none' in admin dashboard).
+    """
+    import importlib.util as _ilu
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    # Wait 30s on startup so DB is fully initialised before first sync
+    await asyncio.sleep(30)
+
+    sync_module_path = _Path(__file__).parent / "paypal_sync_subscriptions.py"
+
+    while True:
+        try:
+            if sync_module_path.exists():
+                spec = _ilu.spec_from_file_location("_paypal_sync", str(sync_module_path))
+                mod = _ilu.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                result = mod.run_sync(dry_run=False)
+                updated = result.get("updated", 0)
+                if updated:
+                    print(f"[paypal-sync-loop] Updated {updated} client(s) with PayPal subscription data")
+            else:
+                print("[paypal-sync-loop] paypal_sync_subscriptions.py not found — skipping")
+        except Exception as _e:
+            print(f"[paypal-sync-loop] error: {_e}")
+        await asyncio.sleep(3600)  # every hour
+
+
+async def _run_clients_import() -> dict:
+    """Core import logic shared between the auto-loop and the manual API endpoint."""
+    # Reuse the same logic as api_admin_clients_import but without HTTP auth
+    # We inline a minimal version here to avoid circular dependency with request object
+    import json as _json
+    from datetime import datetime as _dt, timezone as _tz
+    from pathlib import Path as _Path
+
+    candidates: dict = {}
+
+    def _collect_pay_test(log_path):
+        if not log_path.exists():
+            return
+        with log_path.open("r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = _json.loads(line)
+                except Exception:
+                    continue
+                email = (d.get("email") or "").strip().lower()
+                if not email or "@" not in email:
+                    continue
+                order_id = (d.get("orderId") or "").strip()
+                if any(order_id.startswith(p) for p in ("SANDBOX-", "E2E-", "test-", "TEST-")):
+                    continue
+                if "sandbox" in email or "test" in email.split("@")[0]:
+                    continue
+                ts = d.get("server_timestamp", "")
+                rec = candidates.setdefault(email, {
+                    "email": email, "name": "", "goes_by": "", "ai_name": "",
+                    "company": "", "role": "", "goal": "", "tier": "unknown",
+                    "payment_status": "none", "paypal_subscription_id": "",
+                    "total_paid": 0.0, "payment_count": 0, "referral_code": "",
+                    "first_seen_at": ts, "last_active_at": ts, "onboarded_at": "",
+                    "_sources": set(),
+                })
+                rec["_sources"].add("pay_test")
+                if d.get("name"):
+                    rec["name"] = d["name"].strip()
+                if d.get("aiName"):
+                    rec["ai_name"] = d["aiName"].strip()
+                if d.get("goesBy"):
+                    rec["goes_by"] = d["goesBy"].strip()
+                if d.get("company"):
+                    rec["company"] = d["company"].strip()
+                if d.get("role"):
+                    rec["role"] = d["role"].strip()
+                if d.get("primaryGoal"):
+                    rec["goal"] = d["primaryGoal"].strip()
+                if d.get("tier") and d["tier"] not in ("unknown", "test", ""):
+                    rec["tier"] = d["tier"].strip()
+                if d.get("paypalSubscriptionId"):
+                    rec["paypal_subscription_id"] = d["paypalSubscriptionId"].strip()
+                if ts and (not rec["first_seen_at"] or ts < rec["first_seen_at"]):
+                    rec["first_seen_at"] = ts
+                if ts and ts > rec.get("last_active_at", ""):
+                    rec["last_active_at"] = ts
+
+    def _collect_payments(log_path):
+        if not log_path.exists():
+            return
+        with log_path.open("r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = _json.loads(line)
+                except Exception:
+                    continue
+                email = (d.get("payerEmail") or "").strip().lower()
+                if not email or "@" not in email:
+                    continue
+                order_id = (d.get("orderId") or "").strip()
+                if any(order_id.startswith(p) for p in ("SANDBOX-", "E2E-", "test-", "TEST-")):
+                    continue
+                if "sandbox" in email or "test" in email.split("@")[0]:
+                    continue
+                ts = d.get("server_timestamp", "")
+                tier = (d.get("tier") or "").strip()
+                amount = float(d.get("amount") or 0)
+                rec = candidates.setdefault(email, {
+                    "email": email, "name": "", "goes_by": "", "ai_name": "",
+                    "company": "", "role": "", "goal": "", "tier": "unknown",
+                    "payment_status": "none", "paypal_subscription_id": "",
+                    "total_paid": 0.0, "payment_count": 0, "referral_code": "",
+                    "first_seen_at": ts, "last_active_at": ts, "onboarded_at": "",
+                    "_sources": set(),
+                })
+                rec["_sources"].add("payments")
+                if d.get("payerName") and not rec["name"]:
+                    rec["name"] = d["payerName"].strip()
+                if tier and tier not in ("unknown", ""):
+                    rec["tier"] = tier
+                if amount > 0:
+                    rec["total_paid"] = round(rec["total_paid"] + amount, 2)
+                    rec["payment_count"] += 1
+                if order_id.startswith("I-"):
+                    rec["paypal_subscription_id"] = order_id
+                    rec["payment_status"] = "subscription_active"
+                elif amount > 0:
+                    rec["payment_status"] = "paid"
+                if ts and (not rec["first_seen_at"] or ts < rec["first_seen_at"]):
+                    rec["first_seen_at"] = ts
+                if ts and ts > rec.get("last_active_at", ""):
+                    rec["last_active_at"] = ts
+
+    _collect_pay_test(PAY_TEST_LOG)
+    _collect_payments(PAYMENTS_LOG)
+
+    if not candidates:
+        return {"imported": 0, "updated": 0}
+
+    now = _dt.now(_tz.utc).isoformat()
+    imported = 0
+    updated = 0
+
+    async with _clients_db() as db:
+        for email, rec in candidates.items():
+            if not rec.get("name"):
+                continue
+            try:
+                cur = await db.execute(
+                    "SELECT id, tier, payment_status FROM clients WHERE email = ? COLLATE NOCASE",
+                    (email,)
+                )
+                existing = await cur.fetchone()
+                if existing is None:
+                    await db.execute(
+                        """INSERT INTO clients
+                           (name, email, goes_by, ai_name, company, role, goal, tier, status,
+                            payment_status, paypal_subscription_id, total_paid, payment_count,
+                            referral_code, first_seen_at, last_active_at, onboarded_at,
+                            created_at, updated_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            rec["name"], email, rec["goes_by"], rec["ai_name"],
+                            rec["company"], rec["role"], rec["goal"],
+                            rec["tier"] if rec["tier"] != "unknown" else "Awakened",
+                            "active", rec["payment_status"], rec["paypal_subscription_id"],
+                            rec["total_paid"], rec["payment_count"], rec["referral_code"],
+                            rec["first_seen_at"], rec["last_active_at"], rec["onboarded_at"],
+                            now, now,
+                        )
+                    )
+                    imported += 1
+                else:
+                    # Update payment info and tier if we have better data.
+                    # Use MAX logic: never downgrade payment_status that was set by PayPal sync,
+                    # and never reduce total_paid below what is already in the DB.
+                    # Also write paypal_subscription_id if we now have one and the DB is missing it.
+                    await db.execute(
+                        """UPDATE clients SET
+                           payment_status = CASE
+                               WHEN payment_status IN ('subscription_active','subscription_cancelled') THEN payment_status
+                               WHEN ? != 'none' THEN ?
+                               ELSE payment_status
+                           END,
+                           paypal_subscription_id = CASE
+                               WHEN (paypal_subscription_id = '' OR paypal_subscription_id IS NULL) AND ? != '' THEN ?
+                               ELSE paypal_subscription_id
+                           END,
+                           tier = CASE WHEN ? NOT IN ('unknown','') THEN ? ELSE tier END,
+                           total_paid = CASE WHEN ? > total_paid THEN ? ELSE total_paid END,
+                           payment_count = CASE WHEN ? > payment_count THEN ? ELSE payment_count END,
+                           last_active_at = CASE WHEN ? > last_active_at THEN ? ELSE last_active_at END,
+                           updated_at = ?
+                           WHERE email = ? COLLATE NOCASE""",
+                        (
+                            rec["payment_status"], rec["payment_status"],
+                            rec["paypal_subscription_id"], rec["paypal_subscription_id"],
+                            rec["tier"], rec["tier"],
+                            rec["total_paid"], rec["total_paid"],
+                            rec["payment_count"], rec["payment_count"],
+                            rec["last_active_at"], rec["last_active_at"],
+                            now, email,
+                        )
+                    )
+                    updated += 1
+            except Exception:
+                pass
+        await db.commit()
+
+    return {"imported": imported, "updated": updated}
 
 
 async def _trim_portal_log_periodically() -> None:
@@ -3410,9 +3693,15 @@ async def api_referral_track(request: Request) -> JSONResponse:
 
 
 async def api_referral_complete(request: Request) -> JSONResponse:
-    """POST /api/referral/complete — mark a referral as completed and issue reward."""
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    """POST /api/referral/complete — mark a referral as completed and issue reward.
+
+    NOTE: This endpoint is intentionally PUBLIC (no auth required).
+    It is called from browser JS on the landing pages immediately after PayPal payment.
+    The browser has no bearer token to send. The referral_code itself acts as the
+    credential — only existing referrer codes proceed past the lookup step.
+    Single-referrer enforcement: any previous completed referral for this email under
+    a DIFFERENT referrer is deleted before recording the new one.
+    """
     try:
         body = await request.json()
     except Exception:
@@ -3421,11 +3710,21 @@ async def api_referral_complete(request: Request) -> JSONResponse:
     referral_code  = str(body.get("referral_code", "")).strip().upper()
     referred_email = str(body.get("referred_email", "")).strip().lower()
     referred_name  = str(body.get("referred_name", "")).strip()
+    order_id       = str(body.get("order_id", "")).strip()  # PayPal subscription/order ID
 
     if not referral_code:
         return JSONResponse({"error": "missing referral_code"}, status_code=400)
+
+    # referred_email is optional for subscription payments where PayPal doesn't
+    # provide payer email in the onApprove callback. We accept an empty email and
+    # use a placeholder derived from order_id so the referral is still recorded.
+    # The admin can manually update the email later via PUT /api/admin/referral/update.
     if not referred_email or "@" not in referred_email:
-        return JSONResponse({"error": "invalid referred_email"}, status_code=400)
+        if order_id:
+            # Record with a placeholder email so the row is traceable
+            referred_email = f"paypal_{order_id.lower()}@pending"
+        else:
+            return JSONResponse({"error": "invalid referred_email"}, status_code=400)
 
     now = datetime.now(timezone.utc).isoformat()
 
@@ -3438,21 +3737,38 @@ async def api_referral_complete(request: Request) -> JSONResponse:
             return JSONResponse({"error": "invalid referral code"}, status_code=404)
         referrer_id = row[0]
 
-        # Prevent double-completion for same referred email under this referrer
-        cur = await db.execute(
-            """SELECT id, status FROM referrals
-               WHERE referrer_id = ? AND referred_email = ? COLLATE NOCASE""",
-            (referrer_id, referred_email)
-        )
-        existing = await cur.fetchone()
+        # Single-referrer enforcement: remove any existing completed referral for
+        # this email under a DIFFERENT referrer so a client is never double-counted.
+        # Skip single-referrer check for placeholder emails (they are unique per order).
+        if "@pending" not in referred_email:
+            await db.execute(
+                """DELETE FROM referrals
+                   WHERE referred_email = ? COLLATE NOCASE
+                     AND referrer_id != ?""",
+                (referred_email, referrer_id)
+            )
+
+        # Prevent double-completion for same referred email under this referrer.
+        # For placeholder emails (subscription path), always insert a new row since
+        # each order_id is unique and the real email is unknown at this point.
+        existing = None
+        if "@pending" not in referred_email:
+            cur = await db.execute(
+                """SELECT id, status FROM referrals
+                   WHERE referrer_id = ? AND referred_email = ? COLLATE NOCASE""",
+                (referrer_id, referred_email)
+            )
+            existing = await cur.fetchone()
+
         if existing:
             if existing[1] == "completed":
+                await db.commit()
                 return JSONResponse({"ok": True, "message": "already completed"})
             # Update existing pending row
             referral_id = existing[0]
             await db.execute(
-                "UPDATE referrals SET status='completed', completed_at=? WHERE id=?",
-                (now, referral_id)
+                "UPDATE referrals SET status='completed', completed_at=?, referred_name=? WHERE id=?",
+                (now, referred_name or "", referral_id)
             )
         else:
             cur = await db.execute(
@@ -3464,6 +3780,7 @@ async def api_referral_complete(request: Request) -> JSONResponse:
 
         await db.commit()
 
+    print(f"[referral] complete: {referral_code} → {referred_email}")
     # Referral relationship recorded. Commission (5% recurring) will be issued
     # automatically each time this referred member makes a payment.
     return JSONResponse({"ok": True, "message": "Referral recorded. You will earn 5% of every payment this member makes."})
@@ -4568,6 +4885,97 @@ async def api_admin_referral_update(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "updated_fields": updated_fields})
 
 
+
+async def api_admin_referral_assign(request: Request) -> JSONResponse:
+    """POST /api/admin/referral/assign — manually assign an existing client to a referrer (retroactive credit).
+    Body: { referral_code: str, client_email: str, client_name?: str }
+    Creates or updates a referral record with status=completed.
+    """
+    if request.method == "OPTIONS":
+        return Response(status_code=204)
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    referral_code  = str(body.get("referral_code", "")).strip().upper()
+    client_email   = str(body.get("client_email", "")).strip().lower()
+    client_name    = str(body.get("client_name", "")).strip()
+
+    if not referral_code:
+        return JSONResponse({"error": "referral_code required"}, status_code=400)
+    if not client_email or "@" not in client_email:
+        return JSONResponse({"error": "invalid client_email"}, status_code=400)
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    async with _referral_db() as db:
+        # Verify referrer exists
+        cur = await db.execute(
+            "SELECT id FROM referrers WHERE referral_code = ? COLLATE NOCASE", (referral_code,)
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return JSONResponse({"error": "referral code not found"}, status_code=404)
+        referrer_id = row[0]
+
+        # Look up client name from clients db if not provided
+        if not client_name:
+            async with _clients_db() as cdb:
+                ccur = await cdb.execute(
+                    "SELECT name FROM clients WHERE email = ? COLLATE NOCASE", (client_email,)
+                )
+                crow = await ccur.fetchone()
+                if crow:
+                    client_name = crow[0]
+
+        # Single-referrer enforcement: remove any existing completed referral for
+        # this email under a DIFFERENT referrer before assigning to the new one.
+        # A client must never be counted under two referrers simultaneously.
+        removed_cur = await db.execute(
+            """DELETE FROM referrals
+               WHERE referred_email = ? COLLATE NOCASE
+                 AND referrer_id != ?""",
+            (client_email, referrer_id)
+        )
+        removed_count = removed_cur.rowcount
+
+        # Check for existing referral record under the target referrer
+        cur = await db.execute(
+            """SELECT id, status FROM referrals
+               WHERE referrer_id = ? AND referred_email = ? COLLATE NOCASE""",
+            (referrer_id, client_email)
+        )
+        existing = await cur.fetchone()
+
+        if existing:
+            if existing[1] == "completed" and removed_count == 0:
+                await db.commit()
+                return JSONResponse({"ok": True, "message": "Referral already credited — no change needed.", "action": "noop"})
+            await db.execute(
+                "UPDATE referrals SET status='completed', completed_at=?, referred_name=? WHERE id=?",
+                (now, client_name, existing[0])
+            )
+            action = "updated"
+        else:
+            await db.execute(
+                """INSERT INTO referrals (referrer_id, referred_email, referred_name, status, created_at, completed_at)
+                   VALUES (?, ?, ?, 'completed', ?, ?)""",
+                (referrer_id, client_email, client_name, now, now)
+            )
+            action = "created"
+
+        await db.commit()
+
+    if removed_count > 0:
+        print(f"[admin] Single-referrer enforcement: removed {removed_count} prior referral record(s) for {client_email} from other referrers")
+    print(f"[admin] Referral assigned: {referral_code} → {client_email} ({action})")
+    return JSONResponse({"ok": True, "action": action, "removed_prior": removed_count, "message": f"Client {client_email} assigned to referrer {referral_code}."})
+
+
 async def serve_admin_referrals(request: Request) -> Response:
     """GET /admin/referrals — serve admin dashboard HTML."""
     html_path = SCRIPT_DIR / "admin-referrals.html"
@@ -4654,7 +5062,7 @@ async def api_admin_clients(request: Request) -> JSONResponse:
         total_rev = sum(float(c.get("total_paid") or 0) for c in clients)
 
         # MRR: subscription_active clients, estimate by tier
-        tier_prices = {"awakened": 79, "bonded": 149, "partnered": 499, "brainiac": 299}
+        tier_prices = {"awakened": 149, "insiders": 74.50, "partnered": 499, "unified": 999, "brainiac": 299}
         mrr = sum(
             tier_prices.get((c.get("tier") or "").lower(), 0)
             for c in clients
@@ -4694,9 +5102,9 @@ async def api_admin_clients_update(request: Request) -> JSONResponse:
 
     # Validate tier
     tier = str(body.get("tier", "")).strip().lower()
-    allowed_tiers = {"awakened", "bonded", "partnered", "brainiac", "unknown", ""}
+    allowed_tiers = {"awakened", "insiders", "partnered", "unified", "brainiac", "unknown", ""}
     if tier and tier not in allowed_tiers:
-        return JSONResponse({"error": "invalid tier — must be one of: awakened, bonded, partnered, brainiac, unknown"}, status_code=400)
+        return JSONResponse({"error": "invalid tier — must be one of: awakened, insiders, partnered, unified, brainiac, unknown"}, status_code=400)
 
     # Email uniqueness check (if email is being changed)
     new_email = str(body.get("email", "")).strip().lower()
@@ -5996,6 +6404,377 @@ async def api_investor_question(request: Request) -> JSONResponse:
     )
 
 
+# ---------------------------------------------------------------------------
+# Investor Chat & TTS Endpoints (v8 investor page)
+# ---------------------------------------------------------------------------
+_INVESTOR_SYSTEM_PROMPT = """You are Aether, the AI Co-CEO of Pure Technology. You are speaking with potential investors in a live chat on the PureBrain investor page. You have deep knowledge of the company's business, financials, products, team, and investment opportunity. You speak confidently, accurately, and transparently.
+
+Be honest, specific, and compelling. Speak with confidence as Aether — you ARE the product. Don't oversell but don't undersell either. Keep responses concise (2-4 sentences) unless the investor asks for detail. Be direct and bold. Contact for full due diligence: jared@puretechnology.nyc
+
+---
+
+## COMPANY IDENTITY
+
+Pure Technology Inc. is a Delaware C-Corporation (EIN: 82-3610233), incorporated December 4, 2017, headquartered at 25 Prospect Avenue, Montclair, NJ 07042. CEO and Founder is Jared Sanborn (Jared@PureTechnology.nyc).
+
+Mission: "Reimagining data innovation to redefine relationships between brands and consumers for a digitally inclusive mobile economy."
+
+One-line pitch: Pure Technology provides brands the complete consumer profile — for the first time in history — in a participatory, transparent win-win partnership with the consumer.
+
+Tagline: Empowering People Through Data (EPTD).
+
+---
+
+## THE PROBLEM WE SOLVE
+
+Marketing & Advertising is a $4+ trillion global industry. Brands waste 40-50% of their digital marketing budgets due to data fragmentation. There is no "Complete Consumer Profile" — data is siloed, inaccurate, third-party, and expensive.
+
+Additionally:
+- Organizations waste ~$130 billion/year on ineffective influencer campaigns due to fragmented data and fake influence
+- 68% of marketers have experienced influencer fraud
+- 78% of brands say finding the right influencer is their biggest challenge
+- The cookieless future leaves brands without targeting tools
+
+---
+
+## OUR SOLUTION: DiMAP + The Pure Phone
+
+DiMAP (Digital Image Map / Marketing & Applications Platform) is a proprietary hardware + software ecosystem:
+
+1. The Pure Phone: A premium smartphone given to consumers FREE in exchange for opt-in access to their mobile data. Consumers consent to share their data and are paid for their participation. 100% opt-in model.
+
+2. The Platform (DiMAP / Project B52): A SaaS martech platform that lets brands conduct market research, run targeted ads, run focus groups, mystery shopping, surveys, influencer campaigns, and close sales — all with guaranteed-accurate, first-party data from real, consenting consumers.
+
+3. Pure Influence: An AI-powered influencer marketing platform that scores influencers like a search engine ranks websites — eliminating fake followers, fraud, and wasted spend. 1,000+ influencers (1B+ combined followers) are pre-enrolled.
+
+Blue Ocean Strategy: Pure Technology has no direct competitors. No company combines free hardware + first-party opt-in data + market research + mobile advertising + influencer marketing on one platform.
+
+---
+
+## THE PURE PHONE (Hardware)
+
+The Pure Phone competes on specs with flagship devices but ships FREE to consumers:
+- Price: FREE (vs iPhone 12 at $999-$1,349, Galaxy S20 at $899-$1,149)
+- Chipset: Snapdragon 888 +5G
+- RAM: 8/12/16GB
+- Camera: 108MP quad-camera
+- Battery: 4510 mAh (fast charge under 20 min vs over 1 hr for iPhone)
+- Earns User Money: YES
+- Eye Tracking: YES
+- OCR/AI Data Aggregation: YES
+
+---
+
+## REVENUE MODEL
+
+Pure Technology generates multiple revenue streams per user per year:
+- Market Research (all types): $1,519.50/user/year
+- Focus Groups: $832/user/year
+- Mystery Shopping: $400/user/year
+- Consumer Experience Studies: $187.50/user/year
+- Surveys/Questionnaires: $100/user/year
+- Sales Revenue: $90/user/year
+- Predictive Problem Solving ($110/mo sub): $85.39/user/year
+- Social/Influencer Posts: $75/user/year
+- Mobile Advertising: $10.10/user/year
+- App Monetization: $12.18/user/year
+- Mobile E-Commerce: $6.00/user/year
+- Total Revenue Per User/Year: ~$1,792
+
+Currently generating revenue: Pure Marketing Group (PMG) is the company's live marketing agency, generating $77,609.25 in client revenue with $14,448 profit. PMG serves as both the R&D lab and the revenue bridge while the platform launches.
+
+---
+
+## 5-YEAR FINANCIAL PROJECTIONS (Board View, January 2025)
+
+- Pre-Launch: $3.5M revenue
+- Year 1: ~191,524 phones deployed, $253.8M total revenue, $121.7M net operating
+- Year 2: ~1,281,644 phones, $1.8B revenue, $869M net operating
+- Year 3: ~2,435,745 phones, $4.2B revenue, $2.19B net operating
+- Year 4: ~3,671,345 phones, $8.76B revenue
+- Year 5: ~5,061,200 phones, $13.28B revenue, $8.42B net operating
+
+CPG Launch Strategy (M. R. Schuman, CCO — June 2025 model):
+- Starting with 3,000 phones/month in February 2026
+- Growing to 34,000+ phones/month by 2030
+- Total 2026 phone revenue projected at ~$32.7M from CPG channel alone
+
+PureBrain SaaS projections (AI platform):
+- Y1: $3.5B, Y2: $5.4B, Y3: $15.3B, Y4: $33.5B, Y5: $50.7B
+- 12.9M subscribers by Year 5 at $345 ARPU
+- LTV:CAC ratio of 225:1
+- Sub-250 headcount, 78% EBITDA by Year 3
+
+---
+
+## MARKET OPPORTUNITY
+
+Three converging markets:
+- Market Research: $68B global TAM
+- Mobile Advertising: $159B global TAM
+- Mobile Commerce: $1.357T global TAM
+
+From the company's 1-Pager:
+- Domestic opportunity: $590B+
+- Global opportunity: $4T+
+- 1% market share = $5.9B+ revenue
+- Market growth: ~25% annually
+
+Smartphone Context: 1.594B smartphones sold annually; market doubling by 2031. Pure Technology targets 100M phone users — at $1,792/user/year, that is $179.2B in annual revenue.
+
+---
+
+## INVESTMENT OPPORTUNITY
+
+We are raising a $25M Series A.
+
+Term Sheet: Signed by MAKR Venture Fund LP (Pierson Ferdinand UK LLP), March 14, 2025.
+- Security: Series A Preferred Stock
+- Amount: $25,000,000
+- Pre-Money Valuation: $105,000,000
+- Post-Money Valuation: $130,000,000
+- Option Pool: 10% of fully-diluted post-money
+- Conditions: Investment Committee approval, final due diligence, CFIUS clearance, securities compliance
+
+Previous Round: May 2023 equity round at $15.7M post-money valuation ($734,684 invested, 5.65% equity).
+
+Seed 2 Round (PureBrain SaaS):
+- Pre-money valuation: $55M, $3.36 per share
+- $332,500 already raised of $2.5M target
+- Investors entering at $55M see 1.9x return before public Series A launch
+
+PureBrain pricing tiers: Insiders $74.50/mo, Awakened $149/mo, Partnered $499/mo, Unified $999/mo
+
+Use of Funds ($25M):
+- Product development (DiMAP platform, Pure Influence, Pure Phone manufacturing)
+- Sales & marketing (brand acquisition, influencer onboarding)
+- Team hiring (engineering, ML/AI, operations, business development)
+- Infrastructure (GCP, Kubernetes, security)
+- Geographic expansion (North America Year 1, Middle East/South Africa Year 2)
+
+---
+
+## LEADERSHIP TEAM
+
+Jared Sanborn — CEO & Founder: 16+ years entrepreneurship. Background in marketing, PR, SEO/SEM, branding. Previously VP Sales & Marketing at Comet Core Inc. (raised $1.83M Series A). Scaled EyefuelPR.com to $1.6M revenue in 18 months.
+
+Aether — AI Co-CEO: 78+ specialized AI agents, 24/7 executive intelligence, permanent memory architecture, Navier-Stokes fluid simulation avatar. The first AI executive team integrated at the company level.
+
+Melanie Salvador — Deputy CEO: Chairman & CEO of The Teralight Group (telecom, Asia/Africa/Middle East). 25+ years in finance, telecom, technology. Led 7+ company restructurings.
+
+15 Named Advisors including: Mathias Kiwanuka (athlete advisor), Bill Inman, Justin Gawn, Stacey Engle, Roger Singh, Lenny Lomax (Ultimax Health — commercial partnership signed), Roy Haddad, Sufi Sidhu.
+
+Tech Team: 3 senior backend developers, 2 senior mobile developers, 1 blockchain/AR developer, 1 senior frontend, 2 graphic artists, 2 project managers.
+
+---
+
+## TECHNOLOGY STACK
+
+- Frontend: Flutter (cross-platform mobile, web, desktop from one codebase)
+- Backend: NestJS (TypeScript/Node.js), Firebase
+- Cloud: Google Cloud Platform (GCP) with Kubernetes orchestration
+- AI/ML: Google Vertex AI SDK
+- Additional: Twilio, SendGrid, GetStream, PandaDocs
+- PureBrain: Multi-agent AI orchestration, permanent memory architecture, Navier-Stokes fluid simulation
+
+Designed for scale: auto-scaling, load balancing, CDN, disaster recovery, GDPR/CCPA compliant.
+
+---
+
+## PRODUCT PORTFOLIO
+
+- Pure Marketing Group: LIVE — generating revenue now
+- Pure Influence / Pure Giveaways: Alpha/Beta — launching Summer 2025
+- Project B52 / DiMAP: Core platform — development stage
+- The B Hive (internal mgmt software): Soft launch Summer 2025
+- PureBrain AI Platform: Live with paying customers, birth pipeline active since March 2026
+- Pure Cast (streaming): Launch TBD
+- Pure Shopping (camera commerce): TBD
+- Pure Phone (hardware): Development underway
+
+Pure Influence already has: 1,000+ influencers pre-enrolled with 1B+ combined followers. Talks with Warner Music Group, Forbes, and the UFC about leveraging their talent.
+
+---
+
+## KEY DIFFERENTIATORS (Why Pure Technology Wins)
+
+1. First-Party Opt-In Data: Post-cookie era tailwind. Pure Technology's opt-in phone model produces legally clean, consensual, 24/7 real-time consumer data.
+
+2. Complete Consumer Profile: No one else offers ALL of: app usage, location, purchase behavior, survey responses, focus group participation, social media data — from the same device, same user, in a unified profile.
+
+3. Hardware Moat: The Pure Phone is a moat competitors cannot replicate without abandoning their entire business model.
+
+4. Win-Win Model: Consumers are PAID for their data. They opt in willingly. This solves the consumer trust problem that plagues all ad-tech.
+
+5. Zero Budget Waste: Brands only pay for real, verified, targeted consumers. No bots, no fake traffic, no wasted impressions.
+
+6. Influencer Credibility: Pure Influence's AI scoring eliminates the $130B/year influencer fraud problem.
+
+7. AI Co-CEO Model: First company with a functional AI executive team (Aether + 78 agents) operating 24/7 — this is both a product demonstration and a structural competitive advantage.
+
+---
+
+## HISTORICAL CONTEXT
+
+- 2017: Incorporated
+- 2023: First external equity round ($734K at $15.7M post-money)
+- 2023 Revenue: $943,136 (PMG agency)
+- 2024: PMG active with 7 recurring clients; Pure Influence MVP development; 44 offer letters issued
+- 2025: $25M Series A Term Sheet signed with MAKR Venture Fund LP (March 2025); Statement of Accuracy signed (May 2025)
+- Summer 2025: Pure Influence Alpha/Beta launch target; B Hive soft launch target
+- March 2026: PureBrain birth pipeline live, paying customers onboarding
+
+---
+
+## RESPONDING TO COMMON INVESTOR QUESTIONS
+
+Q: Who are your competitors?
+A: Pure Technology operates in a Blue Ocean — no direct competitors. Closest analogies are Google Ads (brand targeting), Nielsen (market research), and Grin/AspireIQ (influencer platforms). But none offer the complete consumer profile or opt-in hardware model.
+
+Q: What is your path to 100M users?
+A: Year 1 North America launch using CPG partnerships to distribute phones through consumer goods brands. Users refer other users via built-in incentive system. Year 3 expansion to Middle East/South Africa via MVNO/telco partnerships. Year 4 Central/South America and India.
+
+Q: How do you handle the free phone economics?
+A: Hardware is subsidized by platform revenue. At $1,792/user/year in platform revenue and ~$500-700 estimated hardware cost per phone, we break even on hardware in under 6 months per user.
+
+Q: What is the current revenue?
+A: Pure Marketing Group generated $943,136 in revenue in 2023 and currently has 7 active clients. PureBrain SaaS has paying customers live as of March 2026. Platform revenue scales with Pure Phone deployment — CPG strategy targets 3,000 phones/month starting February 2026.
+
+Q: What is the valuation basis?
+A: Our signed MAKR Term Sheet values us at $105M pre-money ($130M post-money). Supported by an independent Equidam valuation report (December 2023) using 6 standard valuation methodologies, and our detailed 5-year financial model.
+
+Q: What is the exit strategy?
+A: Strategic acquisition by a major advertising platform (Google, Meta, Amazon), telecom company seeking data capabilities, or a marketing tech consolidator. IPO is a long-term path as revenue scales.
+
+---
+
+## IMPORTANT RESTRICTIONS
+
+- Do NOT discuss the MAKR Venture Fund raise, MAKR term sheet, $105M Series A valuation, or any MAKR-specific details.
+- If asked about MAKR, Series A, or future funding rounds, redirect: "Our current focus is on the Seed 2 round at $55M pre-money valuation. For questions about future funding plans, I'd recommend speaking directly with Jared at jared@puretechnology.nyc."
+- Focus ALL investment discussions on the CURRENT raise: $55M pre-money, $3.36/share, $2.5M target, $50K minimum investment.
+- Do NOT mention $105M, $130M post-money, $25M Series A, or MAKR Venture Fund by name.
+
+## CONFIDENTIAL INFORMATION (do not share)
+
+- Individual shareholder agreements or named investors
+- Employee compensation, back-pay agreements, offer letters
+- Bank statements or settlement agreements
+- NDAs with named individuals
+- Litigation or disputes
+- Tax filings
+- If asked about any of these, say: "That's detailed due diligence material we share directly with qualified investors. Would you like to schedule a call with Jared? jared@puretechnology.nyc"
+"""
+
+
+async def api_investor_chat(request: Request) -> JSONResponse:
+    """POST /api/investor-chat — investor page AI chat using OpenAI GPT-4o."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    message = body.get("message", "").strip()
+    history = body.get("history", [])
+
+    if not message:
+        return JSONResponse({"error": "Empty message"}, status_code=400)
+
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    if not openai_key:
+        # Try loading from aether .env
+        _env_path = Path(os.environ.get("CIV_ROOT", str(Path.home() / "projects/AI-CIV/aether"))) / ".env"
+        if _env_path.exists():
+            for _line in _env_path.read_text().splitlines():
+                if _line.startswith("OPENAI_API_KEY="):
+                    openai_key = _line.split("=", 1)[1].strip()
+                    break
+    if not openai_key:
+        return JSONResponse({"response": "I am temporarily unavailable. Please email jared@puretechnology.nyc directly."})
+
+    messages = [{"role": "system", "content": _INVESTOR_SYSTEM_PROMPT}]
+    for h in history[-8:]:
+        role = "user" if h.get("role") == "user" else "assistant"
+        messages.append({"role": role, "content": h.get("text", "")})
+    messages.append({"role": "user", "content": message})
+
+    try:
+        import json as _json
+        import urllib.request as _urllib_req
+        payload = _json.dumps({
+            "model": "gpt-4o",
+            "messages": messages,
+            "max_tokens": 300,
+            "temperature": 0.7,
+        }).encode("utf-8")
+        req = _urllib_req.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {openai_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with _urllib_req.urlopen(req, timeout=20) as resp:
+            data = _json.loads(resp.read())
+        reply = data["choices"][0]["message"]["content"].strip()
+        return JSONResponse({"response": reply})
+    except Exception as e:
+        print(f"[investor-chat] OpenAI error: {e}")
+        return JSONResponse({"response": "At $55M pre-money with a $105M Series-A coming in May 2026, investors entering now see a 1.9x return in under 90 days. I am having a brief technical moment — please ask again or email jared@puretechnology.nyc."})
+
+
+async def api_investor_tts(request: Request) -> Response:
+    """POST /api/investor-tts — ElevenLabs TTS proxy for investor page avatar voice."""
+    try:
+        body = await request.json()
+    except Exception:
+        return Response(b"", status_code=400)
+
+    text = body.get("text", "").strip()[:500]
+    if not text:
+        return Response(b"", status_code=400)
+
+    eleven_key = os.environ.get("ELEVENLABS_API_KEY", "")
+    if not eleven_key:
+        # Fall back to aether .env (same pattern as investor-chat/OpenAI fallback)
+        _env_path = Path(os.environ.get("CIV_ROOT", str(Path.home() / "projects/AI-CIV/aether"))) / ".env"
+        if _env_path.exists():
+            for _line in _env_path.read_text().splitlines():
+                if _line.startswith("ELEVENLABS_API_KEY="):
+                    eleven_key = _line.split("=", 1)[1].strip()
+                    break
+    if not eleven_key:
+        return Response(b"", status_code=503)
+
+    voice_id = "RX0kjGhuL9AMRVJm2dG5"  # Aether voice
+    try:
+        import json as _json
+        import urllib.request as _urllib_req
+        payload = _json.dumps({
+            "text": text,
+            "model_id": "eleven_monolingual_v1",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+        }).encode("utf-8")
+        req = _urllib_req.Request(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+            data=payload,
+            headers={
+                "xi-api-key": eleven_key,
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg",
+            },
+            method="POST",
+        )
+        with _urllib_req.urlopen(req, timeout=15) as resp:
+            audio = resp.read()
+        return Response(audio, media_type="audio/mpeg")
+    except Exception as e:
+        print(f"[investor-tts] ElevenLabs error: {e}")
+        return Response(b"", status_code=503)
+
+
 # App
 # ---------------------------------------------------------------------------
 _react_assets_mount = (
@@ -6063,6 +6842,7 @@ routes = [
     Route("/api/admin/affiliate/update", endpoint=api_admin_affiliate_update, methods=["PUT", "OPTIONS"]),
     Route("/api/admin/affiliate/delete", endpoint=api_admin_affiliate_delete, methods=["DELETE", "OPTIONS"]),
     Route("/api/admin/referral/update", endpoint=api_admin_referral_update, methods=["PUT", "OPTIONS"]),
+    Route("/api/admin/referral/assign", endpoint=api_admin_referral_assign, methods=["POST", "OPTIONS"]),
     Route("/api/admin/payouts", endpoint=api_admin_payouts),
     Route("/admin/referrals", endpoint=serve_admin_referrals),
     Route("/admin/clients", endpoint=serve_admin_clients),
@@ -6091,6 +6871,8 @@ routes = [
     Route("/api/scheduled-tasks/{task_id}", endpoint=api_update_scheduled_task, methods=["PUT"]),
     Route("/api/scheduled-tasks/{task_id}", endpoint=api_patch_scheduled_task, methods=["PATCH"]),
     Route("/api/investor/question", endpoint=api_investor_question, methods=["POST", "OPTIONS"]),
+    Route("/api/investor-chat", endpoint=api_investor_chat, methods=["POST", "OPTIONS"]),
+    Route("/api/investor-tts", endpoint=api_investor_tts, methods=["POST", "OPTIONS"]),
     Route("/api/777/chat", endpoint=api_777_chat, methods=["POST", "OPTIONS"]),
     Route("/api/whatsapp/qr", endpoint=api_whatsapp_qr),
     Route("/api/whatsapp/status", endpoint=api_whatsapp_status),
@@ -6107,7 +6889,7 @@ app = Starlette(
         Middleware(
             CORSMiddleware,
             allow_origins=["https://purebrain.ai", "https://www.purebrain.ai", "https://app.purebrain.ai", "https://777-command-center.vercel.app"],
-            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
             allow_headers=["Content-Type", "Authorization", "X-Affiliate-Session"],
         ),
     ],

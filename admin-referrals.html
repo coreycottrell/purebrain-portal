@@ -338,6 +338,27 @@
   .confirm-box .confirm-actions { display: flex; gap: 10px; justify-content: flex-end; }
   .refresh-btn:hover { color: var(--text); transform: rotate(180deg); }
 
+  /* ── Autocomplete dropdown ── */
+  .autocomplete-wrap { position: relative; }
+  .autocomplete-dropdown {
+    position: absolute; top: calc(100% + 4px); left: 0; right: 0;
+    background: var(--bg2); border: 1px solid var(--blue);
+    border-radius: 8px; z-index: 2000;
+    max-height: 220px; overflow-y: auto;
+    box-shadow: 0 8px 24px rgba(0,0,0,.5);
+    display: none;
+  }
+  .autocomplete-dropdown.open { display: block; }
+  .ac-item {
+    padding: 9px 12px; cursor: pointer; border-bottom: 1px solid var(--border);
+    transition: background .1s;
+  }
+  .ac-item:last-child { border-bottom: none; }
+  .ac-item:hover, .ac-item.ac-selected { background: rgba(42,147,193,.15); }
+  .ac-item-name { font-size: 13px; font-weight: 500; }
+  .ac-item-email { font-size: 11px; color: var(--text-dim); margin-top: 1px; }
+  .ac-item-company { font-size: 11px; color: var(--blue); }
+
   @media (max-width: 640px) {
     main { padding: 16px; }
     .stats-grid { grid-template-columns: 1fr 1fr; }
@@ -697,20 +718,8 @@ function renderAffiliates(col, dir) {
       <td>
         <div style="display:flex;gap:6px">
           <button class="btn-icon action-btn-write" title="Edit affiliate" onclick="openAffiliateEdit(${i})" style="display:${IS_READONLY?'none':''}">✏️</button>
+          <button class="btn-icon action-btn-write" title="Assign existing client to this referrer" onclick="openAssignClient(${i})" style="display:${IS_READONLY?'none':''};background:rgba(42,147,193,.15)">🔗</button>
           <button class="btn-icon danger action-btn-write" title="Delete affiliate" onclick="openAffiliateDelete(${i})" style="display:${IS_READONLY?'none':''}">🗑️</button>
-        </div>
-      </td>
-    </tr>
-    <tr class="inline-edit-row" id="aff-edit-${i}" style="display:none">
-      <td colspan="10">
-        <div class="inline-edit-form">
-          <div class="field"><label>Name</label><input id="aff-edit-name-${i}" value="${esc(a.name)}" placeholder="Affiliate name"></div>
-          <div class="field"><label>Email</label><input id="aff-edit-email-${i}" value="${esc(a.email)}" placeholder="user@email.com" type="email"></div>
-          <div class="field"><label>PayPal Email</label><input id="aff-edit-paypal-${i}" value="${esc(a.paypal_email||'')}" placeholder="paypal@email.com" type="email"></div>
-          <div class="actions">
-            <button class="btn btn-blue btn-sm" onclick="saveAffiliateEdit(${i},'${esc(a.code)}')">Save</button>
-            <button class="btn btn-ghost btn-sm" onclick="closeAffiliateEdit(${i})">Cancel</button>
-          </div>
         </div>
       </td>
     </tr>
@@ -731,23 +740,32 @@ function toggleExpand(i) {
   row.style.display = row.style.display === 'none' ? '' : 'none';
 }
 
+// ── Affiliate Edit Modal ──
+let _editAffiliateCode = '';
+
 function openAffiliateEdit(i) {
-  // Close any other open edit rows
-  document.querySelectorAll('[id^="aff-edit-"]').forEach(r => r.style.display = 'none');
-  document.getElementById('aff-edit-' + i).style.display = '';
-  document.getElementById('aff-edit-name-' + i).focus();
+  const a = allAffiliates[i];
+  if (!a) return;
+  _editAffiliateCode = a.code;
+  document.getElementById('aff-modal-title').textContent = 'Edit Affiliate — ' + (a.name || a.code);
+  document.getElementById('aff-modal-name').value    = a.name    || '';
+  document.getElementById('aff-modal-email').value   = a.email   || '';
+  document.getElementById('aff-modal-paypal').value  = a.paypal_email || '';
+  document.getElementById('aff-edit-modal-overlay').style.display = 'flex';
+  setTimeout(() => document.getElementById('aff-modal-name').focus(), 50);
 }
 
-function closeAffiliateEdit(i) {
-  document.getElementById('aff-edit-' + i).style.display = 'none';
+function closeAffiliateEdit() {
+  document.getElementById('aff-edit-modal-overlay').style.display = 'none';
+  _editAffiliateCode = '';
 }
 
-async function saveAffiliateEdit(i, code) {
-  const name    = document.getElementById('aff-edit-name-' + i).value.trim();
-  const email   = document.getElementById('aff-edit-email-' + i).value.trim();
-  const paypal  = document.getElementById('aff-edit-paypal-' + i).value.trim();
+async function saveAffiliateEdit() {
+  const name   = document.getElementById('aff-modal-name').value.trim();
+  const email  = document.getElementById('aff-modal-email').value.trim();
+  const paypal = document.getElementById('aff-modal-paypal').value.trim();
 
-  const body = { referral_code: code };
+  const body = { referral_code: _editAffiliateCode };
   if (name)   body.user_name    = name;
   if (email)  body.user_email   = email;
   if (paypal) body.paypal_email = paypal;
@@ -758,7 +776,7 @@ async function saveAffiliateEdit(i, code) {
   if (r.ok) {
     const d = await r.json();
     toast('Affiliate updated (' + d.updated_fields.join(', ') + ')');
-    closeAffiliateEdit(i);
+    closeAffiliateEdit();
     await loadAffiliates();
   } else {
     const d = await r.json().catch(() => ({}));
@@ -1046,6 +1064,227 @@ window.addEventListener('DOMContentLoaded', () => {
 
 // Auto-refresh every 60s
 setInterval(loadAll, 60000);
+
+// ── Assign Client to Referrer ──
+let _assignAffiliateCode = '';
+let _assignAffiliateIdx = -1;
+let _allClients = [];        // cached client list for autocomplete
+let _acSelectedIdx = -1;     // keyboard nav index
+
+async function _ensureClientsLoaded() {
+  if (_allClients.length > 0) return;
+  try {
+    const r = await apiFetch('/api/admin/clients');
+    if (r.ok) {
+      const d = await r.json();
+      _allClients = (d.clients || []).filter(c => c.email);
+    }
+  } catch(e) { /* non-fatal — autocomplete just won't work */ }
+}
+
+function openAssignClient(i) {
+  const a = allAffiliates[i];
+  if (!a) return;
+  _assignAffiliateCode = a.code;
+  _assignAffiliateIdx  = i;
+  document.getElementById('assign-modal-affiliate-name').textContent = a.name || a.code;
+  document.getElementById('assign-modal-code').textContent           = a.code;
+  document.getElementById('assign-client-search').value  = '';
+  document.getElementById('assign-client-name').value    = '';
+  document.getElementById('assign-client-email-hidden').value = '';
+  _hideAcDropdown();
+  document.getElementById('assign-modal-overlay').style.display = 'flex';
+  _ensureClientsLoaded().then(() => {
+    setTimeout(() => document.getElementById('assign-client-search').focus(), 50);
+  });
+}
+
+function closeAssignModal() {
+  document.getElementById('assign-modal-overlay').style.display = 'none';
+  _hideAcDropdown();
+  _assignAffiliateCode = '';
+  _assignAffiliateIdx  = -1;
+}
+
+function _acResults(query) {
+  const q = query.toLowerCase().trim();
+  if (!q) return [];
+  return _allClients.filter(c =>
+    (c.email || '').toLowerCase().includes(q) ||
+    (c.name  || '').toLowerCase().includes(q) ||
+    (c.company || '').toLowerCase().includes(q)
+  ).slice(0, 10);
+}
+
+function _showAcDropdown(results) {
+  const dd = document.getElementById('assign-ac-dropdown');
+  if (results.length === 0) { _hideAcDropdown(); return; }
+  _acSelectedIdx = -1;
+  dd.innerHTML = results.map((c, idx) => `
+    <div class="ac-item" data-idx="${idx}" onmousedown="acPickClient(${idx})">
+      <div class="ac-item-name">${esc(c.name || '(no name)')}</div>
+      <div class="ac-item-email">${esc(c.email)}</div>
+      ${c.company ? `<div class="ac-item-company">${esc(c.company)}</div>` : ''}
+    </div>`).join('');
+  dd._results = results;
+  dd.classList.add('open');
+}
+
+function _hideAcDropdown() {
+  const dd = document.getElementById('assign-ac-dropdown');
+  if (dd) { dd.classList.remove('open'); dd._results = []; }
+  _acSelectedIdx = -1;
+}
+
+function acPickClient(idx) {
+  const dd = document.getElementById('assign-ac-dropdown');
+  const results = dd._results || [];
+  const c = results[idx];
+  if (!c) return;
+  document.getElementById('assign-client-search').value       = c.email;
+  document.getElementById('assign-client-email-hidden').value = c.email;
+  document.getElementById('assign-client-name').value         = c.name || '';
+  _hideAcDropdown();
+}
+
+function onAssignSearchInput(e) {
+  const query = e.target.value.trim();
+  // Clear hidden email when user types (so they must re-select)
+  document.getElementById('assign-client-email-hidden').value = '';
+  if (!query) { _hideAcDropdown(); return; }
+  const results = _acResults(query);
+  _showAcDropdown(results);
+}
+
+function onAssignSearchKeydown(e) {
+  const dd = document.getElementById('assign-ac-dropdown');
+  const results = dd._results || [];
+  const items = dd.querySelectorAll('.ac-item');
+  if (!dd.classList.contains('open')) {
+    if (e.key === 'Enter') { submitAssignClient(); } return;
+  }
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    _acSelectedIdx = Math.min(_acSelectedIdx + 1, items.length - 1);
+    items.forEach((el, i) => el.classList.toggle('ac-selected', i === _acSelectedIdx));
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    _acSelectedIdx = Math.max(_acSelectedIdx - 1, 0);
+    items.forEach((el, i) => el.classList.toggle('ac-selected', i === _acSelectedIdx));
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    if (_acSelectedIdx >= 0 && results[_acSelectedIdx]) {
+      acPickClient(_acSelectedIdx);
+    } else {
+      _hideAcDropdown();
+      submitAssignClient();
+    }
+  } else if (e.key === 'Escape') {
+    _hideAcDropdown();
+  }
+}
+
+async function submitAssignClient() {
+  // Use hidden field if client was selected from dropdown, otherwise use typed value
+  const hiddenEmail  = document.getElementById('assign-client-email-hidden').value.trim();
+  const typedEmail   = document.getElementById('assign-client-search').value.trim();
+  const email        = hiddenEmail || typedEmail;
+  const name         = document.getElementById('assign-client-name').value.trim();
+
+  if (!email || !email.includes('@')) { toast('Select or enter a valid client email', 'error'); return; }
+  const body = { referral_code: _assignAffiliateCode, client_email: email };
+  if (name) body.client_name = name;
+  const r = await apiFetch('/api/admin/referral/assign', { method: 'POST', body });
+  if (r.ok) {
+    const d = await r.json();
+    toast(d.message || 'Client assigned successfully');
+    closeAssignModal();
+    await loadAffiliates();
+  } else {
+    const d = await r.json().catch(() => ({}));
+    toast('Error: ' + (d.error || 'unknown'), 'error');
+  }
+}
+
+// Close assign modal on overlay click
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('assign-modal-overlay').addEventListener('click', e => {
+    if (e.target === document.getElementById('assign-modal-overlay')) closeAssignModal();
+  });
+  // Close affiliate edit modal on overlay click
+  document.getElementById('aff-edit-modal-overlay').addEventListener('click', e => {
+    if (e.target === document.getElementById('aff-edit-modal-overlay')) closeAffiliateEdit();
+  });
+  // Close autocomplete when clicking outside
+  document.addEventListener('click', e => {
+    if (!e.target.closest('#assign-ac-wrap')) _hideAcDropdown();
+  });
+});
+
 </script>
+
+<!-- Assign Client to Referrer Modal -->
+<div id="assign-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center;">
+  <div style="background:#13161f;border:1px solid var(--border);border-radius:12px;padding:28px 32px;width:460px;max-width:95vw">
+    <h3 style="margin:0 0 6px;font-size:16px;color:var(--text)">Assign Client to Referrer</h3>
+    <p style="margin:0 0 18px;font-size:12px;color:var(--text-dim)">Credit an existing client to <strong id="assign-modal-affiliate-name"></strong> (<code id="assign-modal-code"></code>) retroactively.</p>
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <div>
+        <label style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em;display:block;margin-bottom:4px">Search Client by Name or Email</label>
+        <div class="autocomplete-wrap" id="assign-ac-wrap">
+          <input id="assign-client-search" type="text" placeholder="Type to search clients…" autocomplete="off"
+                 oninput="onAssignSearchInput(event)"
+                 onkeydown="onAssignSearchKeydown(event)"
+                 style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px 12px;font-size:13px;outline:none;">
+          <div id="assign-ac-dropdown" class="autocomplete-dropdown"></div>
+        </div>
+        <!-- Hidden field to store the confirmed email from autocomplete selection -->
+        <input type="hidden" id="assign-client-email-hidden">
+        <p style="margin:4px 0 0;font-size:11px;color:var(--text-dim)">Select from dropdown or type email directly</p>
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em;display:block;margin-bottom:4px">Client Name (auto-filled on selection)</label>
+        <input id="assign-client-name" type="text" placeholder="Auto-filled when client is selected"
+               style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px 12px;font-size:13px;outline:none;">
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:20px;justify-content:flex-end">
+      <button class="btn btn-ghost btn-sm" onclick="closeAssignModal()">Cancel</button>
+      <button class="btn btn-blue btn-sm" onclick="submitAssignClient()">Assign Client</button>
+    </div>
+  </div>
+</div>
+
+<!-- Affiliate Edit Modal -->
+<div id="aff-edit-modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center;">
+  <div style="background:#13161f;border:1px solid var(--border);border-radius:12px;padding:28px 32px;width:460px;max-width:95vw">
+    <h3 id="aff-modal-title" style="margin:0 0 18px;font-size:16px;color:var(--text)">Edit Affiliate</h3>
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div>
+        <label style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em;display:block;margin-bottom:4px">Name</label>
+        <input id="aff-modal-name" type="text" placeholder="Affiliate name"
+               style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px 12px;font-size:13px;outline:none;"
+               onkeydown="if(event.key==='Enter')saveAffiliateEdit()">
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em;display:block;margin-bottom:4px">Email</label>
+        <input id="aff-modal-email" type="email" placeholder="user@email.com"
+               style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px 12px;font-size:13px;outline:none;"
+               onkeydown="if(event.key==='Enter')saveAffiliateEdit()">
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em;display:block;margin-bottom:4px">PayPal Email</label>
+        <input id="aff-modal-paypal" type="email" placeholder="paypal@email.com"
+               style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px 12px;font-size:13px;outline:none;"
+               onkeydown="if(event.key==='Enter')saveAffiliateEdit()">
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:22px;justify-content:flex-end">
+      <button class="btn btn-ghost btn-sm" onclick="closeAffiliateEdit()">Cancel</button>
+      <button class="btn btn-blue btn-sm" onclick="saveAffiliateEdit()">Save Changes</button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>

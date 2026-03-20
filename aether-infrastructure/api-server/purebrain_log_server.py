@@ -634,14 +634,30 @@ def register_routes(app: Flask) -> None:
         if not data or not data.get('orderId'):
             return jsonify({'error': 'Missing required field: orderId'}), 400
 
+        # Extract payer email — check top-level field first, then nested payerInfo.
+        # PayPal subscription onApprove passes the raw SDK data object as payerInfo,
+        # which may contain email_address / name sub-objects.
+        payer_email = (data.get('payerEmail') or '').strip()
+        payer_name = (data.get('payerName') or '').strip()
+        payer_info = data.get('payerInfo') or {}
+        if isinstance(payer_info, dict):
+            if not payer_email:
+                payer_email = (payer_info.get('email_address') or '').strip()
+            if not payer_name:
+                name_obj = payer_info.get('name') or {}
+                if isinstance(name_obj, dict):
+                    given = (name_obj.get('given_name') or '').strip()
+                    surname = (name_obj.get('surname') or '').strip()
+                    payer_name = f'{given} {surname}'.strip()
+
         # Log the payment verification
         payment_entry = {
             'type': 'payment_verification',
             'orderId': data.get('orderId'),
             'tier': data.get('tier', 'unknown'),
             'amount': data.get('amount', '0.00'),
-            'payerEmail': data.get('payerEmail', ''),
-            'payerName': data.get('payerName', ''),
+            'payerEmail': payer_email,
+            'payerName': payer_name,
             'captureId': data.get('captureId', ''),
             'server_timestamp': datetime.now(timezone.utc).isoformat(),
             'client_ip': request.remote_addr,
@@ -654,10 +670,47 @@ def register_routes(app: Flask) -> None:
             with _file_lock:
                 with open(payment_log, 'a') as f:
                     f.write(json.dumps(payment_entry) + '\n')
-            logger.info(f'Payment verified: order={data.get("orderId")}, tier={data.get("tier")}, amount={data.get("amount")}')
+            logger.info(f'Payment verified: order={data.get("orderId")}, tier={data.get("tier")}, amount={data.get("amount")}, email={payer_email or "(none yet)"}')
         except Exception as e:
             logger.error(f'Failed to write payment log: {e}')
             return jsonify({'error': 'Failed to log payment'}), 500
+
+        # For subscriptions (I- prefix): immediately write subscription ID to clients.db
+        # if we have an email. This ensures the hourly PayPal sync can find the customer
+        # even before the pay-test onboarding flow completes.
+        order_id = data.get('orderId', '')
+        if order_id.startswith('I-') and payer_email and '@' in payer_email:
+            import sqlite3 as _sqlite3
+            _clients_db_path = '/home/jared/purebrain_portal/clients.db'
+            try:
+                _now = datetime.now(timezone.utc).isoformat()
+                _conn = _sqlite3.connect(_clients_db_path, timeout=10)
+                _conn.execute('PRAGMA journal_mode = WAL')
+                _cur = _conn.cursor()
+                # Update existing client: write subscription ID only if currently blank
+                _cur.execute(
+                    """UPDATE clients SET
+                       paypal_subscription_id = CASE
+                           WHEN paypal_subscription_id = '' OR paypal_subscription_id IS NULL THEN ?
+                           ELSE paypal_subscription_id
+                       END,
+                       payment_status = CASE
+                           WHEN payment_status NOT IN ('subscription_active', 'subscription_cancelled') THEN 'subscription_active'
+                           ELSE payment_status
+                       END,
+                       updated_at = ?
+                       WHERE email = ? COLLATE NOCASE""",
+                    (order_id, _now, payer_email)
+                )
+                _updated = _cur.rowcount
+                _conn.commit()
+                _conn.close()
+                if _updated > 0:
+                    logger.info(f'Subscription ID {order_id} immediately written to clients.db for {payer_email}')
+                else:
+                    logger.info(f'Subscription ID {order_id} received for {payer_email} — not in DB yet, PayPal sync will handle')
+            except Exception as _db_err:
+                logger.warning(f'Could not write subscription ID to clients.db: {_db_err}')
 
         # Increment spots claimed counter — ONLY for real (non-sandbox, non-test) payments.
         # Sandbox/test orders must NEVER increment the public-facing invitation page counter.
@@ -667,7 +720,6 @@ def register_routes(app: Flask) -> None:
         #   E2E-*         — E2E automation test orders
         #   test-*        — manual test orders
         #   I-*           — PayPal subscription/billing agreement IDs (not one-time payments)
-        order_id = data.get('orderId', '')
         sandbox_prefixes = ('SANDBOX-TEST', 'E2E-', 'test-', 'I-')
         is_sandbox_or_test = any(order_id.startswith(prefix) for prefix in sandbox_prefixes)
         if is_sandbox_or_test:
@@ -685,7 +737,7 @@ def register_routes(app: Flask) -> None:
                     order_record = {
                         'order_id': order_id,
                         'tier': data.get('tier', 'unknown'),
-                        'payer_email': data.get('payerEmail', ''),
+                        'payer_email': payer_email,
                         'timestamp': payment_entry['server_timestamp']
                     }
                     if 'claimed_orders' not in spots_data:
@@ -820,6 +872,41 @@ def register_routes(app: Flask) -> None:
                 tg_thread.start()
             except Exception:
                 pass
+
+        # If pay-test has both email and a subscription ID, immediately write to clients.db.
+        # This is the key linkage point: when a subscriber completes onboarding and provides
+        # their email, we can connect their I- subscription ID to their client record.
+        pt_email = (data.get('email') or '').strip().lower()
+        pt_order = (data.get('orderId') or '').strip()
+        if pt_order.startswith('I-') and pt_email and '@' in pt_email:
+            import sqlite3 as _sqlite3
+            _clients_db_path = '/home/jared/purebrain_portal/clients.db'
+            try:
+                _now_pt = datetime.now(timezone.utc).isoformat()
+                _conn_pt = _sqlite3.connect(_clients_db_path, timeout=10)
+                _conn_pt.execute('PRAGMA journal_mode = WAL')
+                _cur_pt = _conn_pt.cursor()
+                _cur_pt.execute(
+                    """UPDATE clients SET
+                       paypal_subscription_id = CASE
+                           WHEN paypal_subscription_id = '' OR paypal_subscription_id IS NULL THEN ?
+                           ELSE paypal_subscription_id
+                       END,
+                       payment_status = CASE
+                           WHEN payment_status NOT IN ('subscription_active', 'subscription_cancelled') THEN 'subscription_active'
+                           ELSE payment_status
+                       END,
+                       updated_at = ?
+                       WHERE email = ? COLLATE NOCASE""",
+                    (pt_order, _now_pt, pt_email)
+                )
+                _updated_pt = _cur_pt.rowcount
+                _conn_pt.commit()
+                _conn_pt.close()
+                if _updated_pt > 0:
+                    logger.info(f'[pay-test] Subscription ID {pt_order} linked to client {pt_email} via onboarding flow')
+            except Exception as _db_err_pt:
+                logger.warning(f'[pay-test] Could not link subscription ID to clients.db: {_db_err_pt}')
 
         return jsonify({
             'success': True,

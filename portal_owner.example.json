@@ -1,6 +1,6 @@
 {
-  "name": "Jared Sanborn",
-  "email": "jared@puretechnology.nyc",
-  "referral_code": "JAREDSB0",
-  "company": "Pure Technology"
+  "name": "[CUSTOMER_NAME]",
+  "email": "[CUSTOMER_EMAIL]",
+  "referral_code": "",
+  "company": "[COMPANY_NAME]"
 }
