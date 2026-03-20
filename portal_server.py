@@ -272,6 +272,75 @@ def _get_tmux_inject_lock():
     return _tmux_inject_lock
 
 
+_DEBOUNCE_WINDOW_S = 2.5  # seconds to wait for more uploads before flushing
+
+_upload_batch: list = []          # list of dicts: {original_name, portal_copy_path, is_image, caption}
+_upload_batch_task = None         # asyncio.Task handle for the pending flush
+
+
+async def _flush_upload_batch():
+    """Wait for the debounce window, then inject ONE combined notification."""
+    global _upload_batch, _upload_batch_task
+    await asyncio.sleep(_DEBOUNCE_WINDOW_S)
+
+    batch = _upload_batch[:]
+    _upload_batch = []
+    _upload_batch_task = None
+
+    if not batch:
+        return
+
+    if len(batch) == 1:
+        item = batch[0]
+        parts = [f"[Portal Upload from {HUMAN_NAME}] File saved to: {item['portal_copy_path']}"]
+        if item["caption"]:
+            parts.append(f"INSTRUCTIONS from {HUMAN_NAME}: {item['caption']}")
+        if item["is_image"]:
+            parts.append(f"[Image: {item['original_name']} — USE Read tool on {item['portal_copy_path']} TO VIEW]")
+        notification = " ".join(parts)
+    else:
+        file_count = len(batch)
+        file_names = ", ".join(f["original_name"] for f in batch)
+        image_paths = [str(f["portal_copy_path"]) for f in batch if f["is_image"]]
+        non_image_paths = [str(f["portal_copy_path"]) for f in batch if not f["is_image"]]
+
+        parts = [f"[Portal Upload from {HUMAN_NAME}] {file_count} files saved: {file_names}"]
+
+        shared_caption = next((f["caption"] for f in batch if f["caption"]), "")
+        if shared_caption:
+            parts.append(f"INSTRUCTIONS from {HUMAN_NAME}: {shared_caption}")
+
+        if non_image_paths:
+            parts.append(f"Files: {', '.join(non_image_paths)}")
+
+        if image_paths:
+            parts.append(
+                f"Images ({len(image_paths)}): {', '.join(image_paths)}"
+                f" — USE Read tool on each path TO VIEW"
+            )
+
+        notification = " ".join(parts)
+
+    await _inject_into_tmux_serialized(notification)
+
+
+def _schedule_upload_batch_item(original_name, portal_copy_path, is_image, caption):
+    """Add one upload to the debounce batch and (re)start the flush timer."""
+    global _upload_batch, _upload_batch_task
+
+    _upload_batch.append({
+        "original_name": original_name,
+        "portal_copy_path": portal_copy_path,
+        "is_image": is_image,
+        "caption": caption,
+    })
+
+    if _upload_batch_task is not None and not _upload_batch_task.done():
+        _upload_batch_task.cancel()
+
+    _upload_batch_task = asyncio.ensure_future(_flush_upload_batch())
+
+
 async def _inject_into_tmux_serialized(notification):
     """Inject a notification into the active tmux session, serialized via lock.
 
@@ -1214,31 +1283,10 @@ async def api_chat_upload(request: Request) -> JSONResponse:
             chat_text += f"\n{caption}"
         user_entry = _save_portal_message(chat_text, role="user")
 
-        # Inject notification into AI's tmux session (mirrors Telegram bridge pattern)
-        # CRITICAL: Must be SINGLE LINE — multi-line paste triggers Claude Code's
-        # "Pasted text" confirmation prompt and blocks automatic processing.
-        notify_parts = [f"[Portal Upload from {HUMAN_NAME}] File saved to: {portal_copy_path}"]
-        if caption:
-            notify_parts.append(f"INSTRUCTIONS from {HUMAN_NAME}: {caption}")
-        if is_image:
-            notify_parts.append(f"[Image: {original_name} — USE Read tool on {portal_copy_path} TO VIEW]")
-        notification = " ".join(notify_parts)
-
-        # Use the serialized injection helper to prevent race conditions when
-        # multiple files are uploaded simultaneously. Each injection acquires
-        # the global lock and waits 1.5s before releasing — so concurrent
-        # uploads are automatically serialized and spaced out for Claude.
-        # NOTE: We fire this as a background task so the upload response
-        # returns immediately (good UX) while injection happens in order.
-        tmux_ok_holder = [False]
-
-        async def _do_serialized_inject():
-            result = await _inject_into_tmux_serialized(notification)
-            tmux_ok_holder[0] = result
-
-        # Schedule the injection but don't await it — response goes back NOW,
-        # injection happens in queue order (1.5s apart per file).
-        asyncio.ensure_future(_do_serialized_inject())
+        # Inject notification into AI's tmux session via debounced batch.
+        # Multiple files within _DEBOUNCE_WINDOW_S (2.5s) are combined into
+        # ONE tmux notification instead of N separate messages (saves tokens).
+        _schedule_upload_batch_item(original_name, str(portal_copy_path), is_image, caption)
         tmux_ok = True  # Assume success for ack message (file IS saved regardless)
 
         # Auto-acknowledge in portal chat so user sees confirmation immediately
