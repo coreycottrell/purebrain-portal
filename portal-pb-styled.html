@@ -14787,7 +14787,7 @@ console.log('[PureBrain Neural 3D] Initialized — login background active');
   // FIX: token must be accessible in this IIFE for _syncSettingsToServer.
   // Without this, _syncSettingsToServer threw ReferenceError which crashed
   // _elSwitchEngine BEFORE visual updates ran — breaking the EL toggle button.
-  var token = localStorage.getItem('pb_token') || localStorage.getItem('portal_token') || '';
+  var token = localStorage.getItem('portal_token') || '';
   var _hmiAnimId = null;
   var _hmiAudioCtx = null;
   var _hmiAnalyser = null;
@@ -16150,11 +16150,11 @@ console.log('[PureBrain Neural 3D] Initialized — login background active');
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
   function authHeaders() {
-    var tok = localStorage.getItem('pb_token') || localStorage.getItem('portal_token') || '';
+    var tok = localStorage.getItem('portal_token') || '';
     return { 'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json' };
   }
   function authGet() {
-    var tok = localStorage.getItem('pb_token') || localStorage.getItem('portal_token') || '';
+    var tok = localStorage.getItem('portal_token') || '';
     return { 'Authorization': 'Bearer ' + tok };
   }
 
@@ -16766,7 +16766,7 @@ console.log('[PureBrain Neural 3D] Initialized — login background active');
     var filterFreq = document.getElementById('boops-filter-freq');
     if (!listEl) return;
     // Get auth token from localStorage (same as main portal auth)
-    var token = localStorage.getItem('pb_token') || localStorage.getItem('portal_token') || '';
+    var token = localStorage.getItem('portal_token') || '';
 
     var _boopsData = [];
     var _boopsLoaded = false;
