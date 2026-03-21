@@ -8895,19 +8895,32 @@
   if (ctxCopyBtn) ctxCopyBtn.addEventListener('click', function(e) {
     e.stopPropagation();
     if (ctxTarget) {
-      var text = (ctxTarget.bubble.textContent || '').trim();
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(function() { showToast('Copied to clipboard'); });
+      var plainText = (ctxTarget.bubble.innerText || ctxTarget.bubble.textContent || '').trim();
+      var htmlContent = ctxTarget.bubble.innerHTML || '';
+      if (navigator.clipboard && window.ClipboardItem) {
+        try {
+          var cbItem = new ClipboardItem({
+            'text/html': new Blob([htmlContent], { type: 'text/html' }),
+            'text/plain': new Blob([plainText], { type: 'text/plain' })
+          });
+          navigator.clipboard.write([cbItem]).then(function() { showToast('Copied!'); }).catch(function() {
+            navigator.clipboard.writeText(plainText).then(function() { showToast('Copied!'); }).catch(function(){});
+          });
+        } catch(e2) {
+          navigator.clipboard.writeText(plainText).then(function() { showToast('Copied!'); }).catch(function(){});
+        }
+      } else if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(plainText).then(function() { showToast('Copied!'); });
       } else {
         // Fallback for non-HTTPS (HTTP portal access)
         var ta = document.createElement('textarea');
-        ta.value = text;
+        ta.value = plainText;
         ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px';
         document.body.appendChild(ta);
         ta.select();
         document.execCommand('copy');
         document.body.removeChild(ta);
-        showToast('Copied to clipboard');
+        showToast('Copied!');
       }
     }
     hideMsgContextMenu();
@@ -9227,9 +9240,22 @@
         e.stopPropagation();
         var sel = window.getSelection();
         var selText = sel && sel.toString().trim();
-        var textToCopy = selText ? selText : (capBubble.textContent || '').trim();
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(textToCopy).then(function() { showToast('Copied to clipboard'); });
+        var plainText = selText ? selText : (capBubble.innerText || capBubble.textContent || '').trim();
+        var htmlContent = selText ? selText : (capBubble.innerHTML || '');
+        if (navigator.clipboard && window.ClipboardItem) {
+          try {
+            var cbItem = new ClipboardItem({
+              'text/html': new Blob([htmlContent], { type: 'text/html' }),
+              'text/plain': new Blob([plainText], { type: 'text/plain' })
+            });
+            navigator.clipboard.write([cbItem]).then(function() { showToast('Copied!'); }).catch(function() {
+              navigator.clipboard.writeText(plainText).then(function() { showToast('Copied!'); }).catch(function(){});
+            });
+          } catch(e2) {
+            navigator.clipboard.writeText(plainText).then(function() { showToast('Copied!'); }).catch(function(){});
+          }
+        } else if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(plainText).then(function() { showToast('Copied!'); });
         }
       });
     })(bubble, msgId, senderName, role);
@@ -9472,9 +9498,22 @@
         e.stopPropagation();
         var sel = window.getSelection();
         var selText = sel && sel.toString().trim();
-        var textToCopy = selText ? selText : (capBubble.textContent || '').trim();
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(textToCopy).then(function() { showToast('Copied to clipboard'); });
+        var plainText = selText ? selText : (capBubble.innerText || capBubble.textContent || '').trim();
+        var htmlContent = selText ? selText : (capBubble.innerHTML || '');
+        if (navigator.clipboard && window.ClipboardItem) {
+          try {
+            var cbItem = new ClipboardItem({
+              'text/html': new Blob([htmlContent], { type: 'text/html' }),
+              'text/plain': new Blob([plainText], { type: 'text/plain' })
+            });
+            navigator.clipboard.write([cbItem]).then(function() { showToast('Copied!'); }).catch(function() {
+              navigator.clipboard.writeText(plainText).then(function() { showToast('Copied!'); }).catch(function(){});
+            });
+          } catch(e2) {
+            navigator.clipboard.writeText(plainText).then(function() { showToast('Copied!'); }).catch(function(){});
+          }
+        } else if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(plainText).then(function() { showToast('Copied!'); });
         }
       });
     })(bubble, safeMsgId, senderName);
