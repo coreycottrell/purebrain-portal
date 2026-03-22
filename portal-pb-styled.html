@@ -5300,7 +5300,8 @@
   .msg-bubble h1 { font-size: 1.2em; } .msg-bubble h2 { font-size: 1.1em; } .msg-bubble h3 { font-size: 1.0em; }
   .msg-bubble ul { padding-left: 18px; margin: 4px 0; }
   .msg-bubble li { margin: 2px 0; }
-  .msg-bubble a { color: var(--teal); text-decoration: underline; }
+  .msg-bubble a { color: var(--teal); text-decoration: underline; cursor: pointer; text-underline-offset: 2px; }
+  .msg-bubble a:hover { color: #00d4ff; text-decoration-color: #00d4ff; }
   .msg-bubble p { margin: 4px 0; }
 
   /* ===== CLAUDE AUTH MODAL (OAuth flow) ===== */
@@ -8071,6 +8072,23 @@
         if (i % 2 === 1) return part; // odd = existing <a>…</a> — leave untouched
         return part.replace(URL_RE, function(url) {
           return '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + url + '</a>';
+        });
+      }).join('');
+    })(s);
+
+    // 7c. Auto-link bare domain URLs (no protocol prefix) — e.g. purebrain.ai/path, cc.purebrain.ai/dashboard
+    s = (function linkifyBareDomains(html) {
+      // Matches word.tld or sub.word.tld optionally followed by /path — no leading http://
+      var BARE_RE = /(?<![=\"'\/])(\b[a-zA-Z][a-zA-Z0-9-]*(?:\.[a-zA-Z0-9-]+)+(?:\/[^\s<>"')\]]*)?)/g;
+      var parts = html.split(/(<a[\s\S]*?<\/a>)/gi);
+      return parts.map(function(part, i) {
+        if (i % 2 === 1) return part; // odd = existing <a>…</a> — leave untouched
+        return part.replace(BARE_RE, function(match) {
+          // Must contain a dot followed by a recognisable TLD (2+ alpha chars)
+          if (!/\.[a-zA-Z]{2,}/.test(match)) return match;
+          // Skip pure numeric tokens like version numbers (1.2.3)
+          if (/^\d/.test(match)) return match;
+          return '<a href="https://' + match + '" target="_blank" rel="noopener noreferrer">' + match + '</a>';
         });
       }).join('');
     })(s);
