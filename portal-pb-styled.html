@@ -6709,13 +6709,11 @@
     <div class="nav-item" data-panel="shortcuts" data-tooltip="Portal shortcuts — slash commands, keyboard shortcuts, features">
       <span class="nav-icon">&#x2318;</span>Shortcuts
     </div>
+    <!-- /nav-panels -->
 
     <div style="border-top:1px solid var(--border);margin:8px 10px 4px;"></div>
     <a href="https://purebrain.ai/brainiac-mastermind-training/?bypass=portal" target="_blank" class="nav-item" data-tooltip="Level up your AI skills — exclusive training for PureBrain members" style="text-decoration:none;color:inherit;">
       <span class="nav-icon">&#x1F9E0;</span>Brainiac Training
-    </a>
-    <a href="https://cc.purebrain.ai/dashboard" target="_blank" class="nav-item" data-tooltip="Command Center — calendar, mandala charts, team tools" style="text-decoration:none;color:inherit;">
-      <span class="nav-icon">&#x26F6;</span>Command Center
     </a>
     <div class="nav-item training-hacks" id="training-hacks-btn" onclick="window._fireTrainingHacks()" style="cursor:pointer" data-tooltip="Scan Brainiac training for new modules — ingests content and suggests actions">
       <span class="nav-icon">&#x26A1;</span><span class="th-spinner"></span><span class="th-label">AI Training Hacks</span>
@@ -7179,6 +7177,7 @@
       </div>
     </div>
 
+  <!-- /panels -->
   </div>
 
 </div>
@@ -7231,12 +7230,10 @@
     <a class="tab-menu-item" href="https://purebrain.ai/brainiac-mastermind-training/?bypass=portal" target="_blank" style="text-decoration:none;color:inherit;" onclick="closeMobileMenu()">
       <span style="margin-right:10px;">&#x1F9E0;</span>Brainiac Training
     </a>
-    <a class="tab-menu-item" href="https://cc.purebrain.ai/dashboard" target="_blank" style="text-decoration:none;color:inherit;" onclick="closeMobileMenu()">
-      <span style="margin-right:10px;">&#x26F6;</span>Command Center
-    </a>
     <div class="tab-menu-item training-hacks" id="training-hacks-btn-mobile" onclick="if(window.closeMobileMenu)window.closeMobileMenu();window._fireTrainingHacks();" style="color:var(--teal);cursor:pointer;">
       <span style="margin-right:10px;">&#x26A1;</span>AI Training Hacks
     </div>
+    <!-- /mobile-menu-items -->
   </div>
 
 <!-- Toast -->
@@ -11264,17 +11261,17 @@
           }
         }
         // List items
-        if (d.directories) {
-          // Root view: show allowed directories
-          d.directories.forEach(function(dd) {
-            if (!dd.exists) return;
+        if (d.dirs) {
+          // Root view: show allowed directories (d.dirs is a flat array of path strings)
+          d.dirs.forEach(function(dd) {
+            var name = dd.split('/').pop() || dd;
             var row = document.createElement('div');
             row.className = 'files-item';
-            row.innerHTML = '<span class="fi-icon">&#x1F4C1;</span><span class="fi-name">' + escHtml(dd.name) + '</span><span class="fi-size" style="color:var(--text-dim)">' + escHtml(dd.path) + '</span>';
-            row.onclick = function() { loadFiles(dd.path); };
+            row.innerHTML = '<span class="fi-icon">&#x1F4C1;</span><span class="fi-name">' + escHtml(name) + '</span><span class="fi-size" style="color:var(--text-dim)">' + escHtml(dd) + '</span>';
+            row.onclick = function() { loadFiles(dd); };
             filesList.appendChild(row);
           });
-        if (d.directories && d.directories.filter(function(dd){return dd.exists;}).length === 0) {
+        if (d.dirs && d.dirs.length === 0) {
           filesList.innerHTML = '<div style="padding:20px;color:var(--text-dim);font-size:0.85rem;text-align:center;line-height:1.6;">No files yet.<br>Upload files via chat or send them through Telegram.<br>They will appear here for browsing and download.</div>';
         }
         } else if (d.items) {

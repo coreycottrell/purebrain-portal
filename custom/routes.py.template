@@ -1,0 +1,79 @@
+"""
+Custom API routes for your AiCIV portal instance.
+
+HOW TO USE:
+  1. Copy this file to routes.py (same directory)
+  2. Add your endpoints as async functions
+  3. Append each endpoint to the `routes` list at the bottom
+  4. Restart the portal -- the customization shim auto-loads routes.py
+
+CONVENTIONS:
+  - Namespace all endpoints under /api/custom/ to avoid collisions with upstream
+  - Use check_auth(request) to protect endpoints that need authentication
+  - Return starlette JSONResponse / Response objects
+  - The `routes` list at the bottom is what the shim reads -- every Route must be there
+
+See ADR-001 (docs/ADR-001-customization-architecture.md) for the full architecture.
+"""
+
+import sys
+from pathlib import Path
+
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+# Import the portal's auth helper so custom endpoints can verify tokens.
+# The sys.path insert ensures portal_server is importable from this subdirectory.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from portal_server import check_auth
+
+
+# ---------------------------------------------------------------------------
+# Example endpoint: return a simple status payload
+# ---------------------------------------------------------------------------
+
+async def api_custom_status(request: Request) -> JSONResponse:
+    """Return a health-check for custom routes.
+
+    This is a minimal example. Replace or extend it with your own logic.
+    """
+    # Guard: reject unauthenticated requests
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    return JSONResponse({
+        "ok": True,
+        "message": "Custom routes are working.",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Example endpoint: accept POST data
+# ---------------------------------------------------------------------------
+
+async def api_custom_echo(request: Request) -> JSONResponse:
+    """Echo back the JSON body (for testing).
+
+    Demonstrates how to read a POST body and return a response.
+    """
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    return JSONResponse({"echoed": body})
+
+
+# ---------------------------------------------------------------------------
+# Route list -- the customization shim reads this automatically.
+# Every custom Route MUST appear here or it won't be loaded.
+# ---------------------------------------------------------------------------
+
+routes = [
+    Route("/api/custom/status", endpoint=api_custom_status),
+    Route("/api/custom/echo", endpoint=api_custom_echo, methods=["POST"]),
+]

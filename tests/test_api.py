@@ -90,15 +90,8 @@ class TestAPIAuth(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertIsInstance(resp.json(), (dict, list))
 
-    # /api/skills
-    def test_skills_requires_auth(self):
-        resp = requests.get(f"{BASE_URL}/api/skills", timeout=5)
-        self.assertEqual(resp.status_code, 401)
-
-    def test_skills_with_auth(self):
-        resp = requests.get(f"{BASE_URL}/api/skills", headers=AUTH_HEADERS, timeout=10)
-        self.assertEqual(resp.status_code, 200)
-        self.assertIsInstance(resp.json(), (dict, list))
+    # NOTE: /api/skills removed — skills are now a per-CIV custom route,
+    # not a core endpoint. See custom/routes.py and ADR-001.
 
     # /api/boops
     def test_boops_requires_auth(self):

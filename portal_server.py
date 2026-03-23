@@ -23,6 +23,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from html import escape
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -938,8 +939,9 @@ def check_auth(request: Request) -> bool:
         return auth[7:] == BEARER_TOKEN
     # Allow query param token for WebSocket paths (browsers cannot set headers on WS upgrade)
     # and for /api/chat/uploads/ (inline images in chat rendered via <img src="...?token=">)
+    # and for /api/download (browser navigates directly to download URL, cannot set headers)
     path = request.url.path
-    if "/ws" in path or "/api/chat/uploads/" in path or "/api/referral/" in path:
+    if "/ws" in path or "/api/chat/uploads/" in path or "/api/referral/" in path or "/api/download" in path:
         return request.query_params.get("token") == BEARER_TOKEN
     return False
 
@@ -1007,10 +1009,10 @@ def _inject_custom_panels(html: str) -> str:
             print(f"[portal-custom] WARNING: panel file {panel_file.name} missing panel-id metadata, skipping")
             continue
 
-        panel_id = meta["id"]
-        panel_label = meta.get("label", panel_id)
-        panel_icon = meta.get("icon", "&#x2726;")
-        panel_tooltip = meta.get("tooltip", "")
+        panel_id = escape(meta["id"], quote=True)
+        panel_label = escape(meta.get("label", panel_id), quote=True)
+        panel_icon = meta.get("icon", "&#x2726;")  # icons are HTML entities, keep as-is
+        panel_tooltip = escape(meta.get("tooltip", ""), quote=True)
 
         nav_items.append(
             f'    <div class="nav-item" data-panel="{panel_id}" '
@@ -1033,29 +1035,27 @@ def _inject_custom_panels(html: str) -> str:
     if not nav_items:
         return html
 
-    # Inject nav items before the Quick Fire pills section
+    # Inject nav items among other panel nav items (before <!-- /nav-panels --> marker)
     nav_inject = '\n'.join(nav_items)
     html = html.replace(
-        '    <!-- Quick Fire pills -->',
-        f'{nav_inject}\n    <!-- Quick Fire pills -->',
+        '    <!-- /nav-panels -->',
+        f'{nav_inject}\n    <!-- /nav-panels -->',
         1
     )
 
-    # Inject panel divs before the closing of the content area
-    # The content area ends with: </div>\n</div>\n\n<!-- Mobile bottom tabs -->
+    # Inject panel divs inside .content area, before <!-- /panels --> marker
     panels_inject = '\n'.join(panel_html_parts)
     html = html.replace(
-        '</div>\n</div>\n\n<!-- Mobile bottom tabs -->',
-        f'{panels_inject}\n</div>\n</div>\n\n<!-- Mobile bottom tabs -->',
+        '<!-- /panels -->',
+        f'{panels_inject}\n  <!-- /panels -->',
         1
     )
 
-    # Inject mobile menu items before the closing of mobile-more-menu
-    # Insert before <!-- Toast -->
+    # Inject mobile menu items inside #mobile-more-menu, before its closing marker
     mobile_inject = '\n'.join(mobile_items)
     html = html.replace(
-        '\n<!-- Toast -->',
-        f'\n{mobile_inject}\n<!-- Toast -->',
+        '    <!-- /mobile-menu-items -->',
+        f'{mobile_inject}\n    <!-- /mobile-menu-items -->',
         1
     )
 
@@ -6955,11 +6955,16 @@ _CUSTOM_DIR = SCRIPT_DIR / "custom"
 _CUSTOM_ROUTES_FILE = _CUSTOM_DIR / "routes.py"
 _CUSTOM_CONFIG_FILE = _CUSTOM_DIR / "config.json"
 
+_ALLOWED_CONFIG_OVERRIDES = {"MAX_TOKENS", "PORTAL_VERSION", "PAYOUT_MIN_AMOUNT", "REFERRAL_COMMISSION_RATE"}
+
 # 1. Config overrides
 if _CUSTOM_CONFIG_FILE.exists():
     try:
         _custom_cfg = json.loads(_CUSTOM_CONFIG_FILE.read_text())
         for _k, _v in _custom_cfg.items():
+            if _k not in _ALLOWED_CONFIG_OVERRIDES:
+                print(f"[portal-custom] WARNING: config override blocked for key '{_k}' (not in allowlist)")
+                continue
             if _k in globals():
                 globals()[_k] = _v
                 print(f"[portal-custom] Config override: {_k} = {_v}")

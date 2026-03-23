@@ -1,0 +1,95 @@
+<!-- panel-id: my-panel -->
+<!-- panel-label: My Panel -->
+<!-- panel-icon: &#x2726; -->
+<!-- panel-tooltip: A short description shown on hover -->
+
+<!--
+  SAMPLE CUSTOM PANEL TEMPLATE
+  =============================
+
+  This file demonstrates how to create a custom panel for the PureBrain Portal.
+  Copy this file, rename it to your-panel-name.html, and customize it.
+
+  METADATA COMMENTS (required, must be in the first 10 lines):
+    panel-id:      Unique identifier (lowercase, hyphens ok). Used in DOM id="panel-{id}"
+    panel-label:   Display name shown in sidebar navigation
+    panel-icon:    HTML entity for the icon (e.g., &#x1F6D2; for shopping cart)
+    panel-tooltip: Hover text for the nav item
+
+  STRUCTURE:
+    - HTML content goes directly in the file (no <html>/<body> wrapper)
+    - CSS should be scoped to #panel-{your-id} to avoid conflicts
+    - JavaScript should be in an IIFE to avoid polluting global scope
+    - Register a handler with window._customPanelHandlers for lazy loading
+
+  INJECTION POINTS:
+    The portal server reads all *.html files from custom/panels/ and injects:
+    1. A sidebar nav-item (before Quick Fire pills)
+    2. A <div class="panel" id="panel-{id}"> wrapping your content (inside .content)
+    3. A mobile menu item (before Toast notifications)
+
+  CONVENTIONS:
+    - Use CSS variables from the portal theme: var(--gold), var(--text-dim),
+      var(--bg-darker), var(--font-heading), etc.
+    - Namespace your API endpoints under /api/custom/ to avoid collisions
+    - Use localStorage.getItem('pb_token') for auth tokens in fetch calls
+-->
+
+<div style="padding: 20px;">
+  <h2 style="color: var(--gold); font-family: var(--font-heading);">
+    My Panel Title
+  </h2>
+  <p style="color: var(--text-dim); margin-bottom: 20px;">
+    Panel description goes here.
+  </p>
+  <div id="my-panel-content">
+    <!-- Your dynamic content loads here -->
+  </div>
+</div>
+
+<style>
+  /* Scope all styles to your panel to avoid conflicts with other panels */
+  #panel-my-panel #my-panel-content {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 16px;
+  }
+</style>
+
+<script>
+(function() {
+  // === IIFE: keeps variables out of global scope ===
+
+  var loaded = false;
+
+  // Register a handler that runs when user switches to this panel.
+  // This enables lazy loading -- your panel's data is only fetched
+  // when the user actually navigates to it.
+  var handlers = window._customPanelHandlers || {};
+  handlers['my-panel'] = function() {
+    if (!loaded) {
+      loadPanelData();
+      loaded = true;
+    }
+  };
+  window._customPanelHandlers = handlers;
+
+  function loadPanelData() {
+    // Example: fetch data from a custom API endpoint defined in custom/routes.py
+    fetch('/api/custom/my-panel-data', {
+      headers: {
+        'Authorization': 'Bearer ' + (localStorage.getItem('pb_token') || '')
+      }
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var container = document.getElementById('my-panel-content');
+      container.innerHTML = '<p style="color:var(--text-dim);">Loaded ' +
+        (data.items ? data.items.length : 0) + ' items.</p>';
+    })
+    .catch(function(err) {
+      console.error('[my-panel] Load failed:', err);
+    });
+  }
+})();
+</script>

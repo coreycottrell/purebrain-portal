@@ -1,6 +1,25 @@
 {
-  "current_version": "1.0.1",
+  "current_version": "1.1.0",
   "releases": [
+    {
+      "version": "1.1.0",
+      "date": "2026-03-23",
+      "title": "Custom Overlay Architecture & Reliability Upgrades",
+      "highlights": [
+        "Custom Overlay Architecture — add panels, API routes, and config overrides without editing core portal files. Customizations survive upstream updates.",
+        "Skills Shop Panel Support — new custom panel system with runtime HTML injection. Drop self-contained HTML files into custom/panels/.",
+        "Config Override System — custom/config.json overrides portal globals (e.g., MAX_TOKENS for 1M context window).",
+        "Custom API Routes — custom/routes.py adds endpoints under the /api/custom/ namespace.",
+        "Template Files — .template files included as starting points for all customization types.",
+        "Bidirectional Telegram Bridge — Telegram messages now inject into the Claude session and stream responses back (previously one-way only).",
+        "Portal Watchdog — automatic restart on crash detection with health checks every 30 seconds.",
+        "Context Bar Fix — now correctly shows usage against the 1M token window (was showing against 200K).",
+        "Files Panel Fix — directory listing now works correctly with the backend API format.",
+        "File Download Auth Fix — downloads now properly authenticate via query parameter tokens.",
+        "68-test Suite Merged — comprehensive test coverage for API auth, database integrity, and frontend structure.",
+        "switchPanel Hook — custom panels integrate seamlessly with the existing panel switching system."
+      ]
+    },
     {
       "version": "1.0.1",
       "date": "2026-03-17",

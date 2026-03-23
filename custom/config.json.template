@@ -1,0 +1,8 @@
+{
+  "_comment_1": "Copy this file to config.json and edit the values below.",
+  "_comment_2": "Each key must match a global variable in portal_server.py.",
+  "_comment_3": "The customization shim applies these overrides at startup.",
+
+  "MAX_TOKENS": 200000,
+  "PORTAL_VERSION": "1.0.0-myinstance"
+}

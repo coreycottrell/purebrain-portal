@@ -66,9 +66,8 @@ class TestMajorRouteGroups(unittest.TestCase):
         resp = requests.get(f"{BASE_URL}/api/agents", headers=AUTH_HEADERS, timeout=5)
         self.assertEqual(resp.status_code, 200)
 
-    def test_skills_route(self):
-        resp = requests.get(f"{BASE_URL}/api/skills", headers=AUTH_HEADERS, timeout=10)
-        self.assertEqual(resp.status_code, 200)
+    # NOTE: skills route removed — skills are now a per-CIV custom route.
+    # See custom/routes.py and ADR-001.
 
     def test_boops_route(self):
         resp = requests.get(f"{BASE_URL}/api/boops", headers=AUTH_HEADERS, timeout=5)
@@ -100,11 +99,7 @@ class TestResponseShapes(unittest.TestCase):
         self.assertIn("agents", data)
         self.assertIsInstance(data["agents"], list)
 
-    def test_skills_has_list(self):
-        resp = requests.get(f"{BASE_URL}/api/skills", headers=AUTH_HEADERS, timeout=10)
-        data = resp.json()
-        self.assertIn("skills", data)
-        self.assertIsInstance(data["skills"], list)
+    # NOTE: skills response shape test removed — skills are a per-CIV custom route.
 
 
 if __name__ == "__main__":

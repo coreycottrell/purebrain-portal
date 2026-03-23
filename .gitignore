@@ -52,3 +52,17 @@ bookmarks.json
 *.mvp-backup-*
 release_notes.json.local
 run_portal_patch.sh
+
+# CIV-specific custom overlay files (not tracked)
+custom/config.json
+custom/routes.py
+custom/startup.py
+custom/quickfire.json
+custom/panels/*.html
+custom/__pycache__/
+# Track templates and scaffolding
+!custom/.gitkeep
+!custom/README.md
+!custom/*.template
+!custom/panels/.gitkeep
+!custom/panels/*.template
