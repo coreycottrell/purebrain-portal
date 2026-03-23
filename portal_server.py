@@ -348,6 +348,10 @@ async def _inject_into_tmux_serialized(notification):
     Each injection is followed by a 1.5s sleep INSIDE the lock so rapid
     multi-file uploads are spaced out — Claude gets time to read each one
     before the next arrives.
+
+    Uses the same 5x Enter retry pattern as api_chat_send to ensure the
+    message executes even when Claude Code is busy with tool calls or
+    generation (single Enter is insufficient in that state).
     """
     lock = _get_tmux_inject_lock()
     async with lock:
@@ -362,6 +366,18 @@ async def _inject_into_tmux_serialized(notification):
                 ["tmux", "send-keys", "-t", session, "Enter"],
                 timeout=5, check=True,
             )
+            # 5x Enter retries — ensures Claude processes the message even if
+            # busy with tool calls or generation at the moment of injection.
+            # Spaced 0.5s apart; runs outside the lock so it does not block
+            # the next queued injection.
+            async def _retry_enters_upload():
+                for _ in range(5):
+                    await asyncio.sleep(0.5)
+                    await _run_subprocess_async(
+                        ["tmux", "send-keys", "-t", session, "Enter"],
+                        timeout=3,
+                    )
+            asyncio.ensure_future(_retry_enters_upload())
             # Give Claude time to start processing before next injection arrives.
             # 1.5s is enough for Claude to register the message without being overwhelmed.
             await asyncio.sleep(1.5)
@@ -955,13 +971,105 @@ async def apple_touch_icon(request: Request):
 
 # Routes
 # ---------------------------------------------------------------------------
+
+def _parse_panel_meta(html_content: str) -> dict:
+    """Extract panel metadata from HTML comment headers (Flux overlay)."""
+    meta = {}
+    for line in html_content.split('\n')[:10]:
+        m = re.match(r'<!--\s*panel-(\w+):\s*(.+?)\s*-->', line)
+        if m:
+            meta[m.group(1)] = m.group(2)
+    return meta
+
+
+def _inject_custom_panels(html: str) -> str:
+    """Inject custom panels from custom/panels/*.html into the portal HTML (Flux overlay).
+
+    If custom/panels/ does not exist or is empty, returns html unchanged (no-op).
+    """
+    custom_panels_dir = SCRIPT_DIR / "custom" / "panels"
+    if not custom_panels_dir.exists():
+        return html
+
+    nav_items = []
+    panel_html_parts = []
+    mobile_items = []
+
+    for panel_file in sorted(custom_panels_dir.glob("*.html")):
+        try:
+            panel_content = panel_file.read_text()
+        except Exception as _e:
+            print(f"[portal-custom] WARNING: could not read panel file {panel_file}: {_e}")
+            continue
+
+        meta = _parse_panel_meta(panel_content)
+        if not meta.get("id"):
+            print(f"[portal-custom] WARNING: panel file {panel_file.name} missing panel-id metadata, skipping")
+            continue
+
+        panel_id = meta["id"]
+        panel_label = meta.get("label", panel_id)
+        panel_icon = meta.get("icon", "&#x2726;")
+        panel_tooltip = meta.get("tooltip", "")
+
+        nav_items.append(
+            f'    <div class="nav-item" data-panel="{panel_id}" '
+            f'data-tooltip="{panel_tooltip}">'
+            f'<span class="nav-icon">{panel_icon}</span>'
+            f'{panel_label}</div>'
+        )
+        panel_html_parts.append(
+            f'  <div class="panel" id="panel-{panel_id}">{panel_content}</div>'
+        )
+        mobile_items.append(
+            f'    <div class="tab-menu-item" data-panel="{panel_id}" '
+            f'onclick="selectMobileMenuItem(\'{panel_id}\')">'
+            f'<span style="margin-right:10px;">{panel_icon}</span>'
+            f'{panel_label}</div>'
+        )
+
+        print(f"[portal-custom] Injecting panel: {panel_id} ({panel_label})")
+
+    if not nav_items:
+        return html
+
+    # Inject nav items before the Quick Fire pills section
+    nav_inject = '\n'.join(nav_items)
+    html = html.replace(
+        '    <!-- Quick Fire pills -->',
+        f'{nav_inject}\n    <!-- Quick Fire pills -->',
+        1
+    )
+
+    # Inject panel divs before the closing of the content area
+    # The content area ends with: </div>\n</div>\n\n<!-- Mobile bottom tabs -->
+    panels_inject = '\n'.join(panel_html_parts)
+    html = html.replace(
+        '</div>\n</div>\n\n<!-- Mobile bottom tabs -->',
+        f'{panels_inject}\n</div>\n</div>\n\n<!-- Mobile bottom tabs -->',
+        1
+    )
+
+    # Inject mobile menu items before the closing of mobile-more-menu
+    # Insert before <!-- Toast -->
+    mobile_inject = '\n'.join(mobile_items)
+    html = html.replace(
+        '\n<!-- Toast -->',
+        f'\n{mobile_inject}\n<!-- Toast -->',
+        1
+    )
+
+    return html
+
 async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "civ": CIV_NAME, "uptime": int(time.time() - START_TIME)})
 
 
 async def index(request: Request) -> Response:
     if PORTAL_PB_HTML.exists():
-        resp = FileResponse(str(PORTAL_PB_HTML), media_type="text/html")
+        html = PORTAL_PB_HTML.read_text()
+        html = _inject_custom_panels(html)
+        resp = Response(html, media_type="text/html")
         resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         return resp
     if PORTAL_HTML.exists():
@@ -971,11 +1079,13 @@ async def index(request: Request) -> Response:
 
 async def index_pb(request: Request) -> Response:
     """Serve PureBrain-styled portal at /pb path."""
-    if PORTAL_PB_HTML.exists():
-        resp = FileResponse(str(PORTAL_PB_HTML), media_type="text/html")
-        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-        return resp
-    return Response("<h1>PB Portal not found</h1>", media_type="text/html", status_code=503)
+    if not PORTAL_PB_HTML.exists():
+        return Response("<h1>PB Portal not found</h1>", media_type="text/html", status_code=503)
+    html = PORTAL_PB_HTML.read_text()
+    html = _inject_custom_panels(html)
+    resp = Response(html, media_type="text/html")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
 
 
 async def index_react(request: Request) -> Response:
@@ -2698,6 +2808,8 @@ async def _startup() -> None:
     asyncio.create_task(_auto_import_clients_loop())
     asyncio.create_task(_paypal_subscription_sync_loop())
     _load_scheduled_tasks()
+    for _hook in _custom_startup_hooks:  # Flux overlay: custom startup hooks
+        await _hook()
 
 
 async def _auto_import_clients_loop() -> None:
@@ -6838,6 +6950,52 @@ _static_mount = (
     else []
 )
 
+# ─── CUSTOMIZATION LAYER (do not remove on upstream update) ────────────
+_CUSTOM_DIR = SCRIPT_DIR / "custom"
+_CUSTOM_ROUTES_FILE = _CUSTOM_DIR / "routes.py"
+_CUSTOM_CONFIG_FILE = _CUSTOM_DIR / "config.json"
+
+# 1. Config overrides
+if _CUSTOM_CONFIG_FILE.exists():
+    try:
+        _custom_cfg = json.loads(_CUSTOM_CONFIG_FILE.read_text())
+        for _k, _v in _custom_cfg.items():
+            if _k in globals():
+                globals()[_k] = _v
+                print(f"[portal-custom] Config override: {_k} = {_v}")
+    except Exception as _e:
+        print(f"[portal-custom] WARNING: config.json load failed: {_e}")
+
+# 2. Custom routes
+_custom_routes: list = []
+if _CUSTOM_ROUTES_FILE.exists():
+    try:
+        import importlib.util as _importlib_util
+        _spec = _importlib_util.spec_from_file_location("custom_routes", str(_CUSTOM_ROUTES_FILE))
+        _mod = _importlib_util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        if hasattr(_mod, "routes"):
+            _custom_routes = _mod.routes
+            print(f"[portal-custom] Loaded {len(_custom_routes)} custom route(s)")
+    except Exception as _e:
+        print(f"[portal-custom] WARNING: routes.py load failed: {_e}")
+
+# 3. Custom startup hooks
+_custom_startup_hooks: list = []
+_custom_startup_file = _CUSTOM_DIR / "startup.py"
+if _custom_startup_file.exists():
+    try:
+        import importlib.util as _importlib_util
+        _spec2 = _importlib_util.spec_from_file_location("custom_startup", str(_custom_startup_file))
+        _mod2 = _importlib_util.module_from_spec(_spec2)
+        _spec2.loader.exec_module(_mod2)
+        if hasattr(_mod2, "on_startup"):
+            _custom_startup_hooks.append(_mod2.on_startup)
+            print("[portal-custom] Loaded custom startup hook")
+    except Exception as _e:
+        print(f"[portal-custom] WARNING: startup.py load failed: {_e}")
+# ─── END CUSTOMIZATION LAYER ──────────────────────────────────────────
+
 routes = [
     Route("/favicon.ico", endpoint=favicon),
     Route("/favicon-32.png", endpoint=favicon_png),
@@ -6928,6 +7086,7 @@ routes = [
     Route("/api/bookmarks", endpoint=api_bookmarks, methods=["GET", "POST"]),
     WebSocketRoute("/ws/chat", endpoint=ws_chat),
     WebSocketRoute("/ws/terminal", endpoint=ws_terminal),
+    *_custom_routes,   # Flux overlay: custom routes from custom/routes.py
 ]
 
 app = Starlette(

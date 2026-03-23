@@ -1,0 +1,204 @@
+<!-- panel-id: system-status -->
+<!-- panel-label: System Status -->
+<!-- panel-icon: &#x25CE; -->
+<!-- panel-tooltip: Server health, uptime, and connected services -->
+
+<div id="system-status-panel" style="padding:20px;max-width:700px;margin:0 auto;">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;">
+    <h2 style="color:var(--gold,#c9a84c);font-family:var(--font-heading,'Cinzel',serif);font-size:1.2rem;margin:0;">
+      &#x25CE; System Status
+    </h2>
+    <button onclick="refreshSystemStatus()" style="background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.12);color:var(--text,#e8e8e8);border-radius:8px;padding:5px 12px;font-size:0.75rem;cursor:pointer;">
+      &#x21BB; Refresh
+    </button>
+  </div>
+
+  <!-- Uptime / Health card -->
+  <div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px 20px;margin-bottom:14px;">
+    <div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-dim,#888);margin-bottom:10px;">Portal Health</div>
+    <div id="ss-health-row" style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span id="ss-health-dot" style="width:10px;height:10px;border-radius:50%;background:#888;display:inline-block;"></span>
+        <span id="ss-health-text" style="color:var(--text,#e8e8e8);font-size:0.9rem;">Checking...</span>
+      </div>
+      <div style="color:var(--text-dim,#888);font-size:0.8rem;">
+        Uptime: <span id="ss-uptime" style="color:var(--teal,#5eead4);font-family:var(--font-mono,'Courier New',monospace);">...</span>
+      </div>
+      <div style="color:var(--text-dim,#888);font-size:0.8rem;">
+        CIV: <span id="ss-civ" style="color:var(--gold,#c9a84c);font-family:var(--font-mono,'Courier New',monospace);">...</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Connected Services -->
+  <div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px 20px;margin-bottom:14px;">
+    <div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-dim,#888);margin-bottom:12px;">Connected Services</div>
+    <div id="ss-services-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;">
+      <div class="ss-service-card" id="ss-svc-api">
+        <span class="ss-svc-dot" style="background:#888;"></span>
+        <span class="ss-svc-label">Portal API</span>
+        <span class="ss-svc-status">...</span>
+      </div>
+      <div class="ss-service-card" id="ss-svc-ws">
+        <span class="ss-svc-dot" style="background:#888;"></span>
+        <span class="ss-svc-label">WebSocket</span>
+        <span class="ss-svc-status">...</span>
+      </div>
+      <div class="ss-service-card" id="ss-svc-claude">
+        <span class="ss-svc-dot" style="background:#888;"></span>
+        <span class="ss-svc-label">Claude Auth</span>
+        <span class="ss-svc-status">...</span>
+      </div>
+      <div class="ss-service-card" id="ss-svc-release">
+        <span class="ss-svc-dot" style="background:#888;"></span>
+        <span class="ss-svc-label">Release Notes</span>
+        <span class="ss-svc-status">...</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Context Usage -->
+  <div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px 20px;margin-bottom:14px;">
+    <div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-dim,#888);margin-bottom:10px;">Context Window</div>
+    <div style="display:flex;align-items:center;gap:12px;">
+      <div style="flex:1;background:rgba(255,255,255,0.07);border-radius:6px;height:8px;overflow:hidden;">
+        <div id="ss-ctx-bar" style="height:100%;width:0%;background:var(--teal,#5eead4);border-radius:6px;transition:width 0.4s;"></div>
+      </div>
+      <span id="ss-ctx-text" style="color:var(--text-dim,#888);font-size:0.8rem;font-family:var(--font-mono,'Courier New',monospace);white-space:nowrap;">...</span>
+    </div>
+  </div>
+
+  <!-- Last updated -->
+  <div style="text-align:right;color:var(--text-dim,#888);font-size:0.7rem;margin-top:8px;">
+    Last updated: <span id="ss-last-updated">never</span>
+  </div>
+</div>
+
+<style>
+  #system-status-panel .ss-service-card {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 0.8rem;
+  }
+  #system-status-panel .ss-svc-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    transition: background 0.3s;
+  }
+  #system-status-panel .ss-svc-label {
+    flex: 1;
+    color: var(--text-dim, #888);
+  }
+  #system-status-panel .ss-svc-status {
+    color: var(--text, #e8e8e8);
+    font-family: var(--font-mono, 'Courier New', monospace);
+    font-size: 0.72rem;
+  }
+</style>
+
+<script>
+(function() {
+  // Register with Flux overlay custom panel handler system
+  window._customPanelHandlers = window._customPanelHandlers || {};
+  window._customPanelHandlers['system-status'] = function() {
+    refreshSystemStatus();
+  };
+
+  function formatUptime(seconds) {
+    if (seconds < 60) return seconds + 's';
+    if (seconds < 3600) return Math.floor(seconds / 60) + 'm ' + (seconds % 60) + 's';
+    var h = Math.floor(seconds / 3600);
+    var m = Math.floor((seconds % 3600) / 60);
+    return h + 'h ' + m + 'm';
+  }
+
+  function setServiceStatus(cardId, ok, label) {
+    var card = document.getElementById(cardId);
+    if (!card) return;
+    var dot = card.querySelector('.ss-svc-dot');
+    var status = card.querySelector('.ss-svc-status');
+    if (dot) dot.style.background = ok ? '#4ade80' : '#f87171';
+    if (status) status.textContent = label || (ok ? 'OK' : 'ERR');
+  }
+
+  window.refreshSystemStatus = function() {
+    var token = localStorage.getItem('pb_token') || '';
+    var headers = token ? { 'Authorization': 'Bearer ' + token } : {};
+
+    // Check portal health
+    fetch('/health', { headers: headers })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        var dot = document.getElementById('ss-health-dot');
+        var txt = document.getElementById('ss-health-text');
+        var uptime = document.getElementById('ss-uptime');
+        var civ = document.getElementById('ss-civ');
+        if (dot) dot.style.background = '#4ade80';
+        if (txt) txt.textContent = 'Healthy';
+        if (uptime) uptime.textContent = formatUptime(data.uptime || 0);
+        if (civ) civ.textContent = data.civ || 'unknown';
+        setServiceStatus('ss-svc-api', true, 'OK');
+      })
+      .catch(function() {
+        var dot = document.getElementById('ss-health-dot');
+        var txt = document.getElementById('ss-health-text');
+        if (dot) dot.style.background = '#f87171';
+        if (txt) txt.textContent = 'Unreachable';
+        setServiceStatus('ss-svc-api', false, 'ERR');
+      });
+
+    // Check Claude auth status
+    fetch('/api/auth/status', { headers: headers })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        var authed = data.authenticated || data.status === 'authenticated';
+        setServiceStatus('ss-svc-claude', authed, authed ? 'Auth' : 'Unauth');
+      })
+      .catch(function() { setServiceStatus('ss-svc-claude', false, 'ERR'); });
+
+    // Check release notes (signals DB/storage is working)
+    fetch('/api/release-notes', { headers: headers })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) { setServiceStatus('ss-svc-release', !!data, data ? 'OK' : 'ERR'); })
+      .catch(function() { setServiceStatus('ss-svc-release', false, 'ERR'); });
+
+    // Check context window
+    fetch('/api/context', { headers: headers })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        var used = data.tokens_used || data.context_tokens || 0;
+        var max = data.max_tokens || data.context_limit || 200000;
+        var pct = Math.min(100, Math.round((used / max) * 100));
+        var bar = document.getElementById('ss-ctx-bar');
+        var txt = document.getElementById('ss-ctx-text');
+        if (bar) {
+          bar.style.width = pct + '%';
+          bar.style.background = pct > 80 ? '#f87171' : pct > 60 ? '#fbbf24' : 'var(--teal,#5eead4)';
+        }
+        if (txt) txt.textContent = pct + '% (' + (used / 1000).toFixed(1) + 'k / ' + (max / 1000).toFixed(0) + 'k)';
+      })
+      .catch(function() {
+        var txt = document.getElementById('ss-ctx-text');
+        if (txt) txt.textContent = 'unavailable';
+      });
+
+    // WebSocket is considered "connected" if ws_chat endpoint responds (we just test the HTTP upgrade header)
+    // We check it via the /health endpoint already; mark ws as up if health is up
+    fetch('/health', { headers: headers })
+      .then(function(r) { return r.ok; })
+      .then(function(ok) { setServiceStatus('ss-svc-ws', ok, ok ? 'Ready' : 'ERR'); })
+      .catch(function() { setServiceStatus('ss-svc-ws', false, 'ERR'); });
+
+    var now = new Date();
+    var lu = document.getElementById('ss-last-updated');
+    if (lu) lu.textContent = now.toLocaleTimeString();
+  };
+})();
+</script>

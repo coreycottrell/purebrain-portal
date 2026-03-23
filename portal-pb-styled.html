@@ -8234,6 +8234,10 @@
       var activeSess = termSessions[activeTermTid];
       if (!activeSess || !activeSess.ws) connectTerminalWSForTid(activeTermTid);
     }
+    // Flux overlay: dispatch to custom panel handlers
+    if (window._customPanelHandlers && window._customPanelHandlers[panel]) {
+      window._customPanelHandlers[panel]();
+    }
   }
 
   document.querySelectorAll('.nav-item').forEach(function(item) {
