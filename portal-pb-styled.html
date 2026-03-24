@@ -1057,6 +1057,7 @@
   }
   .pb-trust-divider { width: 1px; height: 14px; background: rgba(255,255,255,0.1); }
   @keyframes pulse-glow { 0%,100%{opacity:1;box-shadow:0 0 4px var(--teal);} 50%{opacity:0.7;box-shadow:0 0 8px var(--teal);} }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   /* Form — floating labels */
   .pb-form {
@@ -7404,6 +7405,37 @@
       </div>
     </div>
 
+    <!-- Portal Updates Section -->
+    <div id="portal-updates-section" style="border:1px solid var(--border);border-radius:10px;padding:16px;display:flex;flex-direction:column;gap:12px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;">
+        <div style="font-size:0.95rem;font-weight:700;color:var(--text);letter-spacing:0.04em;">&#x1F504; Portal Updates</div>
+        <span id="update-badge" style="display:none;font-size:0.75rem;font-family:var(--font-mono);color:#fff;background:#22c55e;padding:2px 8px;border-radius:4px;">Update Available</span>
+      </div>
+      <div style="display:flex;gap:16px;font-size:0.85rem;color:#b0b8c8;">
+        <span>Current: <code id="update-current-version" style="color:var(--gold);">v--</code></span>
+        <span>SHA: <code id="update-current-sha" style="color:var(--text-dim);">-------</code></span>
+      </div>
+      <div id="update-available-info" style="display:none;flex-direction:column;gap:8px;">
+        <div style="font-size:0.85rem;color:#e8ecf4;">
+          <span id="update-commits-behind"></span> new commit(s) available
+        </div>
+        <div id="update-changelog" style="max-height:160px;overflow-y:auto;background:var(--surface2);border:1px solid var(--border2);border-radius:6px;padding:10px;font-size:0.82rem;font-family:var(--font-mono);color:#e8ecf4;line-height:1.5;"></div>
+      </div>
+      <div id="update-uptodate-msg" style="display:none;font-size:0.85rem;color:#22c55e;">&#x2714; Portal is up to date.</div>
+      <div id="update-error-msg" style="display:none;font-size:0.85rem;color:#ef4444;"></div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button id="update-check-btn" onclick="checkForUpdates()" style="padding:8px 16px;background:var(--surface2);border:1px solid var(--border2);border-radius:6px;color:#e8ecf4;font-size:0.88rem;cursor:pointer;">Check for Updates</button>
+        <button id="update-apply-btn" onclick="applyUpdate()" style="display:none;padding:8px 18px;background:linear-gradient(135deg,var(--gold),var(--teal));color:#fff;border:none;border-radius:6px;font-size:0.88rem;font-weight:700;cursor:pointer;">Update Now</button>
+      </div>
+      <div id="update-progress" style="display:none;flex-direction:column;gap:6px;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <div id="update-spinner" style="width:16px;height:16px;border:2px solid var(--border);border-top:2px solid var(--gold);border-radius:50%;animation:spin 1s linear infinite;"></div>
+          <span id="update-progress-text" style="font-size:0.85rem;color:#e8ecf4;">Updating...</span>
+        </div>
+        <div id="update-steps" style="font-size:0.78rem;color:#b0b8c8;font-family:var(--font-mono);"></div>
+      </div>
+    </div>
+
   </div>
 </div>
 
@@ -12909,6 +12941,172 @@
       });
   }
   window.processReleaseNotesWithAI = processReleaseNotesWithAI;
+
+  // --- Portal Update Functions ---
+
+  var _updateCheckInterval = null;
+
+  function _escapeHtmlUpdate(str) {
+    var d = document.createElement('div');
+    d.appendChild(document.createTextNode(str));
+    return d.innerHTML;
+  }
+
+  function showSettingsUpdateDot(show) {
+    var gear = document.getElementById('settings-btn');
+    if (!gear) return;
+    var dot = document.getElementById('settings-update-dot');
+    if (show && !dot) {
+      dot = document.createElement('span');
+      dot.id = 'settings-update-dot';
+      dot.style.cssText = 'position:absolute;top:2px;right:2px;width:8px;height:8px;background:#22c55e;border-radius:50%;';
+      gear.style.position = 'relative';
+      gear.appendChild(dot);
+    } else if (!show && dot) {
+      dot.remove();
+    }
+  }
+
+  function checkForUpdates() {
+    var btn = document.getElementById('update-check-btn');
+    if (!btn) return;
+    btn.textContent = 'Checking...';
+    btn.disabled = true;
+
+    fetch('/api/update/check', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      btn.textContent = 'Check for Updates';
+      btn.disabled = false;
+
+      document.getElementById('update-error-msg').style.display = 'none';
+
+      if (data.status === 'available') {
+        document.getElementById('update-current-version').textContent = 'v' + data.current_version;
+        document.getElementById('update-current-sha').textContent = data.current_sha.substring(0, 7);
+        document.getElementById('update-commits-behind').textContent = data.commits_behind;
+
+        var cl = document.getElementById('update-changelog');
+        cl.innerHTML = '';
+        (data.changelog || []).forEach(function(c) {
+          cl.innerHTML += '<div>' + c.sha.substring(0,7) + ' ' + _escapeHtmlUpdate(c.message) + '</div>';
+        });
+
+        document.getElementById('update-available-info').style.display = 'flex';
+        document.getElementById('update-uptodate-msg').style.display = 'none';
+        document.getElementById('update-apply-btn').style.display = 'inline-block';
+        document.getElementById('update-badge').style.display = 'inline-block';
+        showSettingsUpdateDot(true);
+
+      } else if (data.status === 'up_to_date') {
+        document.getElementById('update-current-version').textContent = 'v' + data.current_version;
+        document.getElementById('update-current-sha').textContent = data.current_sha.substring(0, 7);
+        document.getElementById('update-available-info').style.display = 'none';
+        document.getElementById('update-uptodate-msg').style.display = 'block';
+        document.getElementById('update-apply-btn').style.display = 'none';
+        document.getElementById('update-badge').style.display = 'none';
+        showSettingsUpdateDot(false);
+
+      } else if (data.status === 'error') {
+        document.getElementById('update-error-msg').textContent = data.error;
+        document.getElementById('update-error-msg').style.display = 'block';
+      }
+    })
+    .catch(function(err) {
+      btn.textContent = 'Check for Updates';
+      btn.disabled = false;
+      document.getElementById('update-error-msg').textContent = 'Network error: ' + err.message;
+      document.getElementById('update-error-msg').style.display = 'block';
+    });
+  }
+
+  function applyUpdate() {
+    if (!confirm('Apply portal update? The portal will restart after updating.')) return;
+
+    var btn = document.getElementById('update-apply-btn');
+    btn.style.display = 'none';
+    document.getElementById('update-progress').style.display = 'flex';
+    document.getElementById('update-progress-text').textContent = 'Starting update...';
+
+    fetch('/api/update/apply', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: '{}'
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.status === 'started') {
+        pollUpdateStatus(data.job_id);
+      } else {
+        document.getElementById('update-progress').style.display = 'none';
+        document.getElementById('update-error-msg').textContent = data.error || 'Unexpected response';
+        document.getElementById('update-error-msg').style.display = 'block';
+        btn.style.display = 'inline-block';
+      }
+    })
+    .catch(function(err) {
+      document.getElementById('update-progress').style.display = 'none';
+      document.getElementById('update-error-msg').textContent = 'Failed to start update: ' + err.message;
+      document.getElementById('update-error-msg').style.display = 'block';
+      btn.style.display = 'inline-block';
+    });
+  }
+
+  function pollUpdateStatus(jobId) {
+    var poll = setInterval(function() {
+      fetch('/api/update/status', {
+        headers: { 'Authorization': 'Bearer ' + token }
+      })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.status === 'in_progress') {
+          document.getElementById('update-progress-text').textContent =
+            'Step: ' + (data.step || '...').replace(/_/g, ' ');
+          document.getElementById('update-steps').textContent =
+            'Completed: ' + (data.steps_completed || []).join(', ');
+
+        } else if (data.status === 'success') {
+          clearInterval(poll);
+          document.getElementById('update-progress').style.display = 'none';
+          document.getElementById('update-uptodate-msg').textContent =
+            'Update complete! Portal restarting... (page will reload in 10s)';
+          document.getElementById('update-uptodate-msg').style.display = 'block';
+          document.getElementById('update-available-info').style.display = 'none';
+          document.getElementById('update-badge').style.display = 'none';
+          showSettingsUpdateDot(false);
+          setTimeout(function() { location.reload(); }, 10000);
+
+        } else if (data.status === 'failed') {
+          clearInterval(poll);
+          document.getElementById('update-progress').style.display = 'none';
+          document.getElementById('update-error-msg').textContent =
+            'Update failed: ' + data.error + (data.rolled_back_to ? ' (rolled back to ' + data.rolled_back_to.substring(0,7) + ')' : '');
+          document.getElementById('update-error-msg').style.display = 'block';
+          document.getElementById('update-apply-btn').style.display = 'inline-block';
+        }
+      })
+      .catch(function() {
+        document.getElementById('update-progress-text').textContent = 'Portal restarting...';
+      });
+    }, 2000);
+
+    // Safety timeout: stop polling after 3 minutes
+    setTimeout(function() { clearInterval(poll); }, 180000);
+  }
+
+  // Auto-check for updates 5s after page load and every 24 hours
+  setTimeout(function() {
+    if (token) checkForUpdates();
+  }, 5000);
+  _updateCheckInterval = setInterval(function() {
+    if (token) checkForUpdates();
+  }, 24 * 60 * 60 * 1000);
+
+  window.checkForUpdates = checkForUpdates;
+  window.applyUpdate = applyUpdate;
+  window.pollUpdateStatus = pollUpdateStatus;
 
   // Fetch release notes after login
   // (hooked into the login success flow below)

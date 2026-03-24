@@ -6935,6 +6935,413 @@ async def api_investor_tts(request: Request) -> Response:
         return Response(b"", status_code=503)
 
 
+# ---------------------------------------------------------------------------
+# Portal Update Mechanism (ADR-003)
+# ---------------------------------------------------------------------------
+
+# In-memory state for update tracking
+_update_state: dict = {
+    "status": "idle",        # idle | in_progress | success | failed
+    "job_id": None,
+    "step": None,
+    "steps_completed": [],
+    "steps_remaining": [],
+    "started_at": None,
+    "completed_at": None,
+    "error": None,
+    "previous_sha": None,
+    "new_sha": None,
+    "new_version": None,
+    "rolled_back_to": None,
+    "step_failed": None,
+    "tests_passed": None,
+    "message": None,
+    "last_update": None,
+}
+
+_update_lock: asyncio.Lock | None = None
+
+
+async def _get_update_lock() -> asyncio.Lock:
+    """Lazily create the asyncio.Lock (must be inside an async context)."""
+    global _update_lock
+    if _update_lock is None:
+        _update_lock = asyncio.Lock()
+    return _update_lock
+
+
+async def _git_cmd(args: list, timeout: int = 15) -> tuple:
+    """Run a git command in the portal directory. Returns (returncode, stdout)."""
+    cmd = ["git", "-C", str(SCRIPT_DIR)] + args
+    loop = asyncio.get_event_loop()
+    try:
+        result = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
+            ),
+            timeout=timeout + 2
+        )
+        return (result.returncode, result.stdout.strip())
+    except (asyncio.TimeoutError, Exception) as e:
+        return (-1, str(e))
+
+
+async def _get_current_version() -> str:
+    """Read the current version from release_notes.json or fallback to PORTAL_VERSION."""
+    try:
+        data = json.loads(RELEASE_NOTES_FILE.read_text())
+        return data.get("current_version", PORTAL_VERSION)
+    except Exception:
+        return PORTAL_VERSION
+
+
+async def api_update_check(request: Request) -> JSONResponse:
+    """GET /api/update/check -- Check for upstream updates."""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, 401)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Fetch from remote
+    rc, _ = await _git_cmd(["fetch", "origin", "main", "--quiet"], timeout=30)
+    if rc != 0:
+        return JSONResponse({
+            "status": "error",
+            "error": "Failed to fetch from remote (not a git repo or no remote configured)",
+            "checked_at": now_iso,
+        })
+
+    # Compare local vs remote
+    rc_local, local_sha = await _git_cmd(["rev-parse", "HEAD"])
+    rc_remote, remote_sha = await _git_cmd(["rev-parse", "origin/main"])
+
+    if rc_local != 0 or rc_remote != 0:
+        return JSONResponse({
+            "status": "error",
+            "error": "Failed to read git HEAD or origin/main",
+            "checked_at": now_iso,
+        })
+
+    current_version = await _get_current_version()
+
+    if local_sha == remote_sha:
+        return JSONResponse({
+            "status": "up_to_date",
+            "current_version": current_version,
+            "current_sha": local_sha,
+            "checked_at": now_iso,
+        })
+
+    # Get commits behind count and changelog
+    rc_log, log_output = await _git_cmd(
+        ["log", "HEAD..origin/main", "--format=%H|||%an|||%aI|||%s"],
+        timeout=15,
+    )
+    changelog = []
+    commits_behind = 0
+    if rc_log == 0 and log_output:
+        for line in log_output.strip().split("\n"):
+            parts = line.split("|||", 3)
+            if len(parts) == 4:
+                changelog.append({
+                    "sha": parts[0],
+                    "author": parts[1],
+                    "date": parts[2],
+                    "message": parts[3],
+                })
+        commits_behind = len(changelog)
+
+    return JSONResponse({
+        "status": "available",
+        "current_version": current_version,
+        "current_sha": local_sha,
+        "remote_sha": remote_sha,
+        "commits_behind": commits_behind,
+        "changelog": changelog,
+        "checked_at": now_iso,
+    })
+
+
+async def api_update_apply(request: Request) -> JSONResponse:
+    """POST /api/update/apply -- Start the safe update process in the background."""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, 401)
+
+    lock = await _get_update_lock()
+
+    if _update_state["status"] == "in_progress":
+        return JSONResponse({"status": "error", "error": "Update already in progress"})
+
+    # Quick check: are we up to date?
+    rc_local, local_sha = await _git_cmd(["rev-parse", "HEAD"])
+    rc_remote, remote_sha = await _git_cmd(["rev-parse", "origin/main"])
+    if rc_local == 0 and rc_remote == 0 and local_sha == remote_sha:
+        return JSONResponse({"status": "error", "error": "Already up to date"})
+
+    # Check for uncommitted changes to tracked files
+    rc_status, status_output = await _git_cmd(["status", "--porcelain"])
+    if rc_status == 0 and status_output:
+        # Filter to only tracked file changes (not untracked '??')
+        tracked_changes = [
+            line for line in status_output.split("\n")
+            if line.strip() and not line.startswith("??")
+        ]
+        if tracked_changes:
+            return JSONResponse({
+                "status": "error",
+                "error": "Uncommitted changes to tracked files. Commit or stash before updating.",
+            })
+
+    job_id = f"update-{datetime.now():%Y%m%d-%H%M%S}"
+
+    # Reset state for new update
+    _update_state.update({
+        "status": "in_progress",
+        "job_id": job_id,
+        "step": "starting",
+        "steps_completed": [],
+        "steps_remaining": ["fetch", "compare", "check_tree", "record_rollback",
+                            "verify_custom", "verify_preserved", "pull",
+                            "running_tests", "read_version", "restart"],
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None,
+        "error": None,
+        "previous_sha": None,
+        "new_sha": None,
+        "new_version": None,
+        "rolled_back_to": None,
+        "step_failed": None,
+        "tests_passed": None,
+        "message": None,
+    })
+
+    # Launch background task
+    asyncio.create_task(_run_update(job_id))
+
+    return JSONResponse({
+        "status": "started",
+        "job_id": job_id,
+        "message": "Update process started. Poll /api/update/status for progress.",
+    })
+
+
+def _update_step(step_name: str):
+    """Mark a step as current and move it from remaining to completed."""
+    _update_state["step"] = step_name
+    if step_name in _update_state["steps_remaining"]:
+        _update_state["steps_remaining"].remove(step_name)
+    if step_name not in _update_state["steps_completed"]:
+        _update_state["steps_completed"].append(step_name)
+
+
+def _log_update(message: str):
+    """Append a message to the update log file."""
+    try:
+        with open("/tmp/portal-update.log", "a") as f:
+            f.write(f"[{datetime.now(timezone.utc).isoformat()}] {message}\n")
+    except Exception:
+        pass
+
+
+async def _run_update(job_id: str):
+    """Execute the 11-step safe update algorithm as a background task."""
+    previous_sha = None
+    try:
+        # Step 2: FETCH
+        _update_step("fetch")
+        _log_update(f"[{job_id}] Step 2: Fetching from origin...")
+        rc, out = await _git_cmd(["fetch", "origin", "main", "--quiet"], timeout=30)
+        if rc != 0:
+            raise RuntimeError(f"git fetch failed: {out}")
+
+        # Step 3: COMPARE
+        _update_step("compare")
+        rc_local, local_sha = await _git_cmd(["rev-parse", "HEAD"])
+        rc_remote, remote_sha = await _git_cmd(["rev-parse", "origin/main"])
+        if rc_local != 0 or rc_remote != 0:
+            raise RuntimeError("Failed to read git SHAs")
+        if local_sha == remote_sha:
+            raise RuntimeError("Already up to date")
+
+        # Step 4: CHECK WORKING TREE
+        _update_step("check_tree")
+        rc_status, status_output = await _git_cmd(["status", "--porcelain"])
+        if rc_status == 0 and status_output:
+            tracked = [l for l in status_output.split("\n") if l.strip() and not l.startswith("??")]
+            if tracked:
+                raise RuntimeError(f"Uncommitted tracked changes: {'; '.join(tracked[:3])}")
+
+        # Step 5: RECORD ROLLBACK POINT
+        _update_step("record_rollback")
+        previous_sha = local_sha
+        _update_state["previous_sha"] = previous_sha
+        _log_update(f"[{job_id}] Rollback point: {previous_sha}")
+
+        # Step 6: VERIFY CUSTOM DIRECTORY
+        _update_step("verify_custom")
+        custom_dir = SCRIPT_DIR / "custom"
+        if custom_dir.exists():
+            # Check that custom/ files are NOT tracked by git
+            for check_file in ["custom/config.json", "custom/routes.py"]:
+                rc_check, _ = await _git_cmd(["ls-files", "--error-unmatch", check_file])
+                if rc_check == 0:
+                    raise RuntimeError(
+                        f"ABORT: {check_file} is tracked by git. .gitignore may be broken."
+                    )
+
+        # Step 7: VERIFY PRESERVED FILES
+        _update_step("verify_preserved")
+        preserved_files = [
+            ".portal-token", "agents.db", "referrals.db", "clients.db",
+            "boop_config.json", "portal-chat.jsonl", "user-settings.json",
+            "scheduled_tasks.json",
+        ]
+        for pf in preserved_files:
+            if (SCRIPT_DIR / pf).exists():
+                rc_check, _ = await _git_cmd(["ls-files", "--error-unmatch", pf])
+                if rc_check == 0:
+                    raise RuntimeError(
+                        f"ABORT: {pf} is tracked by git. This file must be gitignored."
+                    )
+
+        # Step 8: PULL (fast-forward only)
+        _update_step("pull")
+        _log_update(f"[{job_id}] Step 8: Pulling with --ff-only...")
+        rc_pull, pull_output = await _git_cmd(
+            ["pull", "--ff-only", "origin", "main"], timeout=60
+        )
+        if rc_pull != 0:
+            if "diverged" in pull_output.lower() or "not possible to fast-forward" in pull_output.lower():
+                raise RuntimeError(
+                    "Local branch has diverged from origin/main. Manual intervention needed."
+                )
+            raise RuntimeError(f"git pull --ff-only failed: {pull_output.split(chr(10))[0]}")
+
+        # Step 9: RUN TESTS
+        _update_step("running_tests")
+        _log_update(f"[{job_id}] Step 9: Running tests...")
+        test_cmd = [sys.executable, "-m", "pytest", str(SCRIPT_DIR / "tests"), "--tb=short", "-q"]
+        loop = asyncio.get_event_loop()
+        try:
+            test_result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: subprocess.run(
+                        test_cmd, timeout=120, capture_output=True, text=True, cwd=str(SCRIPT_DIR)
+                    )
+                ),
+                timeout=125,
+            )
+            if test_result.returncode != 0:
+                test_output = (test_result.stdout + "\n" + test_result.stderr).strip()
+                _log_update(f"[{job_id}] Tests FAILED:\n{test_output}")
+                raise RuntimeError(f"Tests failed: {test_output[:200]}")
+            _update_state["tests_passed"] = True
+        except asyncio.TimeoutError:
+            raise RuntimeError("Tests timed out after 120 seconds")
+
+        # Step 10: READ NEW VERSION
+        _update_step("read_version")
+        new_version = await _get_current_version()
+        rc_new, new_sha = await _git_cmd(["rev-parse", "HEAD"])
+        _update_state["new_sha"] = new_sha if rc_new == 0 else remote_sha
+        _update_state["new_version"] = new_version
+
+        # Step 11: SCHEDULE RESTART
+        _update_step("restart")
+        _update_state["status"] = "success"
+        _update_state["completed_at"] = datetime.now(timezone.utc).isoformat()
+        _update_state["message"] = "Update complete. Portal will restart momentarily."
+        _update_state["last_update"] = {
+            "job_id": job_id,
+            "status": "success",
+            "completed_at": _update_state["completed_at"],
+        }
+        _log_update(f"[{job_id}] SUCCESS: Updated from {previous_sha[:7]} to {_update_state['new_sha'][:7]}")
+
+        # Delay 2s so the success status can be polled, then SIGTERM
+        await asyncio.sleep(2)
+        _log_update(f"[{job_id}] Sending SIGTERM for watchdog restart...")
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    except Exception as e:
+        error_msg = str(e)
+        _log_update(f"[{job_id}] FAILED at step '{_update_state.get('step')}': {error_msg}")
+
+        # Rollback if we already pulled
+        rolled_back_to = None
+        if previous_sha and _update_state["step"] in ("running_tests", "read_version", "restart"):
+            _log_update(f"[{job_id}] Rolling back to {previous_sha}...")
+            rc_reset, _ = await _git_cmd(["reset", "--hard", previous_sha])
+            if rc_reset == 0:
+                rolled_back_to = previous_sha
+                _log_update(f"[{job_id}] Rollback successful")
+            else:
+                _log_update(f"[{job_id}] WARNING: Rollback failed!")
+
+        _update_state.update({
+            "status": "failed",
+            "step_failed": _update_state.get("step"),
+            "error": error_msg,
+            "rolled_back_to": rolled_back_to,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "message": "Update failed. Rolled back to previous version." if rolled_back_to else f"Update failed: {error_msg}",
+            "last_update": {
+                "job_id": job_id,
+                "status": "failed",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        })
+
+
+async def api_update_status(request: Request) -> JSONResponse:
+    """GET /api/update/status -- Poll the status of the current/recent update."""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, 401)
+
+    status = _update_state["status"]
+
+    if status == "in_progress":
+        return JSONResponse({
+            "status": "in_progress",
+            "job_id": _update_state["job_id"],
+            "step": _update_state["step"],
+            "steps_completed": _update_state["steps_completed"],
+            "steps_remaining": _update_state["steps_remaining"],
+            "started_at": _update_state["started_at"],
+        })
+
+    if status == "success":
+        return JSONResponse({
+            "status": "success",
+            "job_id": _update_state["job_id"],
+            "previous_sha": _update_state["previous_sha"],
+            "new_sha": _update_state["new_sha"],
+            "new_version": _update_state["new_version"],
+            "tests_passed": _update_state["tests_passed"],
+            "message": _update_state["message"],
+            "completed_at": _update_state["completed_at"],
+        })
+
+    if status == "failed":
+        return JSONResponse({
+            "status": "failed",
+            "job_id": _update_state["job_id"],
+            "step_failed": _update_state["step_failed"],
+            "error": _update_state["error"],
+            "rolled_back_to": _update_state["rolled_back_to"],
+            "message": _update_state["message"],
+            "completed_at": _update_state["completed_at"],
+        })
+
+    # idle
+    return JSONResponse({
+        "status": "idle",
+        "last_update": _update_state.get("last_update"),
+    })
+
+
 # App
 # ---------------------------------------------------------------------------
 _react_assets_mount = (
@@ -7089,6 +7496,9 @@ routes = [
     Route("/api/whatsapp/status", endpoint=api_whatsapp_status),
     Route("/api/settings", endpoint=api_user_settings, methods=["GET", "POST", "PUT"]),
     Route("/api/bookmarks", endpoint=api_bookmarks, methods=["GET", "POST"]),
+    Route("/api/update/check", endpoint=api_update_check),
+    Route("/api/update/apply", endpoint=api_update_apply, methods=["POST"]),
+    Route("/api/update/status", endpoint=api_update_status),
     WebSocketRoute("/ws/chat", endpoint=ws_chat),
     WebSocketRoute("/ws/terminal", endpoint=ws_terminal),
     *_custom_routes,   # Flux overlay: custom routes from custom/routes.py
