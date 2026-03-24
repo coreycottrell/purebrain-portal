@@ -1,6 +1,18 @@
 {
-  "current_version": "1.1.0",
+  "current_version": "1.2.0",
   "releases": [
+    {
+      "version": "1.2.0",
+      "date": "2026-03-24",
+      "title": "Safe In-Portal Update Mechanism",
+      "highlights": [
+        "One-click updates from settings — check for and apply portal updates without leaving the browser.",
+        "11-step safe update with rollback — stash, pull, verify, restart with automatic rollback on failure.",
+        "Auto-check every 24 hours — portal silently checks for new versions and shows a notification badge.",
+        "Fast-forward only pulls — refuses force-pushes and non-linear history to protect local changes.",
+        "Watchdog-aware restart — coordinates with the portal watchdog for zero-downtime restarts."
+      ]
+    },
     {
       "version": "1.1.0",
       "date": "2026-03-23",
