@@ -1,0 +1,7 @@
+starlette==0.52.1
+uvicorn
+aiofiles
+websockets
+aiosqlite
+pyyaml
+httpx
