@@ -8195,6 +8195,10 @@
         overlay.classList.add('hidden');
         document.body.classList.remove('login-active');
         logoutBtn.style.display = '';
+        fetch('/api/evolution/first-boot', {
+          method: 'POST',
+          headers: {'Authorization': 'Bearer ' + t}
+        }).catch(function() {});
         boot();
       })
       .catch(function(e) {
@@ -8223,6 +8227,10 @@
       overlay.classList.add('hidden');
       document.body.classList.remove('login-active');
       logoutBtn.style.display = '';
+      fetch('/api/evolution/first-boot', {
+        method: 'POST',
+        headers: {'Authorization': 'Bearer ' + urlToken}
+      }).catch(function() {});
       boot();
     } else {
       doAuth();
