@@ -12836,14 +12836,9 @@
         if (vLabel) vLabel.textContent = 'v' + ver;
         var wnVer = document.getElementById('whats-new-version');
         if (wnVer) wnVer.textContent = 'v' + ver;
-        // Check if new version since last seen
-        if (ver !== _lastSeenVersion && _lastSeenVersion !== '0.0.0') {
-          var badge = document.getElementById('settings-new-badge');
-          if (badge) badge.style.display = 'block';
-          var sideBtn = document.getElementById('whats-new-sidebar-btn');
-          if (sideBtn) sideBtn.style.display = 'inline-block';
-        } else if (_lastSeenVersion === '0.0.0') {
-          // First visit — just set the version, no badge
+        // Auto-mark version as seen — no persistent badge needed.
+        // The release notes are always available in settings for users to read.
+        if (ver !== _lastSeenVersion) {
           localStorage.setItem('pb_last_seen_version', ver);
           _lastSeenVersion = ver;
         }
@@ -13008,6 +13003,9 @@
         document.getElementById('update-apply-btn').style.display = 'none';
         document.getElementById('update-badge').style.display = 'none';
         showSettingsUpdateDot(false);
+        // Also clear any release-notes badge — portal is current
+        var newBadge = document.getElementById('settings-new-badge');
+        if (newBadge) newBadge.style.display = 'none';
 
       } else if (data.status === 'error') {
         document.getElementById('update-error-msg').textContent = data.error;

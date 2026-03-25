@@ -227,6 +227,44 @@ class TestUpdateFrontend(unittest.TestCase):
     def test_pollUpdateStatus_function(self):
         self.assertIn('function pollUpdateStatus(', self.html)
 
+    def test_settings_new_badge_hidden_by_default(self):
+        """The settings gear notification badge must be hidden by default (display:none)."""
+        # The badge element in HTML must have display:none inline
+        import re
+        match = re.search(r'id="settings-new-badge"[^>]*style="([^"]*)"', self.html)
+        self.assertIsNotNone(match, "settings-new-badge element not found")
+        style = match.group(1)
+        self.assertIn('display:none', style,
+                      "settings-new-badge must be hidden by default (display:none in inline style)")
+
+    def test_release_notes_do_not_show_badge(self):
+        """fetchReleaseNotes must NOT set settings-new-badge to visible.
+
+        The old code showed a persistent red badge on the settings gear whenever
+        the portal version changed.  The fix auto-marks the version as seen so
+        no badge is displayed.
+        """
+        # Ensure the old pattern (badge.style.display = 'block') is gone
+        import re
+        # Find the fetchReleaseNotes function body
+        fn_start = self.html.find('function fetchReleaseNotes()')
+        self.assertGreater(fn_start, 0, "fetchReleaseNotes function not found")
+        fn_body = self.html[fn_start:fn_start + 2000]
+        self.assertNotIn("badge.style.display = 'block'", fn_body,
+                         "fetchReleaseNotes must not show settings-new-badge")
+        self.assertNotIn('badge.style.display = "block"', fn_body,
+                         "fetchReleaseNotes must not show settings-new-badge")
+
+    def test_up_to_date_clears_new_badge(self):
+        """When update check returns up_to_date, settings-new-badge must be hidden."""
+        # Find the up_to_date handler in checkForUpdates
+        idx = self.html.find("data.status === 'up_to_date'")
+        self.assertGreater(idx, 0, "up_to_date handler not found in checkForUpdates")
+        # Check the next ~800 chars for the badge clearing code
+        handler_block = self.html[idx:idx + 800]
+        self.assertIn('settings-new-badge', handler_block,
+                      "up_to_date handler must reference settings-new-badge to clear it")
+
 
 if __name__ == "__main__":
     unittest.main()
