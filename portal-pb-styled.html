@@ -7416,12 +7416,15 @@
         <span>SHA: <code id="update-current-sha" style="color:var(--text-dim);">-------</code></span>
       </div>
       <div id="update-available-info" style="display:none;flex-direction:column;gap:8px;">
-        <div style="font-size:0.85rem;color:#e8ecf4;">
-          <span id="update-commits-behind"></span> new commit(s) available
+        <div style="display:flex;align-items:center;gap:8px;font-size:0.88rem;color:#e8ecf4;flex-wrap:wrap;">
+          <span>Update available:</span>
+          <code id="update-remote-version" style="color:#22c55e;font-weight:700;">v--</code>
+          <span style="color:#b0b8c8;font-size:0.82rem;">(<span id="update-commits-behind"></span> commit(s))</span>
         </div>
         <div id="update-changelog" style="max-height:160px;overflow-y:auto;background:var(--surface2);border:1px solid var(--border2);border-radius:6px;padding:10px;font-size:0.82rem;font-family:var(--font-mono);color:#e8ecf4;line-height:1.5;"></div>
       </div>
       <div id="update-uptodate-msg" style="display:none;font-size:0.85rem;color:#22c55e;">&#x2714; Portal is up to date.</div>
+      <div id="update-success-msg" style="display:none;flex-direction:column;gap:6px;background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.25);border-radius:8px;padding:12px;font-size:0.85rem;color:#22c55e;"></div>
       <div id="update-error-msg" style="display:none;font-size:0.85rem;color:#ef4444;"></div>
       <div style="display:flex;gap:8px;align-items:center;">
         <button id="update-check-btn" onclick="checkForUpdates()" style="padding:8px 16px;background:var(--surface2);border:1px solid var(--border2);border-radius:6px;color:#e8ecf4;font-size:0.88rem;cursor:pointer;">Check for Updates</button>
@@ -12940,6 +12943,8 @@
   // --- Portal Update Functions ---
 
   var _updateCheckInterval = null;
+  var _updateCurrentVersion = '';
+  var _updateTargetVersion = '';
 
   function _escapeHtmlUpdate(str) {
     var d = document.createElement('div');
@@ -12968,6 +12973,10 @@
     btn.textContent = 'Checking...';
     btn.disabled = true;
 
+    // Hide previous messages
+    var successMsg = document.getElementById('update-success-msg');
+    if (successMsg) successMsg.style.display = 'none';
+
     fetch('/api/update/check', {
       headers: { 'Authorization': 'Bearer ' + token }
     })
@@ -12979,9 +12988,25 @@
       document.getElementById('update-error-msg').style.display = 'none';
 
       if (data.status === 'available') {
+        _updateCurrentVersion = data.current_version || '';
+        // Derive target version from changelog or remote info
+        _updateTargetVersion = '';
+        if (data.changelog && data.changelog.length > 0) {
+          // Try to extract version from latest commit message (e.g., "v1.2.1" or "Release 1.2.1")
+          var latestMsg = data.changelog[0].message || '';
+          var verMatch = latestMsg.match(/v?(\d+\.\d+\.\d+)/);
+          if (verMatch) _updateTargetVersion = verMatch[1];
+        }
+
         document.getElementById('update-current-version').textContent = 'v' + data.current_version;
         document.getElementById('update-current-sha').textContent = data.current_sha.substring(0, 7);
         document.getElementById('update-commits-behind').textContent = data.commits_behind;
+
+        // Set remote version display
+        var remoteVerEl = document.getElementById('update-remote-version');
+        if (remoteVerEl) {
+          remoteVerEl.textContent = _updateTargetVersion ? 'v' + _updateTargetVersion : data.remote_sha.substring(0, 7);
+        }
 
         var cl = document.getElementById('update-changelog');
         cl.innerHTML = '';
@@ -13003,7 +13028,7 @@
         document.getElementById('update-apply-btn').style.display = 'none';
         document.getElementById('update-badge').style.display = 'none';
         showSettingsUpdateDot(false);
-        // Also clear any release-notes badge — portal is current
+        // Also clear any release-notes badge -- portal is current
         var newBadge = document.getElementById('settings-new-badge');
         if (newBadge) newBadge.style.display = 'none';
 
@@ -13021,12 +13046,19 @@
   }
 
   function applyUpdate() {
-    if (!confirm('Apply portal update? The portal will restart after updating.')) return;
+    var currentVersion = _updateCurrentVersion || '?';
+    var _updateTargetVersion_display = _updateTargetVersion || 'latest';
+    var confirmMsg = 'This will update the portal from v' + currentVersion
+      + ' to ' + (_updateTargetVersion ? 'v' + _updateTargetVersion : _updateTargetVersion_display)
+      + ' and restart.\n\nContinue?';
+    if (!confirm(confirmMsg)) return;
 
     var btn = document.getElementById('update-apply-btn');
     btn.style.display = 'none';
+    document.getElementById('update-check-btn').style.display = 'none';
     document.getElementById('update-progress').style.display = 'flex';
     document.getElementById('update-progress-text').textContent = 'Starting update...';
+    document.getElementById('update-steps').innerHTML = '';
 
     fetch('/api/update/apply', {
       method: 'POST',
@@ -13039,6 +13071,7 @@
         pollUpdateStatus(data.job_id);
       } else {
         document.getElementById('update-progress').style.display = 'none';
+        document.getElementById('update-check-btn').style.display = 'inline-block';
         document.getElementById('update-error-msg').textContent = data.error || 'Unexpected response';
         document.getElementById('update-error-msg').style.display = 'block';
         btn.style.display = 'inline-block';
@@ -13046,13 +13079,31 @@
     })
     .catch(function(err) {
       document.getElementById('update-progress').style.display = 'none';
+      document.getElementById('update-check-btn').style.display = 'inline-block';
       document.getElementById('update-error-msg').textContent = 'Failed to start update: ' + err.message;
       document.getElementById('update-error-msg').style.display = 'block';
       btn.style.display = 'inline-block';
     });
   }
 
+  var _updateStepLabels = {
+    'starting':         'Initializing update...',
+    'fetch':            'Fetching latest changes...',
+    'compare':          'Comparing versions...',
+    'check_tree':       'Checking file tree...',
+    'record_rollback':  'Recording rollback point...',
+    'verify_custom':    'Verifying custom files...',
+    'verify_preserved': 'Verifying preserved files...',
+    'pull':             'Pulling new code...',
+    'running_tests':    'Running tests...',
+    'read_version':     'Reading new version...',
+    'restart':          'Restarting portal...'
+  };
+
   function pollUpdateStatus(jobId) {
+    var stepsEl = document.getElementById('update-steps');
+    var completedSet = {};
+
     var poll = setInterval(function() {
       fetch('/api/update/status', {
         headers: { 'Authorization': 'Bearer ' + token }
@@ -13060,27 +13111,49 @@
       .then(function(r) { return r.json(); })
       .then(function(data) {
         if (data.status === 'in_progress') {
-          document.getElementById('update-progress-text').textContent =
-            'Step: ' + (data.step || '...').replace(/_/g, ' ');
-          document.getElementById('update-steps').textContent =
-            'Completed: ' + (data.steps_completed || []).join(', ');
+          var stepName = data.step || 'starting';
+          var label = _updateStepLabels[stepName] || stepName.replace(/_/g, ' ');
+          document.getElementById('update-progress-text').textContent = label;
+
+          // Show completed steps as a list
+          (data.steps_completed || []).forEach(function(s) {
+            if (!completedSet[s]) {
+              completedSet[s] = true;
+              var stepLabel = _updateStepLabels[s] || s.replace(/_/g, ' ');
+              stepsEl.innerHTML += '<div style="color:#22c55e;">&#x2714; ' + _escapeHtmlUpdate(stepLabel) + '</div>';
+            }
+          });
 
         } else if (data.status === 'success') {
           clearInterval(poll);
           document.getElementById('update-progress').style.display = 'none';
-          document.getElementById('update-uptodate-msg').textContent =
-            'Update complete! Portal restarting... (page will reload in 10s)';
-          document.getElementById('update-uptodate-msg').style.display = 'block';
           document.getElementById('update-available-info').style.display = 'none';
           document.getElementById('update-badge').style.display = 'none';
+          document.getElementById('update-check-btn').style.display = 'inline-block';
           showSettingsUpdateDot(false);
-          setTimeout(function() { location.reload(); }, 10000);
+
+          // Show dedicated success message with version info
+          var successEl = document.getElementById('update-success-msg');
+          if (successEl) {
+            var newVer = data.new_version || _updateTargetVersion || 'latest';
+            successEl.innerHTML =
+              '<div style="font-weight:700;">&#x2714; Updated to v' + _escapeHtmlUpdate(newVer) + ' successfully!</div>' +
+              '<div style="font-size:0.82rem;color:#b0b8c8;">Portal will restart in 5 seconds. The page will reload automatically.</div>';
+            successEl.style.display = 'flex';
+          }
+
+          setTimeout(function() { location.reload(); }, 5000);
 
         } else if (data.status === 'failed') {
           clearInterval(poll);
           document.getElementById('update-progress').style.display = 'none';
-          document.getElementById('update-error-msg').textContent =
-            'Update failed: ' + data.error + (data.rolled_back_to ? ' (rolled back to ' + data.rolled_back_to.substring(0,7) + ')' : '');
+          document.getElementById('update-check-btn').style.display = 'inline-block';
+
+          var errMsg = 'Update failed: ' + (data.error || 'Unknown error');
+          if (data.rolled_back_to) {
+            errMsg += ' (rolled back to ' + data.rolled_back_to.substring(0,7) + ')';
+          }
+          document.getElementById('update-error-msg').textContent = errMsg;
           document.getElementById('update-error-msg').style.display = 'block';
           document.getElementById('update-apply-btn').style.display = 'inline-block';
         }
