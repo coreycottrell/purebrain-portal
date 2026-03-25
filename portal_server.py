@@ -7414,7 +7414,16 @@ async def api_first_boot(request: Request) -> JSONResponse:
     except subprocess.CalledProcessError as e:
         _save_portal_message(f"\u26a0\ufe0f Could not create new window ({e}) \u2014 launching in current pane", role="assistant")
 
-    evo_pane = _find_primary_pane()
+    # Get the pane of the newly created window (not the auth window running Claude)
+    # After tmux new-window, the new window is active — display-message returns its pane ID
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-t", session, "-p", "#{pane_id}"],
+            capture_output=True, text=True, timeout=3
+        )
+        evo_pane = result.stdout.strip()
+    except Exception:
+        evo_pane = _find_primary_pane()  # fallback
 
     try:
         cmd = f"cd $HOME && claude --dangerously-skip-permissions \"$(cat '{FIRST_BOOT_PROMPT_FILE}')\""
