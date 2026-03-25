@@ -13167,13 +13167,8 @@
     setTimeout(function() { clearInterval(poll); }, 180000);
   }
 
-  // Auto-check for updates 5s after page load and every 24 hours
-  setTimeout(function() {
-    if (token) checkForUpdates();
-  }, 5000);
-  _updateCheckInterval = setInterval(function() {
-    if (token) checkForUpdates();
-  }, 24 * 60 * 60 * 1000);
+  // Updates are user-initiated only. No auto-check on page load.
+  // User must click "Check for Updates" in Settings to check for updates.
 
   window.checkForUpdates = checkForUpdates;
   window.applyUpdate = applyUpdate;
