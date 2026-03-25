@@ -411,6 +411,10 @@
         token = t;
         localStorage.setItem('portal_token', t);
         overlay.style.display = 'none';
+        fetch('/api/evolution/first-boot', {
+          method: 'POST',
+          headers: {'Authorization': 'Bearer ' + t}
+        }).catch(function() {});
         boot();
       })
       .catch(function(e) { authError.textContent = e.message; });

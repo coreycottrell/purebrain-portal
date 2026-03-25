@@ -7342,6 +7342,76 @@ async def api_update_status(request: Request) -> JSONResponse:
     })
 
 
+# ---------------------------------------------------------------------------
+# Evolution / First-Boot
+# ---------------------------------------------------------------------------
+EVOLUTION_DONE_FILE = Path.home() / "memories" / "identity" / ".evolution-done"
+FIRST_BOOT_FIRED_FILE = Path.home() / ".first-boot-fired"
+FIRST_BOOT_PROMPT_FILE = Path.home() / ".claude" / "skills" / "first-visit-evolution" / "prompt.txt"
+
+
+async def api_evolution_status(request: Request) -> JSONResponse:
+    """Check if this AiCIV needs first-boot evolution, is mid-evolution, or is done."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    evolution_done = EVOLUTION_DONE_FILE.exists()
+    first_boot_fired = FIRST_BOOT_FIRED_FILE.exists()
+    seed_exists = Path(Path.home() / "memories" / "identity" / "seed-conversation.md").exists()
+    return JSONResponse({
+        "seed_exists": seed_exists,
+        "evolution_done": evolution_done,
+        "first_boot_fired": first_boot_fired,
+        "needs_evolution": seed_exists and not evolution_done and not first_boot_fired,
+    })
+
+
+async def api_first_boot(request: Request) -> JSONResponse:
+    """Start Claude with the first-visit evolution prompt as a startup argument."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    if EVOLUTION_DONE_FILE.exists():
+        return JSONResponse({"status": "skipped", "reason": "evolution already complete"})
+    if FIRST_BOOT_FIRED_FILE.exists():
+        return JSONResponse({"status": "skipped", "reason": "first boot already fired"})
+    seed_file = Path.home() / "memories" / "identity" / "seed-conversation.md"
+    if not seed_file.exists():
+        return JSONResponse({"status": "skipped", "reason": "no seed conversation found"})
+
+    if not FIRST_BOOT_PROMPT_FILE.exists():
+        return JSONResponse({"error": "prompt file not found"}, status_code=500)
+    prompt_text = FIRST_BOOT_PROMPT_FILE.read_text().strip()
+    if not prompt_text:
+        return JSONResponse({"error": "prompt file is empty"}, status_code=500)
+
+    session = get_tmux_session()
+    try:
+        subprocess.run(["tmux", "new-window", "-t", session],
+                       check=True, stderr=subprocess.DEVNULL)
+        _save_portal_message("\U0001faa7 Opening fresh window for evolution\u2026 (auth window preserved)", role="assistant")
+        await asyncio.sleep(0.3)
+    except subprocess.CalledProcessError as e:
+        _save_portal_message(f"\u26a0\ufe0f Could not create new window ({e}) \u2014 launching in current pane", role="assistant")
+
+    evo_pane = _find_primary_pane()
+
+    try:
+        cmd = f"cd $HOME && claude --dangerously-skip-permissions \"$(cat '{FIRST_BOOT_PROMPT_FILE}')\""
+        subprocess.run(["tmux", "send-keys", "-t", evo_pane, "-l", cmd],
+                       check=True, stderr=subprocess.DEVNULL)
+        subprocess.run(["tmux", "send-keys", "-t", evo_pane, "Enter"],
+                       check=True, stderr=subprocess.DEVNULL)
+
+        FIRST_BOOT_FIRED_FILE.write_text(f"fired at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
+
+        _save_portal_message("\U0001f305 First-visit evolution started \u2014 watch your AI wake up!", role="assistant")
+        return JSONResponse({"status": "fired", "prompt_length": len(prompt_text)})
+
+    except subprocess.CalledProcessError as e:
+        _save_portal_message(f"\u274c First-boot failed: {e}", role="assistant")
+        return JSONResponse({"error": f"tmux error: {e}"}, status_code=500)
+
+
 # App
 # ---------------------------------------------------------------------------
 _react_assets_mount = (
@@ -7499,6 +7569,8 @@ routes = [
     Route("/api/update/check", endpoint=api_update_check),
     Route("/api/update/apply", endpoint=api_update_apply, methods=["POST"]),
     Route("/api/update/status", endpoint=api_update_status),
+    Route("/api/evolution/status", endpoint=api_evolution_status),
+    Route("/api/evolution/first-boot", endpoint=api_first_boot, methods=["POST"]),
     WebSocketRoute("/ws/chat", endpoint=ws_chat),
     WebSocketRoute("/ws/terminal", endpoint=ws_terminal),
     *_custom_routes,   # Flux overlay: custom routes from custom/routes.py
