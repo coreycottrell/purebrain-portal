@@ -1,6 +1,18 @@
 {
-  "current_version": "1.2.1",
+  "current_version": "1.2.2",
   "releases": [
+    {
+      "version": "1.2.2",
+      "date": "2026-03-25",
+      "title": "Update UX Improvements",
+      "highlights": [
+        "Update check now shows target version and number of commits behind.",
+        "Confirm dialog displays current and target versions before applying.",
+        "Progress indicator shows human-readable step descriptions.",
+        "Success message shows new version with 5-second restart countdown.",
+        "Failure message includes rollback details and error information."
+      ]
+    },
     {
       "version": "1.2.1",
       "date": "2026-03-25",
