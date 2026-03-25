@@ -12,6 +12,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -1579,6 +1580,7 @@ _PANE_CACHE_TTL = 10.0
 
 def _find_primary_pane():
     """Find the tmux pane ID running the primary Claude Code instance.
+    Scans ALL windows (-s) and prefers the pane where claude is running.
     Result cached for 10s to avoid subprocess calls on every poll."""
     global _pane_cache
     now = time.time()
@@ -1586,38 +1588,57 @@ def _find_primary_pane():
         return _pane_cache[1]
     session = get_tmux_session()
     try:
-        # List all panes with their IDs
+        # List all panes across all windows with their current command
         out = subprocess.check_output(
-            ["tmux", "list-panes", "-t", session, "-F", "#{pane_id}"],
+            ["tmux", "list-panes", "-s", "-t", session,
+             "-F", "#{pane_id} #{pane_current_command}"],
             stderr=subprocess.DEVNULL, text=True, timeout=3
         )
         panes = [p.strip() for p in out.splitlines() if p.strip()]
         if not panes:
             _pane_cache = (now, session)
             return session
-        _pane_cache = (now, panes[0])
-        return panes[0]
+        # Prefer the pane where claude is actually running
+        for entry in panes:
+            parts = entry.split(None, 1)
+            if len(parts) == 2 and "claude" in parts[1].lower():
+                _pane_cache = (now, parts[0])
+                return parts[0]
+        # Fallback to last pane (most recently created window)
+        fallback = panes[-1].split(None, 1)[0]
+        _pane_cache = (now, fallback)
+        return fallback
     except Exception:
         _pane_cache = (now, session)
         return session
 
 
 async def _find_primary_pane_async():
-    """Async version of _find_primary_pane — use from async functions."""
+    """Async version of _find_primary_pane — use from async functions.
+    Scans ALL windows (-s) and prefers the pane where claude is running."""
     global _pane_cache
     now = time.time()
     if now - _pane_cache[0] < _PANE_CACHE_TTL and _pane_cache[1]:
         return _pane_cache[1]
     session = get_tmux_session()
     out = await _run_subprocess_output(
-        ["tmux", "list-panes", "-t", session, "-F", "#{pane_id}"], timeout=3
+        ["tmux", "list-panes", "-s", "-t", session,
+         "-F", "#{pane_id} #{pane_current_command}"], timeout=3
     )
     panes = [p.strip() for p in out.splitlines() if p.strip()] if out else []
     if not panes:
         _pane_cache = (now, session)
         return session
-    _pane_cache = (now, panes[0])
-    return panes[0]
+    # Prefer the pane where claude is actually running
+    for entry in panes:
+        parts = entry.split(None, 1)
+        if len(parts) == 2 and "claude" in parts[1].lower():
+            _pane_cache = (now, parts[0])
+            return parts[0]
+    # Fallback to last pane (most recently created window)
+    fallback = panes[-1].split(None, 1)[0]
+    _pane_cache = (now, fallback)
+    return fallback
 
 
 async def ws_terminal(websocket: WebSocket) -> None:
@@ -7397,10 +7418,19 @@ async def api_first_boot(request: Request) -> JSONResponse:
 
     try:
         cmd = f"cd $HOME && claude --dangerously-skip-permissions \"$(cat '{FIRST_BOOT_PROMPT_FILE}')\""
-        subprocess.run(["tmux", "send-keys", "-t", evo_pane, "-l", cmd],
-                       check=True, stderr=subprocess.DEVNULL)
-        subprocess.run(["tmux", "send-keys", "-t", evo_pane, "Enter"],
-                       check=True, stderr=subprocess.DEVNULL)
+        # Use load-buffer + paste-buffer to avoid send-keys truncation on long commands
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tf:
+            tf.write(cmd)
+            tf_path = tf.name
+        try:
+            subprocess.run(["tmux", "load-buffer", tf_path],
+                           check=True, stderr=subprocess.DEVNULL)
+            subprocess.run(["tmux", "paste-buffer", "-t", evo_pane],
+                           check=True, stderr=subprocess.DEVNULL)
+            subprocess.run(["tmux", "send-keys", "-t", evo_pane, "Enter"],
+                           check=True, stderr=subprocess.DEVNULL)
+        finally:
+            os.unlink(tf_path)
 
         FIRST_BOOT_FIRED_FILE.write_text(f"fired at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
 
