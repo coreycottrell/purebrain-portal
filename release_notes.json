@@ -1,6 +1,16 @@
 {
-  "current_version": "1.2.3",
+  "current_version": "1.2.4",
   "releases": [
+    {
+      "version": "1.2.4",
+      "date": "2026-03-25",
+      "title": "Update Flow QA — User-Initiated Only",
+      "highlights": [
+        "Updates are now fully user-initiated — no auto-check on page load.",
+        "Users must click Check for Updates in settings to detect new versions.",
+        "Prevents silent updates that bypass confirmation and progress display."
+      ]
+    },
     {
       "version": "1.2.3",
       "date": "2026-03-25",
