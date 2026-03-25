@@ -1,6 +1,16 @@
 {
-  "current_version": "1.2.0",
+  "current_version": "1.2.1",
   "releases": [
+    {
+      "version": "1.2.1",
+      "date": "2026-03-25",
+      "title": "Bug Fixes & Polish",
+      "highlights": [
+        "Fixed persistent red notification badge on settings gear icon.",
+        "Settings gear badge now auto-dismisses after version is seen.",
+        "Update check clears stale badges on up-to-date status."
+      ]
+    },
     {
       "version": "1.2.0",
       "date": "2026-03-24",
