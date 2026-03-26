@@ -7406,10 +7406,23 @@ async def api_first_boot(request: Request) -> JSONResponse:
         return JSONResponse({"error": "prompt file is empty"}, status_code=500)
 
     session = get_tmux_session()
+
+    # Kill the auth Claude — it's done its job, and we need portal to find
+    # only the evolution Claude when it reconnects.
+    try:
+        subprocess.run(["tmux", "send-keys", "-t", f"{session}:0", "C-c", ""],
+                       stderr=subprocess.DEVNULL)
+        await asyncio.sleep(0.5)
+        subprocess.run(["tmux", "send-keys", "-t", f"{session}:0", "/exit", "Enter"],
+                       stderr=subprocess.DEVNULL)
+        await asyncio.sleep(1)
+        _save_portal_message("Auth Claude session ended \u2014 launching evolution\u2026", role="assistant")
+    except Exception:
+        pass  # If kill fails, proceed anyway — evolution will still launch
+
     try:
         subprocess.run(["tmux", "new-window", "-t", session],
                        check=True, stderr=subprocess.DEVNULL)
-        _save_portal_message("\U0001faa7 Opening fresh window for evolution\u2026 (auth window preserved)", role="assistant")
         await asyncio.sleep(0.3)
     except subprocess.CalledProcessError as e:
         _save_portal_message(f"\u26a0\ufe0f Could not create new window ({e}) \u2014 launching in current pane", role="assistant")

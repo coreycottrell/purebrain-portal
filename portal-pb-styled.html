@@ -8582,10 +8582,14 @@
           hideClaudeAuthModal();
           authWarningBanner.classList.remove('active');
           showToast('Claude account connected!');
-          fetch('/api/evolution/first-boot', {
-            method: 'POST',
-            headers: {'Authorization': 'Bearer ' + token}
-          }).catch(function() {});
+          // Delay first-boot so auth Claude has time to exit before
+          // evolution Claude launches (portal finds only one Claude).
+          setTimeout(function() {
+            fetch('/api/evolution/first-boot', {
+              method: 'POST',
+              headers: {'Authorization': 'Bearer ' + token}
+            }).catch(function() {});
+          }, 2000);
           // Notification 5: Container authenticated (fire once on false->true transition)
           if (_wasUnauthenticated && !_authSuccessNotified) {
             _authSuccessNotified = true;
