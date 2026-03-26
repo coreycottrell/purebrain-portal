@@ -7407,36 +7407,19 @@ async def api_first_boot(request: Request) -> JSONResponse:
 
     session = get_tmux_session()
 
-    # Kill the auth Claude — it's done its job, and we need portal to find
-    # only the evolution Claude when it reconnects.
+    # Kill the auth Claude with double Ctrl-C, then launch evolution in SAME pane.
+    # No new window -- portal terminal stays on pane 0 the whole time.
+    evo_pane = f"{session}:0"
     try:
-        subprocess.run(["tmux", "send-keys", "-t", f"{session}:0", "C-c", ""],
+        subprocess.run(["tmux", "send-keys", "-t", evo_pane, "C-c", ""],
                        stderr=subprocess.DEVNULL)
-        await asyncio.sleep(0.5)
-        subprocess.run(["tmux", "send-keys", "-t", f"{session}:0", "/exit", "Enter"],
-                       stderr=subprocess.DEVNULL)
-        await asyncio.sleep(1)
-        _save_portal_message("Auth Claude session ended \u2014 launching evolution\u2026", role="assistant")
-    except Exception:
-        pass  # If kill fails, proceed anyway — evolution will still launch
-
-    try:
-        subprocess.run(["tmux", "new-window", "-t", session],
-                       check=True, stderr=subprocess.DEVNULL)
         await asyncio.sleep(0.3)
-    except subprocess.CalledProcessError as e:
-        _save_portal_message(f"\u26a0\ufe0f Could not create new window ({e}) \u2014 launching in current pane", role="assistant")
-
-    # Get the pane of the newly created window (not the auth window running Claude)
-    # After tmux new-window, the new window is active — display-message returns its pane ID
-    try:
-        result = subprocess.run(
-            ["tmux", "display-message", "-t", session, "-p", "#{pane_id}"],
-            capture_output=True, text=True, timeout=3
-        )
-        evo_pane = result.stdout.strip()
+        subprocess.run(["tmux", "send-keys", "-t", evo_pane, "C-c", ""],
+                       stderr=subprocess.DEVNULL)
+        await asyncio.sleep(2)
+        _save_portal_message("Auth Claude ended -- launching evolution...", role="assistant")
     except Exception:
-        evo_pane = _find_primary_pane()  # fallback
+        pass
 
     try:
         cmd = f"cd $HOME && claude --dangerously-skip-permissions \"$(cat '{FIRST_BOOT_PROMPT_FILE}')\""
