@@ -7227,6 +7227,12 @@ async def api_update_check(request: Request) -> JSONResponse:
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    # Auto-configure origin remote if not set (common on fresh non-git-clone deployments)
+    rc_check, _ = await _git_cmd(["remote", "get-url", "origin"])
+    if rc_check != 0:
+        await _git_cmd(["remote", "add", "origin",
+                        "https://github.com/coreycottrell/purebrain-portal.git"])
+
     # Fetch from remote
     rc, _ = await _git_cmd(["fetch", "origin", "main", "--quiet"], timeout=30)
     if rc != 0:
