@@ -43,7 +43,7 @@ PORTAL_HTML = SCRIPT_DIR / "portal.html"
 PORTAL_PB_HTML = SCRIPT_DIR / "portal-pb-styled.html"
 REACT_DIST = SCRIPT_DIR / "react-portal" / "dist"
 START_TIME = time.time()
-PORTAL_VERSION = "1.0.1"
+PORTAL_VERSION = "1.3.0"
 RELEASE_NOTES_FILE = SCRIPT_DIR / "release_notes.json"
 # Auto-detect CIV_NAME and HUMAN_NAME from identity file — works in any fleet container.
 # Falls back to generic defaults if identity file not found (local dev).
@@ -4340,18 +4340,30 @@ async def api_referral_paypal_email(request: Request) -> JSONResponse:
 
 
 async def api_referral_leaderboard(request: Request) -> JSONResponse:
-    """GET /api/referral/leaderboard — top referrers by completed referrals."""
+    """GET /api/referral/leaderboard -- top referrers by completed referrals.
+
+    FIX (2026-03-31): Use subqueries instead of double LEFT JOIN to avoid
+    cartesian product between referrals and rewards tables.
+    """
     limit = min(int(request.query_params.get("limit", "10")), 50)
 
     async with _referral_db() as db:
         cur = await db.execute(
             """SELECT r.user_name, r.referral_code,
-                      COUNT(ref.id) AS completed_count,
-                      COALESCE(SUM(rw.reward_value), 0) AS total_earned
+                      COALESCE(ref_counts.completed_count, 0) AS completed_count,
+                      COALESCE(rw_totals.total_earned, 0) AS total_earned
                FROM referrers r
-               LEFT JOIN referrals ref ON ref.referrer_id = r.id AND ref.status = 'completed'
-               LEFT JOIN rewards rw ON rw.referrer_id = r.id
-               GROUP BY r.id
+               LEFT JOIN (
+                   SELECT referrer_id, COUNT(*) AS completed_count
+                   FROM referrals
+                   WHERE status = 'completed'
+                   GROUP BY referrer_id
+               ) ref_counts ON ref_counts.referrer_id = r.id
+               LEFT JOIN (
+                   SELECT referrer_id, SUM(reward_value) AS total_earned
+                   FROM rewards
+                   GROUP BY referrer_id
+               ) rw_totals ON rw_totals.referrer_id = r.id
                ORDER BY completed_count DESC, total_earned DESC
                LIMIT ?""",
             (limit,)
@@ -7443,6 +7455,16 @@ async def _run_update(job_id: str):
                         f"ABORT: {pf} is tracked by git. This file must be gitignored."
                     )
 
+        # Step 7b: VERIFY IDENTITY DIRS NOT TRACKED
+        for identity_dir in ["memories", ".claude"]:
+            rc_ls, ls_out = await _git_cmd(["ls-files", identity_dir])
+            if rc_ls == 0 and ls_out.strip():
+                raise RuntimeError(
+                    f"ABORT: Files inside {identity_dir}/ are tracked by git. "
+                    f"Identity/memory files must be gitignored to prevent overwrite. "
+                    f"Tracked: {ls_out.strip()[:200]}"
+                )
+
         # Step 8: PULL (fast-forward only)
         _update_step("pull")
         _log_update(f"[{job_id}] Step 8: Pulling with --ff-only...")
@@ -7664,6 +7686,337 @@ async def api_first_boot(request: Request) -> JSONResponse:
         return JSONResponse({"error": f"tmux error: {e}"}, status_code=500)
 
 
+# ---------------------------------------------------------------------------
+# Agent Control Hub endpoints (additive — does not modify existing endpoints)
+# ---------------------------------------------------------------------------
+
+# ── Hub Tasks & Weekly Usage ──────────────────────────────────────────────
+
+async def api_hub_tasks(request: Request) -> JSONResponse:
+    """GET /api/hub/tasks — return active project-level tasks for the Agent Hub."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    tasks_file = SCRIPT_DIR / "hub_tasks.json"
+    if tasks_file.exists():
+        try:
+            data = json.loads(tasks_file.read_text())
+            return JSONResponse(data)
+        except Exception:
+            pass
+    return JSONResponse({"tasks": []})
+
+
+async def api_hub_tasks_update(request: Request) -> JSONResponse:
+    """POST /api/hub/tasks — update project-level tasks."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+        tasks_file = SCRIPT_DIR / "hub_tasks.json"
+        tasks_file.write_text(json.dumps(body, indent=2))
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_hub_weekly_usage(request: Request) -> JSONResponse:
+    """GET /api/hub/weekly-usage — return weekly API usage percentage."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    usage_file = SCRIPT_DIR / "hub_weekly_usage.json"
+    if usage_file.exists():
+        try:
+            data = json.loads(usage_file.read_text())
+            return JSONResponse(data)
+        except Exception:
+            pass
+    return JSONResponse({"percent": 0})
+
+
+async def api_hub_weekly_usage_update(request: Request) -> JSONResponse:
+    """POST /api/hub/weekly-usage — update weekly usage percentage."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+        usage_file = SCRIPT_DIR / "hub_weekly_usage.json"
+        usage_file.write_text(json.dumps(body, indent=2))
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ── Live Sub-Agents ───────────────────────────────────────────────────────
+
+# Auto-detect agent tasks dir (works across fleet containers)
+_AGENT_TASKS_DIR_CANDIDATES = [
+    Path(f"/tmp/claude-{os.getuid()}/-home-aiciv-civ/tasks"),
+    Path(f"/tmp/claude-{os.getuid()}/tasks"),
+    Path.home() / ".claude" / "tasks",
+]
+AGENT_TASKS_DIR = next((p for p in _AGENT_TASKS_DIR_CANDIDATES if p.exists()), _AGENT_TASKS_DIR_CANDIDATES[0])
+
+
+async def api_hub_live_agents(request: Request) -> JSONResponse:
+    """GET /api/hub/live-agents — list currently running sub-agents."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    agents = []
+    if not AGENT_TASKS_DIR.exists():
+        return JSONResponse({"agents": agents})
+
+    now = time.time()
+    for entry in AGENT_TASKS_DIR.iterdir():
+        if not entry.name.endswith('.output'):
+            continue
+
+        try:
+            real_path = entry.resolve()
+            if not real_path.exists():
+                continue
+
+            mtime = real_path.stat().st_mtime
+            age_seconds = now - mtime
+
+            # Only include agents active in last 10 minutes
+            if age_seconds > 600:
+                continue
+
+            status = "running" if age_seconds < 120 else "idle"
+            agent_id = entry.name.replace('.output', '')
+
+            description = ""
+            agent_type = ""
+            started_at = ""
+            try:
+                with open(real_path, 'r') as f:
+                    for i, line in enumerate(f):
+                        if i > 20:
+                            break
+                        try:
+                            msg = json.loads(line)
+                            if not agent_type and msg.get("slug"):
+                                agent_type = msg["slug"]
+                            if msg.get("agentId"):
+                                agent_id = msg["agentId"]
+                            if not started_at and msg.get("timestamp"):
+                                started_at = msg["timestamp"]
+                            if not description:
+                                inner = msg.get("message", {})
+                                if isinstance(inner, dict) and inner.get("role") == "user":
+                                    content = inner.get("content", "")
+                                    if isinstance(content, str) and len(content) > 10:
+                                        description = content[:100]
+                                    elif isinstance(content, list):
+                                        for item in content:
+                                            if isinstance(item, dict) and item.get("type") == "text":
+                                                txt = item.get("text", "")
+                                                if len(txt) > 10 and not txt.startswith("<command"):
+                                                    description = txt[:100]
+                                                    break
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+            except IOError:
+                pass
+
+            agents.append({
+                "id": agent_id,
+                "type": agent_type,
+                "description": description or f"Agent {agent_id[:8]}",
+                "status": status,
+                "started_at": started_at,
+            })
+        except (OSError, ValueError):
+            continue
+
+    agents.sort(key=lambda a: (0 if a["status"] == "running" else 1, a.get("started_at", "")))
+    return JSONResponse({"agents": agents})
+
+
+# ── Continue & Restart ────────────────────────────────────────────────────
+
+async def api_hub_continue(request: Request) -> JSONResponse:
+    """POST /api/continue — continue the last conversation with fresh context."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        # Kill any existing primary sessions first
+        try:
+            old = await _run_subprocess_output(
+                ["tmux", "list-sessions", "-F", "#{session_name}"], timeout=3
+            )
+            if old:
+                for s in old.splitlines():
+                    if s.startswith(f"{CIV_NAME}-primary"):
+                        await _run_subprocess_async(["tmux", "kill-session", "-t", s])
+        except Exception:
+            pass
+
+        tmux_session = f"{CIV_NAME}-primary"
+        project_dir = str(Path.home())
+        marker = Path.home() / ".current_session"
+        marker.write_text(tmux_session)
+        # Use default model — each CIV may have different config
+        model_file = Path.home() / ".claude_session_model"
+        model = model_file.read_text().strip() if model_file.exists() else "claude-sonnet-4-6[1m]"
+        claude_cmd = (
+            f"claude --model {model} --dangerously-skip-permissions "
+            f"--continue"
+        )
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: subprocess.Popen(
+            ["tmux", "new-session", "-d", "-s", tmux_session, "-c", project_dir, claude_cmd],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ))
+        return JSONResponse({
+            "status": "continuing",
+            "tmux": tmux_session,
+            "message": f"Continuing last conversation with fresh context: {tmux_session}"
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_hub_restart(request: Request) -> JSONResponse:
+    """POST /api/restart — launch a fresh Claude instance."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        tmux_session = f"{CIV_NAME}-primary-{timestamp}"
+        project_dir = str(Path.home())
+        # Kill any stale sessions
+        try:
+            old = await _run_subprocess_output(
+                ["tmux", "list-sessions", "-F", "#{session_name}"], timeout=3
+            )
+            if old:
+                for s in old.splitlines():
+                    if s.startswith(f"{CIV_NAME}-primary-"):
+                        await _run_subprocess_async(["tmux", "kill-session", "-t", s])
+        except Exception:
+            pass
+        marker = Path.home() / ".current_session"
+        marker.write_text(tmux_session)
+        model_file = Path.home() / ".claude_session_model"
+        model = model_file.read_text().strip() if model_file.exists() else "claude-sonnet-4-6[1m]"
+        claude_cmd = (
+            f"claude --model {model} --dangerously-skip-permissions"
+        )
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: subprocess.Popen(
+            ["tmux", "new-session", "-d", "-s", tmux_session, "-c", project_dir, claude_cmd],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ))
+        return JSONResponse({"status": "restarting", "tmux": tmux_session})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ── Debug Report ──────────────────────────────────────────────────────────
+
+async def api_hub_debug_report(request: Request) -> JSONResponse:
+    """POST /api/debug/report — collect diagnostics and return as JSON."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    user_note = (body.get("note") or "").strip()
+
+    diag = []
+
+    # 1. Portal info
+    import platform
+    uptime_sec = time.time() - START_TIME
+    uptime_str = f"{int(uptime_sec // 3600)}h {int((uptime_sec % 3600) // 60)}m"
+    diag.append("=== PORTAL DIAGNOSTICS ===")
+    diag.append(f"CIV: {CIV_NAME}")
+    diag.append(f"Version: {PORTAL_VERSION}")
+    diag.append(f"Uptime: {uptime_str}")
+    diag.append(f"Python: {platform.python_version()}")
+    diag.append(f"Platform: {platform.platform()}")
+    diag.append(f"Timestamp: {datetime.now(timezone.utc).isoformat()}")
+
+    if user_note:
+        diag.append("\n=== USER NOTE ===")
+        diag.append(user_note)
+
+    # 2. Memory/disk
+    try:
+        import shutil
+        disk = shutil.disk_usage("/")
+        diag.append("\n=== SYSTEM ===")
+        diag.append(f"Disk: {disk.used // (1024**3)}GB / {disk.total // (1024**3)}GB ({disk.used * 100 // disk.total}%)")
+    except Exception as e:
+        diag.append(f"Disk info error: {e}")
+
+    try:
+        import resource
+        mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        diag.append(f"Portal RSS: {mem_mb:.0f} MB")
+    except Exception:
+        pass
+
+    # 3. Process count
+    try:
+        result = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            proc_count = len(result.stdout.strip().splitlines()) - 1
+            diag.append(f"Processes: {proc_count}")
+    except Exception:
+        pass
+
+    # 4. Tmux sessions
+    try:
+        result = subprocess.run(["tmux", "list-sessions"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            diag.append("\n=== TMUX SESSIONS ===")
+            diag.append(result.stdout.strip())
+    except Exception as e:
+        diag.append(f"Tmux error: {e}")
+
+    # 5. Recent portal log
+    log_path = SCRIPT_DIR / "portal.log"
+    if not log_path.exists():
+        log_path = Path("/tmp/portal.log")
+    try:
+        if log_path.exists():
+            lines = log_path.read_text().splitlines()
+            tail = lines[-100:] if len(lines) > 100 else lines
+            diag.append(f"\n=== PORTAL LOG (last {len(tail)} lines) ===")
+            diag.extend(tail)
+    except Exception as e:
+        diag.append(f"Log read error: {e}")
+
+    # 6. Recent errors
+    try:
+        if log_path.exists():
+            all_text = log_path.read_text()
+            error_lines = [l for l in all_text.splitlines() if any(w in l.lower() for w in ["error", "traceback", "exception"])]
+            if error_lines:
+                diag.append(f"\n=== ERRORS FOUND ({len(error_lines)} lines) ===")
+                diag.extend(error_lines[-20:])
+    except Exception:
+        pass
+
+    report_text = "\n".join(diag)
+    if len(report_text) > 50000:
+        report_text = report_text[:50000] + "\n\n[TRUNCATED -- full log exceeds 50KB]"
+
+    # Save report to file for later retrieval
+    report_file = SCRIPT_DIR / "debug-report-latest.txt"
+    try:
+        report_file.write_text(report_text)
+    except Exception:
+        pass
+
+    return JSONResponse({"ok": True, "report": report_text})
+
+
 # App
 # ---------------------------------------------------------------------------
 _react_assets_mount = (
@@ -7824,6 +8177,15 @@ routes = [
     Route("/api/update/status", endpoint=api_update_status),
     Route("/api/evolution/status", endpoint=api_evolution_status),
     Route("/api/evolution/first-boot", endpoint=api_first_boot, methods=["POST"]),
+    # ── Agent Control Hub routes (additive) ──
+    Route("/api/hub/tasks", endpoint=api_hub_tasks),
+    Route("/api/hub/tasks", endpoint=api_hub_tasks_update, methods=["POST"]),
+    Route("/api/hub/weekly-usage", endpoint=api_hub_weekly_usage),
+    Route("/api/hub/weekly-usage", endpoint=api_hub_weekly_usage_update, methods=["POST"]),
+    Route("/api/hub/live-agents", endpoint=api_hub_live_agents),
+    Route("/api/debug/report", endpoint=api_hub_debug_report, methods=["POST"]),
+    Route("/api/continue", endpoint=api_hub_continue, methods=["POST"]),
+    Route("/api/restart", endpoint=api_hub_restart, methods=["POST"]),
     WebSocketRoute("/ws/chat", endpoint=ws_chat),
     WebSocketRoute("/ws/terminal", endpoint=ws_terminal),
     *_custom_routes,   # Flux overlay: custom routes from custom/routes.py

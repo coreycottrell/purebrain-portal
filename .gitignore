@@ -53,6 +53,10 @@ bookmarks.json
 release_notes.json.local
 run_portal_patch.sh
 
+# CIV identity and memory (NEVER track -- overwrite = amnesia)
+memories/
+.claude/
+
 # CIV-specific custom overlay files (not tracked)
 custom/config.json
 custom/routes.py

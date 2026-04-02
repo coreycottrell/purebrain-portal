@@ -18085,6 +18085,663 @@ if (window.__welcome3DQueue) {
 })();
 </script>
 
+<!-- ===== AGENT CONTROL HUB — Additive Feature (Phase 1) ===== -->
+<style>
+  /* ===== AGENT CONTROL HUB SIDEBAR ===== */
+  .agent-hub-sidebar {
+    position: fixed; right: 0; top: 0; bottom: 0;
+    width: 280px; max-width: 280px;
+    background: rgba(14,16,21,0.95); backdrop-filter: blur(12px);
+    border-left: 1px solid var(--border);
+    display: flex; flex-direction: column; gap: 0;
+    overflow-y: auto; overflow-x: hidden;
+    transition: transform 0.25s ease, opacity 0.2s ease;
+    z-index: 1000; flex-shrink: 0;
+  }
+  .agent-hub-sidebar.agent-hub-collapsed {
+    transform: translateX(100%); opacity: 0;
+    pointer-events: none;
+  }
+  .agent-hub-title {
+    font-size: 0.82rem; font-weight: 700; color: var(--gold);
+    padding: 14px 16px 10px; letter-spacing: 0.04em;
+    text-transform: uppercase; border-bottom: 1px solid var(--border);
+  }
+  .agent-hub-section { padding: 12px 14px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+  .agent-hub-section-title {
+    font-size: 0.68rem; font-weight: 600; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px;
+  }
+  /* Agent Status Card */
+  .agent-hub-status-card {
+    background: var(--surface); border: 1px solid var(--border2);
+    border-radius: 10px; padding: 10px 12px;
+  }
+  .agent-hub-status-top { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .agent-hub-online-dot {
+    width: 8px; height: 8px; border-radius: 50%; background: #22c55e;
+    box-shadow: 0 0 6px rgba(34,197,94,0.5); flex-shrink: 0;
+  }
+  .agent-hub-online-dot.agent-hub-offline { background: #ef4444; box-shadow: 0 0 6px rgba(239,68,68,0.5); }
+  .agent-hub-online-label { font-size: 0.75rem; font-weight: 600; color: #22c55e; }
+  .agent-hub-online-label.agent-hub-offline { color: #ef4444; }
+  .agent-hub-uptime { font-size: 0.68rem; color: var(--text-dim); margin-left: auto; }
+  .agent-hub-rings-row { display: flex; justify-content: center; gap: 24px; }
+  .agent-hub-ring-wrap { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .agent-hub-ring {
+    position: relative; width: 62px; height: 62px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .agent-hub-ring svg { position: absolute; inset: 0; transform: rotate(-90deg); }
+  .agent-hub-ring-bg { fill: none; stroke: rgba(255,255,255,0.06); stroke-width: 5; }
+  .agent-hub-ring-fill { fill: none; stroke-width: 5; stroke-linecap: round; transition: stroke-dashoffset 0.6s ease; }
+  .agent-hub-ring-fill.agent-hub-ctx-color { stroke: var(--gold); }
+  .agent-hub-ring-fill.agent-hub-weekly-color { stroke: #00c896; }
+  .agent-hub-ring-pct {
+    font-size: 0.82rem; font-weight: 700; color: var(--text);
+    position: relative; z-index: 1;
+  }
+  .agent-hub-ring-label { font-size: 0.6rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.04em; }
+  /* Live Agents */
+  .agent-hub-agents-list { display: flex; flex-direction: column; gap: 4px; }
+  .agent-hub-agent-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 8px; border-radius: 6px;
+    background: rgba(255,255,255,0.02); font-size: 0.75rem;
+  }
+  .agent-hub-agent-row:hover { background: rgba(255,255,255,0.05); }
+  .agent-hub-agent-dot {
+    width: 6px; height: 6px; border-radius: 50%; background: #22c55e;
+    box-shadow: 0 0 4px rgba(34,197,94,0.4); flex-shrink: 0;
+  }
+  .agent-hub-agent-name { flex: 1; color: var(--text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .agent-hub-agent-time { color: var(--text-dim); font-size: 0.68rem; flex-shrink: 0; }
+  .agent-hub-agent-row.agent-hub-sub-agent { opacity: 0.9; }
+  .agent-hub-agent-row.agent-hub-sub-agent .agent-hub-agent-name { font-size: 0.68rem; }
+  .agent-hub-agent-dot.agent-hub-running { background: #22c55e; box-shadow: 0 0 6px rgba(34,197,94,0.6); animation: agent-hub-pulse-dot 2s ease-in-out infinite; }
+  .agent-hub-agent-dot.agent-hub-idle { background: #6b7280; box-shadow: none; }
+  @keyframes agent-hub-pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+  /* Quick Actions Grid */
+  .agent-hub-actions-grid {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 6px;
+  }
+  .agent-hub-action-btn {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 4px; padding: 8px 4px; border-radius: 8px;
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
+    color: var(--text-dim); cursor: pointer; transition: all 0.15s;
+    font-size: 0;
+  }
+  .agent-hub-action-btn:hover { background: rgba(255,255,255,0.07); border-color: rgba(255,255,255,0.12); color: var(--text); }
+  .agent-hub-action-btn svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+  .agent-hub-action-label { font-size: 0.6rem; font-weight: 500; line-height: 1.2; text-align: center; }
+  .agent-hub-action-btn.agent-hub-tint-red { color: #ef4444; border-color: rgba(239,68,68,0.15); }
+  .agent-hub-action-btn.agent-hub-tint-red:hover { background: rgba(239,68,68,0.1); border-color: rgba(239,68,68,0.3); }
+  .agent-hub-action-btn.agent-hub-tint-amber { color: #f59e0b; border-color: rgba(245,158,11,0.15); }
+  .agent-hub-action-btn.agent-hub-tint-amber:hover { background: rgba(245,158,11,0.1); border-color: rgba(245,158,11,0.3); }
+  .agent-hub-action-btn.agent-hub-tint-green { color: #22c55e; border-color: rgba(34,197,94,0.15); }
+  .agent-hub-action-btn.agent-hub-tint-green:hover { background: rgba(34,197,94,0.1); border-color: rgba(34,197,94,0.3); }
+  .agent-hub-action-btn.agent-hub-tint-blue { color: #3b82f6; border-color: rgba(59,130,246,0.15); }
+  .agent-hub-action-btn.agent-hub-tint-blue:hover { background: rgba(59,130,246,0.1); border-color: rgba(59,130,246,0.3); }
+  /* Activity Feed */
+  .agent-hub-activity-feed { display: flex; flex-direction: column; gap: 0; }
+  .agent-hub-activity-item {
+    display: flex; align-items: flex-start; gap: 8px;
+    padding: 6px 8px; border-left: 2px solid transparent; font-size: 0.72rem;
+  }
+  .agent-hub-activity-item.agent-hub-border-green { border-left-color: #22c55e; }
+  .agent-hub-activity-item.agent-hub-border-blue { border-left-color: #3b82f6; }
+  .agent-hub-activity-item.agent-hub-border-orange { border-left-color: #f59e0b; }
+  .agent-hub-activity-time { color: var(--text-dim); font-size: 0.65rem; flex-shrink: 0; min-width: 48px; }
+  .agent-hub-activity-text { color: var(--text); line-height: 1.3; }
+  /* Tasks */
+  .agent-hub-task-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
+  .agent-hub-task-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .agent-hub-task-dot.agent-hub-in-progress { background: #3b82f6; }
+  .agent-hub-task-dot.agent-hub-complete { background: #00c896; box-shadow: 0 0 4px #00c896; }
+  .agent-hub-task-dot.agent-hub-active { background: #2a93c1; box-shadow: 0 0 4px #2a93c1; }
+  .agent-hub-task-dot.agent-hub-queued { background: rgba(255,255,255,0.2); box-shadow: none; }
+  .agent-hub-task-info { flex: 1; min-width: 0; }
+  .agent-hub-task-name { font-size: 0.72rem; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .agent-hub-task-status { font-size: 0.6rem; color: var(--text-dim); }
+  .agent-hub-task-bar { flex: 0 0 60px; height: 4px; background: rgba(255,255,255,0.06); border-radius: 2px; overflow: hidden; }
+  .agent-hub-task-fill { height: 100%; border-radius: 2px; transition: width 0.4s ease; }
+  /* Hub Toggle FAB Button */
+  .agent-hub-toggle-fab {
+    position: fixed; right: 18px; bottom: 98px;
+    width: 48px; height: 48px; border-radius: 50%;
+    background: var(--gold); color: #fff; border: none;
+    box-shadow: 0 4px 16px rgba(42,147,193,0.35);
+    cursor: pointer; z-index: 1001;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.2s;
+  }
+  .agent-hub-toggle-fab:hover { transform: scale(1.08); box-shadow: 0 6px 20px rgba(42,147,193,0.5); }
+  .agent-hub-toggle-fab svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .agent-hub-toggle-fab.agent-hub-fab-open { right: 296px; }
+  /* Responsive: hide hub on small screens */
+  @media (max-width: 768px) {
+    .agent-hub-sidebar { display: none !important; }
+    .agent-hub-toggle-fab { display: none !important; }
+  }
+  /* Light mode adjustments */
+  body.light-mode .agent-hub-sidebar { background: rgba(240,242,248,0.95); border-left-color: #d0d4e0; }
+  body.light-mode .agent-hub-status-card { background: #fff; border-color: #d0d4e0; }
+  body.light-mode .agent-hub-action-btn { background: rgba(0,0,0,0.03); border-color: rgba(0,0,0,0.08); }
+  body.light-mode .agent-hub-agent-row { background: rgba(0,0,0,0.02); }
+  body.light-mode .agent-hub-agent-row:hover { background: rgba(0,0,0,0.05); }
+</style>
+
+<!-- Agent Control Hub Sidebar -->
+<aside class="agent-hub-sidebar agent-hub-collapsed" id="agentHubSidebar">
+  <div class="agent-hub-title">Agent Control Hub</div>
+
+  <!-- 1. Agent Status -->
+  <div class="agent-hub-section">
+    <div class="agent-hub-section-title">Agent Status</div>
+    <div class="agent-hub-status-card">
+      <div class="agent-hub-status-top">
+        <div class="agent-hub-online-dot" id="ahub-online-dot"></div>
+        <span class="agent-hub-online-label" id="ahub-online-label">Online</span>
+        <span class="agent-hub-uptime" id="ahub-uptime">Uptime: --</span>
+      </div>
+      <div class="agent-hub-rings-row">
+        <div class="agent-hub-ring-wrap">
+          <div class="agent-hub-ring">
+            <svg width="62" height="62" viewBox="0 0 62 62">
+              <circle class="agent-hub-ring-bg" cx="31" cy="31" r="24"/>
+              <circle class="agent-hub-ring-fill agent-hub-ctx-color" id="ahub-ctx-ring" cx="31" cy="31" r="24" stroke-dasharray="150.8" stroke-dashoffset="150.8"/>
+            </svg>
+            <span class="agent-hub-ring-pct" id="ahub-ctx-pct">--%</span>
+          </div>
+          <span class="agent-hub-ring-label" id="ahub-ctx-label">Context</span>
+        </div>
+        <div class="agent-hub-ring-wrap">
+          <div class="agent-hub-ring">
+            <svg width="62" height="62" viewBox="0 0 62 62">
+              <circle class="agent-hub-ring-bg" cx="31" cy="31" r="24"/>
+              <circle class="agent-hub-ring-fill agent-hub-weekly-color" id="ahub-weekly-ring" cx="31" cy="31" r="24" stroke-dasharray="150.8" stroke-dashoffset="150.8"/>
+            </svg>
+            <span class="agent-hub-ring-pct" id="ahub-weekly-pct">--%</span>
+          </div>
+          <span class="agent-hub-ring-label">Weekly Use</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2. Live Agents -->
+  <div class="agent-hub-section">
+    <div class="agent-hub-section-title" id="ahub-agents-title">Live Agents (0)</div>
+    <div class="agent-hub-agents-list" id="ahub-agents-list">
+      <div style="font-size:0.72rem;color:var(--text-dim);padding:4px 8px;">Loading...</div>
+    </div>
+  </div>
+
+  <!-- 3. Quick Actions -->
+  <div class="agent-hub-section">
+    <div class="agent-hub-section-title">Quick Actions</div>
+    <div class="agent-hub-actions-grid">
+      <button class="agent-hub-action-btn agent-hub-tint-red" id="ahub-kill-btn" title="Kill running process">
+        <svg viewBox="0 0 24 24"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>
+        <span class="agent-hub-action-label">Kill Process</span>
+      </button>
+      <button class="agent-hub-action-btn agent-hub-tint-amber" id="ahub-restart-btn" title="Restart agent">
+        <svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        <span class="agent-hub-action-label">Restart Agent</span>
+      </button>
+      <button class="agent-hub-action-btn" id="ahub-compact-btn" title="Compact memory">
+        <svg viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+        <span class="agent-hub-action-label">Compact Memory</span>
+      </button>
+      <button class="agent-hub-action-btn agent-hub-tint-green" id="ahub-diag-btn" title="Run diagnostics">
+        <svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        <span class="agent-hub-action-label">Run Diagnostics</span>
+      </button>
+      <button class="agent-hub-action-btn agent-hub-tint-red" id="ahub-debug-btn" title="Send debug report">
+        <svg viewBox="0 0 24 24"><path d="m8 2 1.88 1.88"/><path d="M14.12 3.88 16 2"/><path d="M9 7.13v-1a3.003 3.003 0 1 1 6 0v1"/><path d="M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6"/><path d="M12 20v-9"/><path d="M6.53 9C4.6 8.8 3 7.1 3 5"/><path d="M6 13H2"/><path d="M3 21c0-2.1 1.7-3.9 3.8-4"/><path d="M20.97 5c0 2.1-1.6 3.8-3.5 4"/><path d="M22 13h-4"/><path d="M17.2 17c2.1.1 3.8 1.9 3.8 4"/></svg>
+        <span class="agent-hub-action-label">Portal Debug</span>
+      </button>
+      <button class="agent-hub-action-btn agent-hub-tint-green" id="ahub-resume-btn" title="Resume last session">
+        <svg viewBox="0 0 24 24"><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>
+        <span class="agent-hub-action-label">Resume</span>
+      </button>
+      <button class="agent-hub-action-btn agent-hub-tint-blue" id="ahub-continue-btn" title="Continue last session">
+        <svg viewBox="0 0 24 24"><path d="M5 12h14"/><polyline points="12 5 19 12 12 19"/></svg>
+        <span class="agent-hub-action-label">Continue</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- 4. Recent Activity Feed -->
+  <div class="agent-hub-section">
+    <div class="agent-hub-section-title">Recent Activity</div>
+    <div class="agent-hub-activity-feed" id="ahub-activity-feed">
+      <div class="agent-hub-activity-item agent-hub-border-blue">
+        <span class="agent-hub-activity-time">--:--</span>
+        <span class="agent-hub-activity-text">Waiting for activity data...</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 5. Active Tasks -->
+  <div class="agent-hub-section">
+    <div class="agent-hub-section-title" id="ahub-tasks-title">Tasks (0 active)</div>
+    <div id="ahub-tasks-list">
+      <div style="font-size:0.72rem;color:var(--text-dim);padding:4px 8px;">Loading...</div>
+    </div>
+  </div>
+</aside>
+
+<!-- Agent Hub Toggle FAB -->
+<button class="agent-hub-toggle-fab" id="agentHubToggleFab" title="Toggle Agent Hub">
+  <svg viewBox="0 0 24 24"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg>
+</button>
+
+<!-- Agent Control Hub Logic -->
+<script>
+(function() {
+  'use strict';
+  var CIRCUMFERENCE = 2 * Math.PI * 24;
+  var REFRESH_INTERVAL = 30000;
+  var _ahubTimer = null;
+
+  function _ahubEsc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function getToken() {
+    return localStorage.getItem('pb_token') || localStorage.getItem('portal_token') || '';
+  }
+
+  function setRing(id, pct) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    var clamped = Math.max(0, Math.min(100, pct));
+    var offset = CIRCUMFERENCE - (clamped / 100) * CIRCUMFERENCE;
+    el.setAttribute('stroke-dashoffset', offset.toFixed(1));
+  }
+
+  function setText(id, text) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = text;
+  }
+
+  function setHtml(id, html) {
+    var el = document.getElementById(id);
+    if (el) el.innerHTML = html;
+  }
+
+  // ===== Load Hub Status =====
+  function loadHubStatus() {
+    var token = getToken();
+    if (!token) return;
+    fetch('/api/status', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    }).then(function(r) {
+      if (!r.ok) throw new Error('Not available');
+      return r.json();
+    }).then(function(d) {
+      var isOnline = d.tmux_alive || d.claude_running || false;
+
+      var uptimeSec = d.uptime || 0;
+      var days = Math.floor(uptimeSec / 86400);
+      var hours = Math.floor((uptimeSec % 86400) / 3600);
+      var mins = Math.floor((uptimeSec % 3600) / 60);
+      var uptimeStr = '';
+      if (days > 0) uptimeStr += days + 'd ';
+      if (hours > 0 || days > 0) uptimeStr += hours + 'h ';
+      uptimeStr += mins + 'm';
+
+      var dot = document.getElementById('ahub-online-dot');
+      var label = document.getElementById('ahub-online-label');
+      if (dot) { dot.classList.toggle('agent-hub-offline', !isOnline); }
+      if (label) { label.textContent = isOnline ? 'Online' : 'Offline'; label.classList.toggle('agent-hub-offline', !isOnline); }
+      setText('ahub-uptime', 'Uptime: ' + uptimeStr);
+    }).catch(function() {
+      var dot = document.getElementById('ahub-online-dot');
+      var label = document.getElementById('ahub-online-label');
+      if (dot) dot.classList.add('agent-hub-offline');
+      if (label) { label.textContent = 'Unavailable'; label.classList.add('agent-hub-offline'); }
+    });
+  }
+
+  // ===== Load Hub Weekly Usage =====
+  function loadHubWeeklyUsage() {
+    var token = getToken();
+    if (!token) return;
+    fetch('/api/hub/weekly-usage', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    }).then(function(r) {
+      if (!r.ok) throw new Error('Not available');
+      return r.json();
+    }).then(function(d) {
+      var pct = d.percent || 0;
+      setRing('ahub-weekly-ring', pct);
+      setText('ahub-weekly-pct', pct + '%');
+    }).catch(function() {
+      setText('ahub-weekly-pct', 'N/A');
+    });
+  }
+
+  // ===== Load Hub Context =====
+  function loadHubContext() {
+    var token = getToken();
+    if (!token) return;
+    fetch('/api/context', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    }).then(function(r) {
+      if (!r.ok) throw new Error('Not available');
+      return r.json();
+    }).then(function(d) {
+      var pct = Math.round(d.pct || d.percent || d.context_percent || 0);
+      var totalK = Math.round((d.total_tokens || 0) / 1000);
+      var ctxWindow = d.context_window || 200000;
+      var maxK = Math.round(ctxWindow / 1000);
+      var maxLabel = maxK >= 1000 ? (maxK / 1000) + 'M' : maxK + 'K';
+      setRing('ahub-ctx-ring', pct);
+      setText('ahub-ctx-pct', pct + '%');
+      setText('ahub-ctx-label', 'Context (' + maxLabel + ')');
+    }).catch(function() {
+      setText('ahub-ctx-pct', 'N/A');
+    });
+  }
+
+  // ===== Load Hub Agents =====
+  function loadHubAgents() {
+    var token = getToken();
+    if (!token) return;
+
+    Promise.all([
+      fetch('/api/panes', { headers: { 'Authorization': 'Bearer ' + token } }).then(function(r) { if (!r.ok) throw new Error(); return r.json(); }).catch(function() { return { panes: [] }; }),
+      fetch('/api/hub/live-agents', { headers: { 'Authorization': 'Bearer ' + token } }).then(function(r) { if (!r.ok) throw new Error(); return r.json(); }).catch(function() { return { agents: [] }; })
+    ]).then(function(results) {
+      var panes = results[0].panes || [];
+      var subAgents = results[1].agents || [];
+      var html = '';
+
+      if (panes.length > 0) {
+        panes.forEach(function(p) {
+          var name = p.title || ('Pane ' + p.id);
+          if (name.indexOf('Claude Code') !== -1) name = 'Primary Session';
+          html += '<div class="agent-hub-agent-row">' +
+            '<div class="agent-hub-agent-dot"></div>' +
+            '<span class="agent-hub-agent-name">' + _ahubEsc(name) + '</span>' +
+            '<span class="agent-hub-agent-time">live</span>' +
+            '</div>';
+        });
+      }
+
+      if (subAgents.length > 0) {
+        subAgents.forEach(function(a) {
+          var dotClass = a.status === 'running' ? 'agent-hub-agent-dot agent-hub-running' : 'agent-hub-agent-dot agent-hub-idle';
+          var statusLabel = a.status === 'running' ? 'active' : 'done';
+          var desc = a.description || 'Agent';
+          if (desc.length > 50) desc = desc.substring(0, 50) + '...';
+          html += '<div class="agent-hub-agent-row agent-hub-sub-agent">' +
+            '<div class="' + dotClass + '"></div>' +
+            '<span class="agent-hub-agent-name">' + _ahubEsc(desc) + '</span>' +
+            '<span class="agent-hub-agent-time">' + _ahubEsc(statusLabel) + '</span>' +
+            '</div>';
+        });
+      }
+
+      var runningCount = subAgents.filter(function(a) { return a.status === 'running'; }).length;
+      var totalCount = panes.length + runningCount;
+
+      if (!html) {
+        html = '<div style="font-size:0.72rem;color:var(--text-dim);padding:4px 8px;">No active sessions</div>';
+      }
+
+      setHtml('ahub-agents-list', html);
+      setText('ahub-agents-title', 'Live Agents (' + totalCount + ')');
+    }).catch(function() {
+      setHtml('ahub-agents-list', '<div style="font-size:0.72rem;color:var(--text-dim);padding:4px 8px;">Unavailable</div>');
+    });
+  }
+
+  // ===== Quick Action Handlers =====
+
+  // Kill Process
+  var killBtn = document.getElementById('ahub-kill-btn');
+  if (killBtn) killBtn.addEventListener('click', function() {
+    var token = getToken();
+    if (!token) return;
+    if (!confirm('Kill the running process? This sends Ctrl+C to the active terminal.')) return;
+    fetch('/api/terminal/signal', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ signal: 'C-c' })
+    }).then(function(r) { return r.json(); }).then(function(d) {
+      if (window.showToast) window.showToast(d.message || 'Signal sent');
+    }).catch(function() { if (window.showToast) window.showToast('Kill signal failed'); });
+  });
+
+  // Restart Agent
+  var restartBtn = document.getElementById('ahub-restart-btn');
+  if (restartBtn) restartBtn.addEventListener('click', function() {
+    var token = getToken();
+    if (!token) return;
+    if (!confirm('Restart the agent? This starts a fresh Claude session.')) return;
+    fetch('/api/restart', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token }
+    }).then(function(r) { return r.json(); }).then(function(d) {
+      if (window.showToast) window.showToast(d.message || 'Agent restarted');
+    }).catch(function() { if (window.showToast) window.showToast('Restart failed — endpoint may not be available yet'); });
+  });
+
+  // Compact Memory
+  var compactBtn = document.getElementById('ahub-compact-btn');
+  if (compactBtn) compactBtn.addEventListener('click', function() {
+    var token = getToken();
+    if (!token) return;
+    fetch('/api/chat/send', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: '/compact' })
+    }).then(function(r) { return r.json(); }).then(function() {
+      if (window.showToast) window.showToast('Compact command sent');
+    }).catch(function() { if (window.showToast) window.showToast('Compact failed'); });
+  });
+
+  // Run Diagnostics
+  var diagBtn = document.getElementById('ahub-diag-btn');
+  if (diagBtn) diagBtn.addEventListener('click', function() {
+    var token = getToken();
+    if (!token) return;
+    if (window.showToast) window.showToast('Running diagnostics...');
+    fetch('/api/status', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    }).then(function(r) { return r.json(); }).then(function(d) {
+      var uptSec = d.uptime || 0;
+      var dH = Math.floor(uptSec / 3600);
+      var dM = Math.floor((uptSec % 3600) / 60);
+      var msg = 'Tmux: ' + (d.tmux_alive ? 'alive' : 'dead') +
+        ' | Claude: ' + (d.claude_running ? 'running' : 'stopped') +
+        ' | TG Bot: ' + (d.tg_bot_running ? 'running' : 'stopped') +
+        ' | Uptime: ' + dH + 'h ' + dM + 'm';
+      if (window.showToast) window.showToast(msg);
+    }).catch(function() { if (window.showToast) window.showToast('Diagnostics failed'); });
+  });
+
+  // Portal Debug
+  var debugBtn = document.getElementById('ahub-debug-btn');
+  if (debugBtn) debugBtn.addEventListener('click', function() {
+    var note = prompt('Optional: describe the issue (or leave blank)');
+    if (note === null) return;
+    var token = getToken();
+    if (!token) return;
+    if (window.showToast) window.showToast('Generating debug report...');
+    fetch('/api/debug/report', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ note: note })
+    }).then(function(r) { return r.json(); }).then(function(d) {
+      if (d.ok) {
+        if (window.showToast) window.showToast('Debug report generated');
+      } else {
+        if (window.showToast) window.showToast('Failed: ' + (d.error || 'unknown'));
+      }
+    }).catch(function() { if (window.showToast) window.showToast('Debug report failed — endpoint may not be available yet'); });
+  });
+
+  // Resume
+  var resumeBtn = document.getElementById('ahub-resume-btn');
+  if (resumeBtn) resumeBtn.addEventListener('click', function() {
+    var token = getToken();
+    if (!token) return;
+    fetch('/api/resume', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token }
+    }).then(function(r) { return r.json(); }).then(function(d) {
+      if (d.error) { if (window.showToast) window.showToast('Resume failed: ' + d.error); return; }
+      if (window.showToast) window.showToast(d.message || 'Resumed session');
+      var termNav = document.querySelector('[data-panel="terminal"]');
+      if (termNav) termNav.click();
+    }).catch(function() { if (window.showToast) window.showToast('Resume failed'); });
+  });
+
+  // Continue
+  var continueBtn = document.getElementById('ahub-continue-btn');
+  if (continueBtn) continueBtn.addEventListener('click', function() {
+    var token = getToken();
+    if (!token) return;
+    fetch('/api/continue', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token }
+    }).then(function(r) { return r.json(); }).then(function(d) {
+      if (d.error) { if (window.showToast) window.showToast('Continue failed: ' + d.error); return; }
+      if (window.showToast) window.showToast(d.message || 'Continued session');
+      var termNav = document.querySelector('[data-panel="terminal"]');
+      if (termNav) termNav.click();
+    }).catch(function() { if (window.showToast) window.showToast('Continue failed — endpoint may not be available yet'); });
+  });
+
+  // ===== Toggle Sidebar =====
+  var toggleFab = document.getElementById('agentHubToggleFab');
+  var sidebar = document.getElementById('agentHubSidebar');
+  if (toggleFab && sidebar) {
+    toggleFab.addEventListener('click', function() {
+      var isOpen = !sidebar.classList.contains('agent-hub-collapsed');
+      if (isOpen) {
+        sidebar.classList.add('agent-hub-collapsed');
+        toggleFab.classList.remove('agent-hub-fab-open');
+        toggleFab.innerHTML = '<svg viewBox="0 0 24 24"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg>';
+      } else {
+        sidebar.classList.remove('agent-hub-collapsed');
+        toggleFab.classList.add('agent-hub-fab-open');
+        toggleFab.innerHTML = '<svg viewBox="0 0 24 24"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>';
+      }
+    });
+  }
+
+  // ===== Load Hub Activity =====
+  function loadHubActivity() {
+    var token = getToken();
+    if (!token) return;
+    fetch('/api/chat/history', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    }).then(function(r) {
+      if (!r.ok) throw new Error('Not available');
+      return r.json();
+    }).then(function(data) {
+      var msgs = data.messages || data || [];
+      var recent = msgs.filter(function(m) { return m.role === 'assistant'; }).slice(-5).reverse();
+      var html = '';
+      var colors = ['agent-hub-border-blue', 'agent-hub-border-green', 'agent-hub-border-orange', 'agent-hub-border-blue', 'agent-hub-border-green'];
+      recent.forEach(function(m, i) {
+        var text = (m.text || m.content || '').substring(0, 60);
+        if ((m.text || m.content || '').length > 60) text += '...';
+        var ts = m.timestamp || m.ts || 0;
+        var timeStr = '--:--';
+        if (ts > 0) {
+          var dt = new Date(ts * 1000);
+          timeStr = dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+        }
+        html += '<div class="agent-hub-activity-item ' + colors[i % colors.length] + '">' +
+          '<span class="agent-hub-activity-time">' + _ahubEsc(timeStr) + '</span>' +
+          '<span class="agent-hub-activity-text">' + _ahubEsc(text) + '</span>' +
+          '</div>';
+      });
+      if (!html) html = '<div style="font-size:0.72rem;color:var(--text-dim);padding:4px 8px;">No recent activity</div>';
+      setHtml('ahub-activity-feed', html);
+    }).catch(function() {
+      setHtml('ahub-activity-feed', '<div style="font-size:0.72rem;color:var(--text-dim);padding:4px 8px;">Unavailable</div>');
+    });
+  }
+
+  // ===== Load Hub Tasks =====
+  function loadHubTasks() {
+    var token = getToken();
+    if (!token) return;
+    fetch('/api/hub/tasks', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    }).then(function(r) {
+      if (!r.ok) throw new Error('Not available');
+      return r.json();
+    }).then(function(data) {
+      var tasks = data.tasks || [];
+      var sorted = tasks.sort(function(a, b) {
+        var order = { in_progress: 0, queued: 1, complete: 2 };
+        return (order[a.status] || 3) - (order[b.status] || 3);
+      }).slice(0, 5);
+
+      var html = '';
+      if (sorted.length === 0) {
+        html = '<div style="font-size:0.72rem;color:var(--text-dim);padding:4px 8px;">No active tasks</div>';
+      } else {
+        sorted.forEach(function(t) {
+          var pct = Math.max(0, Math.min(100, parseInt(t.progress, 10) || 0));
+          var barColor = t.status === 'complete' ? '#00c896' :
+                         t.status === 'in_progress' ? '#2a93c1' :
+                         'rgba(255,255,255,0.15)';
+          var statusLabel = t.status === 'in_progress' ? 'In Progress' :
+                           t.status === 'complete' ? 'Complete' :
+                           t.status === 'queued' ? 'Queued' : t.status;
+          var dotClass = t.status === 'complete' ? 'agent-hub-complete' :
+                        t.status === 'in_progress' ? 'agent-hub-active' : 'agent-hub-queued';
+          html += '<div class="agent-hub-task-row">' +
+            '<span class="agent-hub-task-dot ' + dotClass + '"></span>' +
+            '<div class="agent-hub-task-info">' +
+            '<div class="agent-hub-task-name">' + _ahubEsc(t.name || 'Task') + '</div>' +
+            '<div class="agent-hub-task-status">' + _ahubEsc(statusLabel) + (t.detail ? ' — ' + _ahubEsc(t.detail) : '') + '</div>' +
+            '</div>' +
+            '<div class="agent-hub-task-bar"><div class="agent-hub-task-fill" style="width:' + pct + '%;background:' + barColor + '"></div></div>' +
+            '</div>';
+        });
+      }
+      var activeCount = sorted.filter(function(t) { return t.status === 'in_progress'; }).length;
+      setText('ahub-tasks-title', 'Tasks (' + activeCount + ' active)');
+      setHtml('ahub-tasks-list', html);
+    }).catch(function() {
+      setHtml('ahub-tasks-list', '<div style="font-size:0.72rem;color:var(--text-dim);padding:4px 8px;">Unavailable</div>');
+    });
+  }
+
+  // ===== Auto-refresh =====
+  function refreshHub() {
+    loadHubStatus();
+    loadHubWeeklyUsage();
+    loadHubContext();
+    loadHubAgents();
+    loadHubActivity();
+    loadHubTasks();
+  }
+
+  // Initial load
+  refreshHub();
+
+  // Periodic refresh
+  _ahubTimer = setInterval(refreshHub, REFRESH_INTERVAL);
+
+  // Expose for external use
+  window._refreshAgentHub = refreshHub;
+})();
+</script>
+<!-- ===== END AGENT CONTROL HUB ===== -->
+
 
 </body>
 </html>

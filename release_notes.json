@@ -1,6 +1,21 @@
 {
-  "current_version": "1.2.4",
+  "current_version": "1.3.0",
   "releases": [
+    {
+      "version": "1.3.0",
+      "date": "2026-04-02",
+      "title": "Agent Control Hub + Referral Fix",
+      "highlights": [
+        "NEW: Agent Control Hub — collapsible sidebar with real-time agent status, context/usage gauges, live agent list, and quick actions (kill, restart, compact, diagnostics, resume, continue).",
+        "NEW: 6 backend endpoints for hub data — /api/hub/tasks, /api/hub/weekly-usage, /api/hub/live-agents, /api/debug/report, /api/continue, /api/restart.",
+        "NEW: Auto-refresh every 30 seconds — agent status stays live without manual reload.",
+        "NEW: Floating toggle button (bottom-right) to open/close the hub panel.",
+        "FIX: Referral leaderboard SQL bug — cartesian product causing inflated counts (8 referrals showing as 64). Now uses pre-aggregated subqueries.",
+        "SECURITY: XSS protection on all hub dynamic content via HTML escaping.",
+        "All new CSS namespaced (agent-hub-*) — zero risk of style conflicts with existing panels.",
+        "Graceful degradation — hub features show 'Unavailable' if backend endpoints missing on older servers."
+      ]
+    },
     {
       "version": "1.2.4",
       "date": "2026-03-25",
