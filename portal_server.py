@@ -7360,6 +7360,32 @@ async def _run_update(job_id: str):
     """Execute the 11-step safe update algorithm as a background task."""
     previous_sha = None
     try:
+        # Step 1b: BACKUP IDENTITY (protect CIV memory from overwrite)
+        _update_step("backup_identity")
+        _log_update(f"[{job_id}] Step 1b: Backing up identity files...")
+        backup_script = Path.home() / "tools" / "backup_identity.sh"
+        if backup_script.exists():
+            loop = asyncio.get_event_loop()
+            try:
+                backup_result = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: subprocess.run(
+                            [str(backup_script)],
+                            timeout=30, capture_output=True, text=True,
+                        )
+                    ),
+                    timeout=35,
+                )
+                if backup_result.returncode == 0:
+                    _log_update(f"[{job_id}] Identity backup completed")
+                else:
+                    _log_update(f"[{job_id}] WARNING: Identity backup failed: {backup_result.stderr[:200]}")
+            except (asyncio.TimeoutError, Exception) as e:
+                _log_update(f"[{job_id}] WARNING: Identity backup error: {e}")
+        else:
+            _log_update(f"[{job_id}] WARNING: backup_identity.sh not found at {backup_script}")
+
         # Step 2: FETCH
         _update_step("fetch")
         _log_update(f"[{job_id}] Step 2: Fetching from origin...")
