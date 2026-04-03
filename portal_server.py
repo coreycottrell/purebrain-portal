@@ -97,6 +97,7 @@ CREDENTIALS_FILE = Path.home() / ".claude" / ".credentials.json"
 OAUTH_URL_PATTERN = re.compile(r'https://[^\s\x1b\x07\]]*oauth/authorize\?[^\s\x1b\x07\]]+')
 _captured_oauth_url = None
 _auth_prewarm_task = None  # background prewarm task handle
+_auth_flow_running = False  # lock to prevent concurrent auth flows
 
 # Auth flow v2 — screen detection patterns for state machine
 AUTH_SCREEN_PATTERNS = {
@@ -2113,23 +2114,41 @@ async def _run_auth_state_machine(pane: str) -> dict:
         _save_portal_message(f"[auth-v2] {msg}", role="assistant")
 
     while retry_count <= max_retries:
-        # --- Phase 1: Start Claude /login ---
+        # --- Phase 1: Clean slate + Start Claude /login ---
         log(f"Starting auth flow (attempt {retry_count + 1}/{max_retries + 1})")
+
+        # Kill ALL claude processes for a clean start
+        await _run_subprocess_output(
+            ["bash", "-c", "pkill -9 -f claude 2>/dev/null; true"],
+            timeout=5,
+        )
+        await asyncio.sleep(1.0)
+
+        # Kill and recreate tmux session for a clean pane
+        session_name = get_tmux_session()
+        log(f"Recreating tmux session '{session_name}' for clean pane")
+        await _run_subprocess_async(
+            ["bash", "-c", f"tmux kill-session -t {session_name} 2>/dev/null; true"]
+        )
+        await asyncio.sleep(0.5)
+        home_dir = str(Path.home())
+        await _run_subprocess_async(
+            ["tmux", "new-session", "-d", "-s", session_name, "-c", home_dir]
+        )
+        await asyncio.sleep(0.5)
+
+        # Re-find pane after session recreate
+        pane = await _find_primary_pane_async()
 
         # Resize tmux so URLs don't wrap
         await _run_subprocess_async(["tmux", "resize-window", "-t", pane, "-x", "500"])
         await asyncio.sleep(0.3)
 
-        claude_running = await _is_claude_running_async(pane)
-        if not claude_running:
-            log("Claude not running — launching 'claude /login'")
-            launch_cmd = f"cd {Path.home()} && claude /login"
-            await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "-l", launch_cmd], check=True)
-            await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
-        else:
-            log("Claude already running — sending /login")
-            await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "-l", "/login"], check=True)
-            await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
+        # Always launch fresh — no "already running" branch
+        log("Launching 'claude /login' in clean pane")
+        launch_cmd = f"cd {home_dir} && claude /login"
+        await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "-l", launch_cmd], check=True)
+        await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
 
         # --- Phase 2: Wait for screen and handle blockers ---
         phase_start = time.time()
@@ -2206,48 +2225,33 @@ async def api_claude_auth_start(request: Request) -> JSONResponse:
     """
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    global _captured_oauth_url
+    global _captured_oauth_url, _auth_flow_running
+    if _auth_flow_running:
+        return JSONResponse({"status": "already_running", "message": "Auth flow already in progress"})
+    _auth_flow_running = True
     _captured_oauth_url = None
-    pane = await _find_primary_pane_async()
-    _save_portal_message(f"Auth flow v2 started — {get_tmux_session()} (pane {pane})", role="assistant")
     try:
+        pane = await _find_primary_pane_async()
+        _save_portal_message(f"Auth flow v2 started — {get_tmux_session()} (pane {pane})", role="assistant")
         result = await _run_auth_state_machine(pane)
         return JSONResponse(result)
     except Exception as e:
         _save_portal_message(f"Auth flow v2 failed: {e}", role="assistant")
         return JSONResponse({"error": f"auth flow error: {e}"}, status_code=500)
+    finally:
+        _auth_flow_running = False
 
 
 async def api_claude_auth_prewarm(request: Request) -> JSONResponse:
     """Pre-warm Claude for faster auth. Called when portal page loads.
 
-    Starts `claude /login` in the background without waiting for URL.
-    When the human clicks Authenticate, Claude is already started and the
-    login menu is likely rendered, shaving 30-45s off the flow.
+    DISABLED: Prewarm causes stacked /login commands on page refresh,
+    leading to interactive prompt deadlocks. Auth starts cleanly from
+    api_claude_auth_start instead.
     """
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    global _auth_prewarm_task
-    # Don't start if already prewarming
-    if _auth_prewarm_task and not _auth_prewarm_task.done():
-        return JSONResponse({"status": "already_prewarming"})
-    pane = await _find_primary_pane_async()
-    _save_portal_message("Pre-warming Claude for auth...", role="assistant")
-    try:
-        # Resize tmux
-        await _run_subprocess_async(["tmux", "resize-window", "-t", pane, "-x", "500"])
-        await asyncio.sleep(0.3)
-        claude_running = await _is_claude_running_async(pane)
-        if not claude_running:
-            launch_cmd = f"cd {Path.home()} && claude /login"
-            await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "-l", launch_cmd], check=True)
-            await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
-            _save_portal_message("Pre-warm: Claude /login launched in background", role="assistant")
-        else:
-            _save_portal_message("Pre-warm: Claude already running", role="assistant")
-        return JSONResponse({"status": "prewarming"})
-    except Exception as e:
-        return JSONResponse({"error": f"prewarm failed: {e}"}, status_code=500)
+    return JSONResponse({"status": "disabled"})
 
 
 async def api_claude_auth_code(request: Request) -> JSONResponse:
