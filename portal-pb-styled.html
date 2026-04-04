@@ -8231,6 +8231,13 @@
     doAuth();
   }
 
+  // ===== MULTI-TERMINAL STATE (hoisted before boot/switchPanel to avoid undefined access) =====
+  // termSessions: { [tid]: { ws, reconnectTimer, paneEl } }
+  var termSessions = {};
+  var activeTermTid = 1;      // which tab is currently visible
+  var termTabCounter = 1;     // next tab id to assign
+  var MAX_TERM_TABS = 4;
+
   // ===== NAVIGATION =====
   function switchPanel(panel) {
     if (panel === activePanel) return;
@@ -8617,12 +8624,7 @@
   var wsStatus      = document.getElementById('ws-status');
   var termChromeTitle = document.getElementById('term-chrome-title');
 
-  // Multi-terminal state
-  // termSessions: { [tid]: { ws, reconnectTimer, paneEl } }
-  var termSessions = {};
-  var activeTermTid = 1;      // which tab is currently visible
-  var termTabCounter = 1;     // next tab id to assign
-  var MAX_TERM_TABS = 4;
+  // (termSessions, activeTermTid, termTabCounter, MAX_TERM_TABS declared above boot() to avoid hoisting bug)
 
   function updateHeaderDot() {
     var activeSession = termSessions[activeTermTid];
