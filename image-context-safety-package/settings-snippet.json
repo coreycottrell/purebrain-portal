@@ -1,0 +1,17 @@
+{
+  "_comment": "Merge this into your .claude/settings.json under hooks.PreToolUse",
+  "_install": "Add the Read matcher entry to your existing PreToolUse array, or create the array if it does not exist.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CIV_ROOT}/tools/warn-image-read.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

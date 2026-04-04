@@ -184,6 +184,22 @@ Browser → portal_server.py → tmux (Claude Code session)
 
 The portal is **local to the container**. It reads tmux panes, parses JSONL logs, and injects text into the active Claude Code session. No external APIs needed — everything happens on localhost.
 
+### 6. Install Image Context Safety Package
+
+```bash
+bash image-context-safety-package/install.sh --civ-root /home/aiciv
+```
+
+This installs a 4-layer defense against image context overflow crashes:
+1. **CLAUDE.md rules** — instructs Claude to never accumulate images in context
+2. **Cleanup script** — `tools/cleanup-context-images.sh` purges stale /tmp images
+3. **Cron job** — runs cleanup every 30 minutes automatically
+4. **Sub-agent pattern** — image analysis delegated to isolated agents with fresh context
+
+Without this, screenshot-heavy workflows can crash sessions with "image exceeds dimension limit" errors.
+
+---
+
 ## Source Tagging
 
 Messages sent from the portal are prefixed in tmux:
