@@ -2117,6 +2117,22 @@ async def _run_auth_state_machine(pane: str) -> dict:
         # --- Phase 1: Clean slate + Start Claude /login ---
         log(f"Starting auth flow (attempt {retry_count + 1}/{max_retries + 1})")
 
+        # Gracefully interrupt any running Claude process via Ctrl+C twice
+        # This handles the case where Claude is active after a page refresh
+        try:
+            await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "C-c"])
+            await asyncio.sleep(0.3)
+            await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "C-c"])
+            await asyncio.sleep(1.0)
+
+            # Handle any "are you sure?" / exit confirmation prompt by sending "y" + Enter
+            await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "-l", "y"])
+            await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"])
+            await asyncio.sleep(1.0)
+        except Exception:
+            # Pane may not exist yet on first attempt — that's fine
+            pass
+
         # Kill ALL claude processes for a clean start
         await _run_subprocess_output(
             ["bash", "-c", "pkill -9 -f claude 2>/dev/null; true"],
