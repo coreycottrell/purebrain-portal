@@ -121,6 +121,13 @@ AUTH_SCREEN_PATTERNS = {
         r'Trust this project|Do you want to trust',
         re.IGNORECASE,
     ),
+    'theme_picker': re.compile(
+        r'Choose (?:the |your )?(?:text )?style|'
+        r'Select (?:a |your )?theme|'
+        r'Dark mode|Light text on dark background|'
+        r"Let's get started",
+        re.IGNORECASE,
+    ),
     'logged_in': re.compile(
         r'Logged in as|Login successful|Successfully authenticated|'
         r'You are now logged in',
@@ -138,7 +145,7 @@ AUTH_SCREEN_PATTERNS = {
 }
 AUTH_SCREEN_PRIORITY = [
     'oauth_url', 'logged_in', 'csat_survey', 'update_prompt',
-    'trust_folder', 'login_menu', 'error', 'shell_prompt',
+    'trust_folder', 'theme_picker', 'login_menu', 'error', 'shell_prompt',
 ]
 
 if TOKEN_FILE.exists():
@@ -2085,11 +2092,44 @@ async def _dismiss_auth_blocker(pane: str, screen_type: str) -> bool:
 
 
 async def _kill_claude_process() -> None:
-    """Kill any running Claude process in this container."""
+    """Kill any running Claude process AND its descendants in this container.
+
+    Total kill — Corey constitutional rule (2026-04-07): "NO CLAUDE SESSION
+    MAY BE RUNNING WHEN THE AUTHENTICATE BUTTON IN THE PUREBRAIN-PORTAL AUTH
+    MODAL FIRES." Plain `pkill -f claude` is insufficient because it does
+    substring-matching on cmdline and misses orphaned MCP children like
+    `node .../playwright-mcp` whose cmdline does not contain "claude". Those
+    orphans hold stdio + lockfile handles and confuse the next claude spawn.
+    """
+    # Round 1: SIGKILL anything matching claude or known MCP children.
     await _run_subprocess_output(
-        ["bash", "-c", "pkill -f 'claude' 2>/dev/null; pkill -f 'node.*claude' 2>/dev/null; true"],
+        ["bash", "-c",
+         "pkill -9 -f 'claude' 2>/dev/null; "
+         "pkill -9 -f 'node.*claude' 2>/dev/null; "
+         "pkill -9 -f 'playwright-mcp' 2>/dev/null; "
+         "pkill -9 -f '@modelcontextprotocol' 2>/dev/null; "
+         "pkill -9 -f 'mcp-server' 2>/dev/null; "
+         "true"],
         timeout=5,
     )
+    # Verification loop — wait until pgrep -f claude returns nothing,
+    # up to ~3s. If anything survives, hammer it again.
+    for _ in range(6):
+        await asyncio.sleep(0.5)
+        out = await _run_subprocess_output(
+            ["bash", "-c", "pgrep -f 'claude' 2>/dev/null || true"],
+            timeout=3,
+        )
+        if not (out or "").strip():
+            return
+        # Survivors — hit them again, harder.
+        await _run_subprocess_output(
+            ["bash", "-c",
+             "pkill -9 -f 'claude' 2>/dev/null; "
+             "pkill -9 -f 'playwright-mcp' 2>/dev/null; "
+             "true"],
+            timeout=3,
+        )
 
 
 async def _run_auth_state_machine(pane: str) -> dict:
@@ -2133,12 +2173,12 @@ async def _run_auth_state_machine(pane: str) -> dict:
             # Pane may not exist yet on first attempt — that's fine
             pass
 
-        # Kill ALL claude processes for a clean start
-        await _run_subprocess_output(
-            ["bash", "-c", "pkill -9 -f claude 2>/dev/null; true"],
-            timeout=5,
-        )
-        await asyncio.sleep(1.0)
+        # Kill ALL claude processes (and MCP descendants) for a clean start.
+        # Uses _kill_claude_process which now does total kill + verification
+        # loop — Corey constitutional rule: zero claude processes may be
+        # running before the auth modal launches a fresh /login.
+        await _kill_claude_process()
+        await asyncio.sleep(0.5)
 
         # Kill and recreate tmux session for a clean pane
         session_name = get_tmux_session()
@@ -2153,7 +2193,14 @@ async def _run_auth_state_machine(pane: str) -> dict:
         )
         await asyncio.sleep(0.5)
 
-        # Re-find pane after session recreate
+        # Re-find pane after session recreate.
+        # CRITICAL: invalidate _pane_cache first — its 10s TTL will otherwise
+        # return the stale pane id of the pane we just destroyed via
+        # `tmux kill-session`, causing every subsequent `tmux send-keys` to
+        # fire into the void and time out at 45s. (Alfred/Tess incident
+        # 2026-04-07.)
+        global _pane_cache
+        _pane_cache = (0.0, "")
         pane = await _find_primary_pane_async()
 
         # Resize tmux so URLs don't wrap
@@ -2195,6 +2242,21 @@ async def _run_auth_state_machine(pane: str) -> dict:
                 await _dismiss_auth_blocker(pane, screen_type)
                 await asyncio.sleep(1.0)
                 continue
+
+            elif screen_type == 'theme_picker':
+                # Claude's first-run theme selector — accept the highlighted
+                # default with Enter so we can move on to the login menu.
+                log("Theme picker detected — accepting default (Enter)")
+                await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"])
+                await asyncio.sleep(1.0)
+                continue
+
+            elif screen_type == 'shell_prompt' and elapsed > 5.0:
+                # We launched `claude /login` but the pane is sitting at a
+                # shell prompt — claude crashed, exited, or never started.
+                # Don't burn the full 45s timeout; break to retry immediately.
+                log("Shell prompt detected after launch — claude not running, retrying")
+                break
 
             elif screen_type == 'login_menu' and not login_selected:
                 log("Login menu detected — selecting first option (Enter)")
