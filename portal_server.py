@@ -7970,6 +7970,45 @@ async def _git_cmd(args: list, timeout: int = 15) -> tuple:
         return (-1, str(e))
 
 
+_UPSTREAM_HTTPS = "https://github.com/coreycottrell/purebrain-portal.git"
+
+
+async def _ensure_git_repo() -> tuple:
+    """Auto-heal git configuration for update checks.
+
+    Handles three failure modes:
+      1. No .git directory (file-copy deployment) -> git init
+      2. No origin remote -> add HTTPS origin
+      3. SSH origin (git@...) that may fail without SSH config -> switch to HTTPS
+
+    Returns (ok: bool, message: str).
+    """
+    git_dir = SCRIPT_DIR / ".git"
+
+    # Step 1: Initialize git repo if missing
+    if not git_dir.exists():
+        rc, out = await _git_cmd(["init"])
+        if rc != 0:
+            return (False, f"git init failed: {out}")
+
+    # Step 2: Check origin remote
+    rc, url = await _git_cmd(["remote", "get-url", "origin"])
+    if rc != 0:
+        # No origin remote -- add HTTPS origin
+        rc, out = await _git_cmd(["remote", "add", "origin", _UPSTREAM_HTTPS])
+        if rc != 0:
+            return (False, f"Failed to add origin remote: {out}")
+    else:
+        # Origin exists -- if it's SSH, switch to HTTPS (public repo, no auth needed)
+        url = url.strip()
+        if url.startswith("git@") or url.startswith("ssh://"):
+            rc, out = await _git_cmd(["remote", "set-url", "origin", _UPSTREAM_HTTPS])
+            if rc != 0:
+                return (False, f"Failed to update SSH origin to HTTPS: {out}")
+
+    return (True, "ok")
+
+
 async def _get_current_version() -> str:
     """Read the current version from release_notes.json or fallback to PORTAL_VERSION."""
     try:
@@ -7986,18 +8025,21 @@ async def api_update_check(request: Request) -> JSONResponse:
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    # Auto-configure origin remote if not set (common on fresh non-git-clone deployments)
-    rc_check, _ = await _git_cmd(["remote", "get-url", "origin"])
-    if rc_check != 0:
-        await _git_cmd(["remote", "add", "origin",
-                        "https://github.com/coreycottrell/purebrain-portal.git"])
+    # Auto-heal git configuration (handles non-git-repo, missing remote, SSH origin)
+    ok, heal_msg = await _ensure_git_repo()
+    if not ok:
+        return JSONResponse({
+            "status": "error",
+            "error": f"Failed to configure git for updates: {heal_msg}",
+            "checked_at": now_iso,
+        })
 
     # Fetch from remote
-    rc, _ = await _git_cmd(["fetch", "origin", "main", "--quiet"], timeout=30)
+    rc, fetch_err = await _git_cmd(["fetch", "origin", "main", "--quiet"], timeout=30)
     if rc != 0:
         return JSONResponse({
             "status": "error",
-            "error": "Failed to fetch from remote (not a git repo or no remote configured)",
+            "error": f"Failed to fetch from remote: {fetch_err}",
             "checked_at": now_iso,
         })
 
@@ -8005,16 +8047,19 @@ async def api_update_check(request: Request) -> JSONResponse:
     rc_local, local_sha = await _git_cmd(["rev-parse", "HEAD"])
     rc_remote, remote_sha = await _git_cmd(["rev-parse", "origin/main"])
 
-    if rc_local != 0 or rc_remote != 0:
+    if rc_remote != 0:
         return JSONResponse({
             "status": "error",
-            "error": "Failed to read git HEAD or origin/main",
+            "error": "Failed to read origin/main after fetch",
             "checked_at": now_iso,
         })
 
+    # If HEAD doesn't exist (fresh git init, no commits), treat as "everything is new"
+    no_local_head = rc_local != 0
+
     current_version = await _get_current_version()
 
-    if local_sha == remote_sha:
+    if not no_local_head and local_sha == remote_sha:
         return JSONResponse({
             "status": "up_to_date",
             "current_version": current_version,
@@ -8023,8 +8068,15 @@ async def api_update_check(request: Request) -> JSONResponse:
         })
 
     # Get commits behind count and changelog
+    if no_local_head:
+        # No local commits -- show last 20 commits from origin/main
+        log_range = "origin/main"
+        log_limit = ["-20"]
+    else:
+        log_range = "HEAD..origin/main"
+        log_limit = []
     rc_log, log_output = await _git_cmd(
-        ["log", "HEAD..origin/main", "--format=%H|||%an|||%aI|||%s"],
+        ["log", log_range] + log_limit + ["--format=%H|||%an|||%aI|||%s"],
         timeout=15,
     )
     changelog = []
@@ -8044,7 +8096,7 @@ async def api_update_check(request: Request) -> JSONResponse:
     return JSONResponse({
         "status": "available",
         "current_version": current_version,
-        "current_sha": local_sha,
+        "current_sha": local_sha if not no_local_head else "0000000",
         "remote_sha": remote_sha,
         "commits_behind": commits_behind,
         "changelog": changelog,
@@ -8062,25 +8114,31 @@ async def api_update_apply(request: Request) -> JSONResponse:
     if _update_state["status"] == "in_progress":
         return JSONResponse({"status": "error", "error": "Update already in progress"})
 
+    # Ensure git is configured (auto-heal for non-git-clone deployments)
+    ok, heal_msg = await _ensure_git_repo()
+    if not ok:
+        return JSONResponse({"status": "error", "error": f"Git setup failed: {heal_msg}"})
+
     # Quick check: are we up to date?
     rc_local, local_sha = await _git_cmd(["rev-parse", "HEAD"])
     rc_remote, remote_sha = await _git_cmd(["rev-parse", "origin/main"])
     if rc_local == 0 and rc_remote == 0 and local_sha == remote_sha:
         return JSONResponse({"status": "error", "error": "Already up to date"})
 
-    # Check for uncommitted changes to tracked files
-    rc_status, status_output = await _git_cmd(["status", "--porcelain"])
-    if rc_status == 0 and status_output:
-        # Filter to only tracked file changes (not untracked '??')
-        tracked_changes = [
-            line for line in status_output.split("\n")
-            if line.strip() and not line.startswith("??")
-        ]
-        if tracked_changes:
-            return JSONResponse({
-                "status": "error",
-                "error": "Uncommitted changes to tracked files. Commit or stash before updating.",
-            })
+    # Check for uncommitted changes to tracked files (only if we have commits)
+    if rc_local == 0:
+        rc_status, status_output = await _git_cmd(["status", "--porcelain"])
+        if rc_status == 0 and status_output:
+            # Filter to only tracked file changes (not untracked '??')
+            tracked_changes = [
+                line for line in status_output.split("\n")
+                if line.strip() and not line.startswith("??")
+            ]
+            if tracked_changes:
+                return JSONResponse({
+                    "status": "error",
+                    "error": "Uncommitted changes to tracked files. Commit or stash before updating.",
+                })
 
     job_id = f"update-{datetime.now():%Y%m%d-%H%M%S}"
 
@@ -8090,9 +8148,9 @@ async def api_update_apply(request: Request) -> JSONResponse:
         "job_id": job_id,
         "step": "starting",
         "steps_completed": [],
-        "steps_remaining": ["fetch", "compare", "check_tree", "record_rollback",
-                            "verify_custom", "verify_preserved", "pull",
-                            "running_tests", "read_version", "restart"],
+        "steps_remaining": ["ensure_git", "fetch", "compare", "check_tree",
+                            "record_rollback", "verify_custom", "verify_preserved",
+                            "pull", "running_tests", "read_version", "restart"],
         "started_at": datetime.now(timezone.utc).isoformat(),
         "completed_at": None,
         "error": None,
@@ -8136,6 +8194,7 @@ def _log_update(message: str):
 async def _run_update(job_id: str):
     """Execute the 11-step safe update algorithm as a background task."""
     previous_sha = None
+    fresh_init = False  # True if repo was just git-init'd (no prior commits)
     try:
         # Step 1b: BACKUP IDENTITY (protect CIV memory from overwrite)
         _update_step("backup_identity")
@@ -8163,6 +8222,12 @@ async def _run_update(job_id: str):
         else:
             _log_update(f"[{job_id}] WARNING: backup_identity.sh not found at {backup_script}")
 
+        # Step 1c: ENSURE GIT REPO (auto-heal non-git-clone deployments)
+        _update_step("ensure_git")
+        ok, heal_msg = await _ensure_git_repo()
+        if not ok:
+            raise RuntimeError(f"Git setup failed: {heal_msg}")
+
         # Step 2: FETCH
         _update_step("fetch")
         _log_update(f"[{job_id}] Step 2: Fetching from origin...")
@@ -8174,74 +8239,97 @@ async def _run_update(job_id: str):
         _update_step("compare")
         rc_local, local_sha = await _git_cmd(["rev-parse", "HEAD"])
         rc_remote, remote_sha = await _git_cmd(["rev-parse", "origin/main"])
-        if rc_local != 0 or rc_remote != 0:
-            raise RuntimeError("Failed to read git SHAs")
-        if local_sha == remote_sha:
+        if rc_remote != 0:
+            raise RuntimeError("Failed to read origin/main SHA")
+        if rc_local != 0:
+            # Fresh init -- no HEAD yet, everything from origin/main is new
+            fresh_init = True
+            local_sha = "0000000"
+            _log_update(f"[{job_id}] Fresh install detected (no local HEAD)")
+        elif local_sha == remote_sha:
             raise RuntimeError("Already up to date")
 
-        # Step 4: CHECK WORKING TREE
+        # Step 4: CHECK WORKING TREE (skip for fresh init -- no tracked files)
         _update_step("check_tree")
-        rc_status, status_output = await _git_cmd(["status", "--porcelain"])
-        if rc_status == 0 and status_output:
-            tracked = [l for l in status_output.split("\n") if l.strip() and not l.startswith("??")]
-            if tracked:
-                raise RuntimeError(f"Uncommitted tracked changes: {'; '.join(tracked[:3])}")
+        if not fresh_init:
+            rc_status, status_output = await _git_cmd(["status", "--porcelain"])
+            if rc_status == 0 and status_output:
+                tracked = [l for l in status_output.split("\n") if l.strip() and not l.startswith("??")]
+                if tracked:
+                    raise RuntimeError(f"Uncommitted tracked changes: {'; '.join(tracked[:3])}")
 
         # Step 5: RECORD ROLLBACK POINT
         _update_step("record_rollback")
-        previous_sha = local_sha
+        previous_sha = local_sha if not fresh_init else None
         _update_state["previous_sha"] = previous_sha
-        _log_update(f"[{job_id}] Rollback point: {previous_sha}")
+        _log_update(f"[{job_id}] Rollback point: {previous_sha or 'none (fresh install)'}")
 
-        # Step 6: VERIFY CUSTOM DIRECTORY
+        # Step 6: VERIFY CUSTOM DIRECTORY (skip for fresh init -- no git index yet)
         _update_step("verify_custom")
-        custom_dir = SCRIPT_DIR / "custom"
-        if custom_dir.exists():
-            # Check that custom/ files are NOT tracked by git
-            for check_file in ["custom/config.json", "custom/routes.py"]:
-                rc_check, _ = await _git_cmd(["ls-files", "--error-unmatch", check_file])
-                if rc_check == 0:
-                    raise RuntimeError(
-                        f"ABORT: {check_file} is tracked by git. .gitignore may be broken."
-                    )
+        if not fresh_init:
+            custom_dir = SCRIPT_DIR / "custom"
+            if custom_dir.exists():
+                # Check that custom/ files are NOT tracked by git
+                for check_file in ["custom/config.json", "custom/routes.py"]:
+                    rc_check, _ = await _git_cmd(["ls-files", "--error-unmatch", check_file])
+                    if rc_check == 0:
+                        raise RuntimeError(
+                            f"ABORT: {check_file} is tracked by git. .gitignore may be broken."
+                        )
 
-        # Step 7: VERIFY PRESERVED FILES
+        # Step 7: VERIFY PRESERVED FILES (skip for fresh init)
         _update_step("verify_preserved")
-        preserved_files = [
-            ".portal-token", "agents.db", "referrals.db", "clients.db",
-            "boop_config.json", "portal-chat.jsonl", "user-settings.json",
-            "scheduled_tasks.json",
-        ]
-        for pf in preserved_files:
-            if (SCRIPT_DIR / pf).exists():
-                rc_check, _ = await _git_cmd(["ls-files", "--error-unmatch", pf])
-                if rc_check == 0:
+        if not fresh_init:
+            preserved_files = [
+                ".portal-token", "agents.db", "referrals.db", "clients.db",
+                "boop_config.json", "portal-chat.jsonl", "user-settings.json",
+                "scheduled_tasks.json",
+            ]
+            for pf in preserved_files:
+                if (SCRIPT_DIR / pf).exists():
+                    rc_check, _ = await _git_cmd(["ls-files", "--error-unmatch", pf])
+                    if rc_check == 0:
+                        raise RuntimeError(
+                            f"ABORT: {pf} is tracked by git. This file must be gitignored."
+                        )
+
+            # Step 7b: VERIFY IDENTITY DIRS NOT TRACKED
+            for identity_dir in ["memories", ".claude"]:
+                rc_ls, ls_out = await _git_cmd(["ls-files", identity_dir])
+                if rc_ls == 0 and ls_out.strip():
                     raise RuntimeError(
-                        f"ABORT: {pf} is tracked by git. This file must be gitignored."
+                        f"ABORT: Files inside {identity_dir}/ are tracked by git. "
+                        f"Identity/memory files must be gitignored to prevent overwrite. "
+                        f"Tracked: {ls_out.strip()[:200]}"
                     )
 
-        # Step 7b: VERIFY IDENTITY DIRS NOT TRACKED
-        for identity_dir in ["memories", ".claude"]:
-            rc_ls, ls_out = await _git_cmd(["ls-files", identity_dir])
-            if rc_ls == 0 and ls_out.strip():
-                raise RuntimeError(
-                    f"ABORT: Files inside {identity_dir}/ are tracked by git. "
-                    f"Identity/memory files must be gitignored to prevent overwrite. "
-                    f"Tracked: {ls_out.strip()[:200]}"
-                )
-
-        # Step 8: PULL (fast-forward only)
+        # Step 8: PULL or CHECKOUT (depends on fresh_init)
         _update_step("pull")
-        _log_update(f"[{job_id}] Step 8: Pulling with --ff-only...")
-        rc_pull, pull_output = await _git_cmd(
-            ["pull", "--ff-only", "origin", "main"], timeout=60
-        )
-        if rc_pull != 0:
-            if "diverged" in pull_output.lower() or "not possible to fast-forward" in pull_output.lower():
-                raise RuntimeError(
-                    "Local branch has diverged from origin/main. Manual intervention needed."
+        if fresh_init:
+            # Fresh init: checkout main from origin (creates local main branch)
+            _log_update(f"[{job_id}] Step 8: Fresh install -- checking out origin/main...")
+            rc_co, co_output = await _git_cmd(
+                ["checkout", "-b", "main", "origin/main", "--force"], timeout=60
+            )
+            if rc_co != 0:
+                # Fallback: reset to origin/main
+                _log_update(f"[{job_id}] checkout failed, trying reset --hard...")
+                rc_reset, reset_out = await _git_cmd(
+                    ["reset", "--hard", "origin/main"], timeout=60
                 )
-            raise RuntimeError(f"git pull --ff-only failed: {pull_output.split(chr(10))[0]}")
+                if rc_reset != 0:
+                    raise RuntimeError(f"Failed to checkout origin/main: {co_output} / {reset_out}")
+        else:
+            _log_update(f"[{job_id}] Step 8: Pulling with --ff-only...")
+            rc_pull, pull_output = await _git_cmd(
+                ["pull", "--ff-only", "origin", "main"], timeout=60
+            )
+            if rc_pull != 0:
+                if "diverged" in pull_output.lower() or "not possible to fast-forward" in pull_output.lower():
+                    raise RuntimeError(
+                        "Local branch has diverged from origin/main. Manual intervention needed."
+                    )
+                raise RuntimeError(f"git pull --ff-only failed: {pull_output.split(chr(10))[0]}")
 
         # Step 9: RUN TESTS
         _update_step("running_tests")
@@ -8283,7 +8371,8 @@ async def _run_update(job_id: str):
             "status": "success",
             "completed_at": _update_state["completed_at"],
         }
-        _log_update(f"[{job_id}] SUCCESS: Updated from {previous_sha[:7]} to {_update_state['new_sha'][:7]}")
+        prev_label = previous_sha[:7] if previous_sha else "fresh"
+        _log_update(f"[{job_id}] SUCCESS: Updated from {prev_label} to {_update_state['new_sha'][:7]}")
 
         # Delay 2s so the success status can be polled, then SIGTERM
         await asyncio.sleep(2)
