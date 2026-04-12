@@ -8109,6 +8109,84 @@ if _custom_startup_file.exists():
         print(f"[portal-custom] WARNING: startup.py load failed: {_e}")
 # ─── END CUSTOMIZATION LAYER ──────────────────────────────────────────
 
+# ---------------------------------------------------------------------------
+# TGIM proxy — integration with TGIM v4.x (Russell Korus / Parallax + Keel)
+# Auth: Option B — service key + user email passthrough
+# ---------------------------------------------------------------------------
+def _read_tgim_env(key: str, default: str = "") -> str:
+    """Read from os.environ first, then fall back to ~/.env file."""
+    val = os.environ.get(key)
+    if val:
+        return val
+    env_path = Path.home() / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            if k.strip() == key:
+                return v.strip()
+    return default
+
+
+TGIM_BACKEND_URL = _read_tgim_env("TGIM_BACKEND_URL", "http://157.230.191.4:8089")
+TGIM_SERVICE_KEY = _read_tgim_env("TGIM_SERVICE_KEY")
+TGIM_DEFAULT_USER_EMAIL = _read_tgim_env("TGIM_DEFAULT_USER_EMAIL", "alex@puretechnology.nyc")
+
+
+def _tgim_headers(user_email: str | None = None) -> dict:
+    return {
+        "X-TGIM-Service-Key": TGIM_SERVICE_KEY,
+        "X-TGIM-User": user_email or TGIM_DEFAULT_USER_EMAIL,
+        "Content-Type": "application/json",
+    }
+
+
+def _tgim_upstream_url(path: str) -> str:
+    trimmed = path.removeprefix("/api/tgim/").removeprefix("/api/tgim")
+    return f"{TGIM_BACKEND_URL}/api/v1/{trimmed}"
+
+
+async def api_tgim_proxy(request: Request) -> JSONResponse:
+    """Generic proxy for /api/tgim/* → TGIM backend /api/v1/*."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if not TGIM_SERVICE_KEY:
+        return JSONResponse({"error": "TGIM_SERVICE_KEY not configured"}, status_code=503)
+
+    upstream_url = _tgim_upstream_url(request.url.path)
+    headers = _tgim_headers()
+    params = dict(request.query_params)
+    method = request.method.upper()
+
+    body = None
+    if method in ("POST", "PUT", "PATCH"):
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.request(
+                method=method, url=upstream_url,
+                headers=headers, params=params,
+                json=body if body is not None else None,
+            )
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"raw": resp.text}
+            return JSONResponse(data, status_code=resp.status_code)
+    except httpx.TimeoutException:
+        print(f"[tgim] Timeout proxying {method} {upstream_url}")
+        return JSONResponse({"error": "TGIM backend timeout"}, status_code=504)
+    except Exception as e:
+        print(f"[tgim] Proxy error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
 routes = [
     Route("/favicon.ico", endpoint=favicon),
     Route("/favicon-32.png", endpoint=favicon_png),
@@ -8212,6 +8290,7 @@ routes = [
     Route("/api/debug/report", endpoint=api_hub_debug_report, methods=["POST"]),
     Route("/api/continue", endpoint=api_hub_continue, methods=["POST"]),
     Route("/api/restart", endpoint=api_hub_restart, methods=["POST"]),
+    Route("/api/tgim/{path:path}", endpoint=api_tgim_proxy, methods=["GET", "POST", "PUT", "PATCH", "DELETE"]),
     WebSocketRoute("/ws/chat", endpoint=ws_chat),
     WebSocketRoute("/ws/terminal", endpoint=ws_terminal),
     *_custom_routes,   # Flux overlay: custom routes from custom/routes.py
