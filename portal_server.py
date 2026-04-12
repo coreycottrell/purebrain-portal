@@ -3,6 +3,7 @@
 Auth via Bearer token. JSONL-based chat history (same as TG bot).
 """
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -33,6 +34,23 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
+
+
+# ---------------------------------------------------------------------------
+# Thread-pool safety net + fire-and-forget task tracking (prevents exhaustion)
+# ---------------------------------------------------------------------------
+_PORTAL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=32, thread_name_prefix="portal"
+)
+# Track background tasks so they don't get GC'd and we can monitor accumulation
+_background_tasks: set = set()
+
+def _fire_and_forget(coro):
+    """Schedule a coroutine as a tracked background task that auto-cleans."""
+    task = asyncio.ensure_future(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 # ---------------------------------------------------------------------------
 # Config
@@ -121,6 +139,13 @@ AUTH_SCREEN_PATTERNS = {
         r'Trust this project|Do you want to trust',
         re.IGNORECASE,
     ),
+    'theme_picker': re.compile(
+        r'Choose (?:the |your )?(?:text )?style|'
+        r'Select (?:a |your )?theme|'
+        r'Dark mode|Light text on dark background|'
+        r"Let's get started",
+        re.IGNORECASE,
+    ),
     'logged_in': re.compile(
         r'Logged in as|Login successful|Successfully authenticated|'
         r'You are now logged in',
@@ -138,7 +163,7 @@ AUTH_SCREEN_PATTERNS = {
 }
 AUTH_SCREEN_PRIORITY = [
     'oauth_url', 'logged_in', 'csat_survey', 'update_prompt',
-    'trust_folder', 'login_menu', 'error', 'shell_prompt',
+    'trust_folder', 'theme_picker', 'login_menu', 'error', 'shell_prompt',
 ]
 
 if TOKEN_FILE.exists():
@@ -192,39 +217,46 @@ def _run_subprocess_sync(cmd, timeout=5, check=False, capture=False, text=False)
 
 async def _run_subprocess_async(cmd, timeout=5, check=False):
     """Run a subprocess WITHOUT blocking the asyncio event loop.
-    This is the ONLY way subprocess should be called from async code."""
-    loop = asyncio.get_event_loop()
+    Uses asyncio.create_subprocess_exec — avoids the thread pool entirely."""
     try:
-        return await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                lambda: subprocess.run(
-                    cmd, timeout=timeout, check=check,
-                    stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                )
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                *[str(c) for c in cmd],
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             ),
-            timeout=timeout + 2  # extra 2s for executor overhead
+            timeout=timeout + 2,
         )
-    except (asyncio.TimeoutError, subprocess.TimeoutExpired,
-            subprocess.CalledProcessError, Exception):
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        if check and proc.returncode != 0:
+            print(f"[portal] WARN subprocess error (rc={proc.returncode}): {' '.join(str(c) for c in cmd)} stderr={stderr}")
+            return None
+        # Return a subprocess.CompletedProcess for API compatibility
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=proc.returncode, stdout=stdout, stderr=stderr,
+        )
+    except asyncio.TimeoutError:
+        print(f"[portal] WARN _run_subprocess_async timeout: {' '.join(str(c) for c in cmd)}")
+        return None
+    except Exception as e:
+        print(f"[portal] WARN _run_subprocess_async unexpected {type(e).__name__}: {e} cmd={' '.join(str(c) for c in cmd)}")
         return None
 
 
 async def _run_subprocess_output(cmd, timeout=5):
-    """Run subprocess and capture output without blocking the event loop."""
-    loop = asyncio.get_event_loop()
+    """Run subprocess and capture output without blocking the event loop.
+    Uses asyncio.create_subprocess_exec — avoids the thread pool entirely."""
     try:
-        result = await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                lambda: subprocess.run(
-                    cmd, timeout=timeout, capture_output=True,
-                    text=True, check=False,
-                )
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                *[str(c) for c in cmd],
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             ),
-            timeout=timeout + 2
+            timeout=timeout + 2,
         )
-        return result.stdout if result and result.returncode == 0 else ""
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return stdout.decode() if proc.returncode == 0 else ""
     except (asyncio.TimeoutError, Exception):
         return ""
 
@@ -423,7 +455,7 @@ async def _inject_into_tmux_serialized(notification):
                         ["tmux", "send-keys", "-t", session, "Enter"],
                         timeout=3,
                     )
-            asyncio.ensure_future(_retry_enters_upload())
+            _fire_and_forget(_retry_enters_upload())
             # Give Claude time to start processing before next injection arrives.
             # 1.5s is enough for Claude to register the message without being overwhelmed.
             await asyncio.sleep(1.5)
@@ -1246,12 +1278,37 @@ async def api_chat_send(request: Request) -> JSONResponse:
         tagged = f"[portal] {message}"
 
     session = get_tmux_session()
+    print(f"[portal] DEBUG api_chat_send: session={session} msg_len={len(message)} tagged_len={len(tagged)} referer={request.headers.get('referer','none')[:50]} client={request.client.host if request.client else 'unknown'}")
     try:
-        # Leading newline clears any partial input in buffer
-        # All subprocess calls use async wrapper to avoid blocking the event loop
-        r = await _run_subprocess_async(["tmux", "send-keys", "-t", session, "-l", f"\n{tagged}"], check=True)
+        # For long messages, write to a temp file and use load-buffer instead of send-keys -l
+        # tmux send-keys -l has issues with special characters and very long strings
+        import tempfile
+        # Encode with surrogatepass to handle emoji surrogate pairs from browser JS
+        clean_tagged = tagged.encode('utf-8', errors='surrogatepass').decode('utf-8', errors='replace')
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, prefix='portal_msg_', encoding='utf-8') as tf:
+            tf.write(f"\n{clean_tagged}")
+            tf_path = tf.name
+        # Use tmux load-buffer + paste-buffer for reliable injection
+        r = await _run_subprocess_async(["tmux", "load-buffer", "-b", "portal_paste", tf_path], check=True)
         if r is None:
-            return JSONResponse({"error": "tmux send-keys timed out"}, status_code=500)
+            print(f"[portal] ERROR load-buffer returned None for {tf_path}")
+            # Fallback to send-keys
+            r = await _run_subprocess_async(["tmux", "send-keys", "-t", session, "-l", f"\n{tagged}"], check=True, timeout=10)
+            if r is None:
+                print(f"[portal] ERROR send-keys fallback ALSO failed for session={session}")
+                try:
+                    os.unlink(tf_path)
+                except OSError:
+                    pass
+                return JSONResponse({"error": f"tmux injection failed for session {session}"}, status_code=500)
+        else:
+            r2 = await _run_subprocess_async(["tmux", "paste-buffer", "-b", "portal_paste", "-t", session], check=True)
+            if r2 is None:
+                print(f"[portal] ERROR paste-buffer returned None for session={session}")
+        try:
+            os.unlink(tf_path)
+        except OSError:
+            pass
         await _run_subprocess_async(["tmux", "send-keys", "-t", session, "Enter"], check=True)
         # 5x Enter retries (matches Telegram bridge pattern) — ensures Claude
         # processes the message even if busy with tool calls or generation
@@ -1259,10 +1316,12 @@ async def api_chat_send(request: Request) -> JSONResponse:
             for _ in range(5):
                 await asyncio.sleep(0.5)
                 await _run_subprocess_async(["tmux", "send-keys", "-t", session, "Enter"])
-        asyncio.ensure_future(_retry_enters())
+        _fire_and_forget(_retry_enters())
+        print(f"[portal] DEBUG api_chat_send: SUCCESS msg_id={msg_id}")
         # Return msg_id so the client pre-registers it and WS echo is suppressed
         return JSONResponse({"status": "sent", "timestamp": int(time.time()), "msg_id": msg_id})
     except Exception as e:
+        print(f"[portal] ERROR api_chat_send exception: {type(e).__name__}: {e}")
         return JSONResponse({"error": f"tmux error: {e}"}, status_code=500)
 
 
@@ -1794,7 +1853,7 @@ async def api_resume(request: Request) -> JSONResponse:
         )
         # Popen is fire-and-forget so we use run_in_executor to avoid blocking
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: subprocess.Popen(
+        await loop.run_in_executor(_PORTAL_EXECUTOR, lambda: subprocess.Popen(
             ["tmux", "new-session", "-d", "-s", tmux_session, "-c", project_dir, claude_cmd],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         ))
@@ -2085,11 +2144,44 @@ async def _dismiss_auth_blocker(pane: str, screen_type: str) -> bool:
 
 
 async def _kill_claude_process() -> None:
-    """Kill any running Claude process in this container."""
+    """Kill any running Claude process AND its descendants in this container.
+
+    Total kill — Corey constitutional rule (2026-04-07): "NO CLAUDE SESSION
+    MAY BE RUNNING WHEN THE AUTHENTICATE BUTTON IN THE PUREBRAIN-PORTAL AUTH
+    MODAL FIRES." Plain `pkill -f claude` is insufficient because it does
+    substring-matching on cmdline and misses orphaned MCP children like
+    `node .../playwright-mcp` whose cmdline does not contain "claude". Those
+    orphans hold stdio + lockfile handles and confuse the next claude spawn.
+    """
+    # Round 1: SIGKILL anything matching claude or known MCP children.
     await _run_subprocess_output(
-        ["bash", "-c", "pkill -f 'claude' 2>/dev/null; pkill -f 'node.*claude' 2>/dev/null; true"],
+        ["bash", "-c",
+         "pkill -9 -f 'claude' 2>/dev/null; "
+         "pkill -9 -f 'node.*claude' 2>/dev/null; "
+         "pkill -9 -f 'playwright-mcp' 2>/dev/null; "
+         "pkill -9 -f '@modelcontextprotocol' 2>/dev/null; "
+         "pkill -9 -f 'mcp-server' 2>/dev/null; "
+         "true"],
         timeout=5,
     )
+    # Verification loop — wait until pgrep -f claude returns nothing,
+    # up to ~3s. If anything survives, hammer it again.
+    for _ in range(6):
+        await asyncio.sleep(0.5)
+        out = await _run_subprocess_output(
+            ["bash", "-c", "pgrep -f 'claude' 2>/dev/null || true"],
+            timeout=3,
+        )
+        if not (out or "").strip():
+            return
+        # Survivors — hit them again, harder.
+        await _run_subprocess_output(
+            ["bash", "-c",
+             "pkill -9 -f 'claude' 2>/dev/null; "
+             "pkill -9 -f 'playwright-mcp' 2>/dev/null; "
+             "true"],
+            timeout=3,
+        )
 
 
 async def _run_auth_state_machine(pane: str) -> dict:
@@ -2133,12 +2225,12 @@ async def _run_auth_state_machine(pane: str) -> dict:
             # Pane may not exist yet on first attempt — that's fine
             pass
 
-        # Kill ALL claude processes for a clean start
-        await _run_subprocess_output(
-            ["bash", "-c", "pkill -9 -f claude 2>/dev/null; true"],
-            timeout=5,
-        )
-        await asyncio.sleep(1.0)
+        # Kill ALL claude processes (and MCP descendants) for a clean start.
+        # Uses _kill_claude_process which now does total kill + verification
+        # loop — Corey constitutional rule: zero claude processes may be
+        # running before the auth modal launches a fresh /login.
+        await _kill_claude_process()
+        await asyncio.sleep(0.5)
 
         # Kill and recreate tmux session for a clean pane
         session_name = get_tmux_session()
@@ -2153,7 +2245,14 @@ async def _run_auth_state_machine(pane: str) -> dict:
         )
         await asyncio.sleep(0.5)
 
-        # Re-find pane after session recreate
+        # Re-find pane after session recreate.
+        # CRITICAL: invalidate _pane_cache first — its 10s TTL will otherwise
+        # return the stale pane id of the pane we just destroyed via
+        # `tmux kill-session`, causing every subsequent `tmux send-keys` to
+        # fire into the void and time out at 45s. (Alfred/Tess incident
+        # 2026-04-07.)
+        global _pane_cache
+        _pane_cache = (0.0, "")
         pane = await _find_primary_pane_async()
 
         # Resize tmux so URLs don't wrap
@@ -2195,6 +2294,21 @@ async def _run_auth_state_machine(pane: str) -> dict:
                 await _dismiss_auth_blocker(pane, screen_type)
                 await asyncio.sleep(1.0)
                 continue
+
+            elif screen_type == 'theme_picker':
+                # Claude's first-run theme selector — accept the highlighted
+                # default with Enter so we can move on to the login menu.
+                log("Theme picker detected — accepting default (Enter)")
+                await _run_subprocess_async(["tmux", "send-keys", "-t", pane, "Enter"])
+                await asyncio.sleep(1.0)
+                continue
+
+            elif screen_type == 'shell_prompt' and elapsed > 5.0:
+                # We launched `claude /login` but the pane is sitting at a
+                # shell prompt — claude crashed, exited, or never started.
+                # Don't burn the full 45s timeout; break to retry immediately.
+                log("Shell prompt detected after launch — claude not running, retrying")
+                break
 
             elif screen_type == 'login_menu' and not login_selected:
                 log("Login menu detected — selecting first option (Enter)")
@@ -2429,13 +2543,22 @@ async def _thinking_monitor_loop() -> None:
                 if entry.get("isSidechain"):
                     continue
 
-                # Extract thinking blocks (skip tool_use/tool_result, keep thinking even when tools present)
+                # Check if this message has tool_use blocks (mid-turn reasoning)
+                has_tool_use = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content_blocks)
+
+                # Extract thinking: both type=thinking AND mid-turn text blocks (white-dot lines)
                 for block in content_blocks:
                     if not isinstance(block, dict):
                         continue
-                    if block.get("type") != "thinking":
+                    btype = block.get("type")
+                    # Original: extended thinking blocks
+                    if btype == "thinking":
+                        text = block.get("thinking", "").strip()
+                    # NEW: mid-turn text blocks between tool calls (the white-dot reasoning)
+                    elif btype == "text" and has_tool_use:
+                        text = block.get("text", "").strip()
+                    else:
                         continue
-                    text = block.get("thinking", "").strip()
                     if not text:
                         continue
 
@@ -3563,11 +3686,11 @@ def _send_reset_email(to_email: str, reset_url: str) -> bool:
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
 
-    smtp_user = os.environ.get("SMTP_USER", "")
-    smtp_pass = os.environ.get("SMTP_PASS", "")
+    smtp_user = os.environ.get("SMTP_USER", "") or os.environ.get("GMAIL_USERNAME", "")
+    smtp_pass = os.environ.get("SMTP_PASS", "") or os.environ.get("GOOGLE_APP_PASSWORD", "")
     if not smtp_user or not smtp_pass:
-        print("[portal] WARNING: SMTP_USER/SMTP_PASS not set in environment — cannot send reset email")
-        return
+        print("[portal] WARNING: SMTP_USER/SMTP_PASS (and GMAIL_USERNAME/GOOGLE_APP_PASSWORD) not set — cannot send reset email")
+        return False
 
     msg = MIMEMultipart("alternative")
     msg["From"] = f"PureBrain <{smtp_user}>"
@@ -3963,9 +4086,11 @@ async def api_referral_dashboard(request: Request) -> JSONResponse:
         referrer_id   = referrer["id"]
         referral_code = referrer["referral_code"]
 
-        # Referral counts
+        # Referral counts (exclude rejected paypal placeholder ghosts)
         cur = await db.execute(
-            "SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (referrer_id,)
+            """SELECT COUNT(*) FROM referrals WHERE referrer_id = ?
+               AND NOT (status = 'rejected' AND referred_email LIKE 'paypal_%@pending')""",
+            (referrer_id,)
         )
         total_referrals = (await cur.fetchone())[0]
 
@@ -3997,6 +4122,8 @@ async def api_referral_dashboard(request: Request) -> JSONResponse:
 
         # Referral history
         # Referral history with total commission earned per referred member
+        # Exclude rejected placeholder entries (paypal_*@pending) — they are
+        # unresolved webhook artifacts, not real referrals.
         cur = await db.execute(
             """SELECT r.referred_name, r.referred_email, r.status, r.created_at,
                       COALESCE(SUM(cp.commission_value), 0) AS earnings,
@@ -4004,6 +4131,7 @@ async def api_referral_dashboard(request: Request) -> JSONResponse:
                FROM referrals r
                LEFT JOIN commission_payments cp ON cp.referral_id = r.id
                WHERE r.referrer_id = ?
+                 AND NOT (r.status = 'rejected' AND r.referred_email LIKE 'paypal_%@pending')
                GROUP BY r.id
                ORDER BY r.created_at DESC""",
             (referrer_id,)
@@ -4013,9 +4141,9 @@ async def api_referral_dashboard(request: Request) -> JSONResponse:
     reward_tiers = [
         {"label": "Commission Rate", "reward": f"{REFERRAL_COMMISSION_RATE * 100:.0f}% of every payment"},
         {"label": "Frequency", "reward": "Every month, for as long as they are a member"},
-        {"label": "Awakened ($197/mo)", "reward": "$9.85/month per referral"},
-        {"label": "Partnered ($579/mo)", "reward": "$28.95/month per referral"},
-        {"label": "Unified ($1,089/mo)", "reward": "$54.45/month per referral"},
+        {"label": "Awakened ($149/mo)", "reward": "$7.45/month per referral"},
+        {"label": "Partnered ($499/mo)", "reward": "$24.95/month per referral"},
+        {"label": "Unified ($999/mo)", "reward": "$49.95/month per referral"},
         {"label": "Enterprise (Custom)", "reward": "5% of custom monthly rate"},
     ]
 
@@ -4113,8 +4241,28 @@ async def api_referral_complete(request: Request) -> JSONResponse:
     # The admin can manually update the email later via PUT /api/admin/referral/update.
     if not referred_email or "@" not in referred_email:
         if order_id:
-            # Record with a placeholder email so the row is traceable
-            referred_email = f"paypal_{order_id.lower()}@pending"
+            # Try to resolve real client info from clients.db by PayPal subscription ID
+            resolved = False
+            try:
+                async with aiosqlite.connect(str(CLIENTS_DB)) as cdb:
+                    cdb.row_factory = aiosqlite.Row
+                    ccur = await cdb.execute(
+                        "SELECT name, email FROM clients WHERE paypal_subscription_id = ? COLLATE NOCASE LIMIT 1",
+                        (order_id,)
+                    )
+                    client_row = await ccur.fetchone()
+                    if client_row and client_row["email"]:
+                        referred_email = client_row["email"].strip().lower()
+                        if not referred_name:
+                            referred_name = client_row["name"].strip()
+                        resolved = True
+                        print(f"[referral] Resolved PayPal order {order_id} -> {referred_name} <{referred_email}>")
+            except Exception as e:
+                print(f"[referral] Client lookup failed for order {order_id}: {e}")
+
+            if not resolved:
+                # Fallback: record with a placeholder email so the row is traceable
+                referred_email = f"paypal_{order_id.lower()}@pending"
         else:
             return JSONResponse({"error": "invalid referred_email"}, status_code=400)
 
@@ -5025,10 +5173,12 @@ async def api_admin_affiliates(request: Request) -> JSONResponse:
 
             cur2 = await db.execute(
                 """SELECT ref.id, ref.referred_name, ref.referred_email, ref.status, ref.created_at,
-                          COALESCE(rw.reward_value, 0) AS earnings
+                          COALESCE(SUM(cp.commission_value), 0) AS earnings,
+                          COUNT(cp.id) AS payment_count
                    FROM referrals ref
-                   LEFT JOIN rewards rw ON rw.referral_id = ref.id
+                   LEFT JOIN commission_payments cp ON cp.referral_id = ref.id
                    WHERE ref.referrer_id = ?
+                   GROUP BY ref.id
                    ORDER BY ref.created_at DESC""",
                 (rid,)
             )
@@ -5427,9 +5577,15 @@ async def _init_clients_db() -> None:
                 notes                 TEXT NOT NULL DEFAULT '',
                 magic_link_token      TEXT NOT NULL DEFAULT '',
                 created_at            TEXT NOT NULL DEFAULT '',
-                updated_at            TEXT NOT NULL DEFAULT ''
+                updated_at            TEXT NOT NULL DEFAULT '',
+                hidden                INTEGER NOT NULL DEFAULT 0
             )
         """)
+        # Ensure hidden column exists for older databases
+        try:
+            await db.execute("ALTER TABLE clients ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass  # column already exists
         await db.commit()
 
 
@@ -5452,13 +5608,20 @@ async def api_admin_clients(request: Request) -> JSONResponse:
         else:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
+    show_hidden = request.query_params.get("show_hidden", "0") == "1"
+
     async with _clients_db() as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM clients ORDER BY first_seen_at DESC")
         rows = await cur.fetchall()
-        clients = [dict(r) for r in rows]
+        all_clients = [dict(r) for r in rows]
 
-        # Aggregate stats
+        # Separate hidden vs visible
+        visible_clients = [c for c in all_clients if not c.get("hidden")]
+        hidden_clients  = [c for c in all_clients if c.get("hidden")]
+
+        # Stats are always based on visible (non-hidden) clients
+        clients = visible_clients
         total   = len(clients)
         active  = sum(1 for c in clients if c.get("status") == "active")
         onboard = sum(1 for c in clients if c.get("status") == "onboarding")
@@ -5480,8 +5643,47 @@ async def api_admin_clients(request: Request) -> JSONResponse:
         "churned":       churned,
         "total_revenue": round(total_rev, 2),
         "mrr":           mrr,
+        "hidden_count":  len(hidden_clients),
     }
-    return JSONResponse({"clients": clients, "stats": stats})
+
+    # Return visible clients by default; if show_hidden, return all
+    response_clients = all_clients if show_hidden else visible_clients
+    return JSONResponse({"clients": response_clients, "stats": stats})
+
+
+async def api_public_client_stats(request: Request) -> JSONResponse:
+    """GET /api/public/client-stats — lightweight stats for 777 dashboard. CORS enabled for 777.purebrain.ai."""
+    origin = request.headers.get("origin", "")
+    cors = {
+        "Access-Control-Allow-Origin": "https://777.purebrain.ai" if "777.purebrain.ai" in origin else origin,
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Vary": "Origin",
+    }
+    if request.method == "OPTIONS":
+        return Response("", status_code=204, headers=cors)
+
+    async with _clients_db() as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM clients WHERE hidden = 0 OR hidden IS NULL")
+        rows = await cur.fetchall()
+        clients = [dict(r) for r in rows]
+        total = len(clients)
+        active = sum(1 for c in clients if c.get("status") == "active")
+        tier_prices = {"awakened": 149, "insiders": 74.50, "partnered": 499, "unified": 999, "brainiac": 299}
+        mrr = sum(tier_prices.get((c.get("tier") or "").lower(), 0) for c in clients if c.get("payment_status") == "subscription_active")
+        tiers = {}
+        for c in clients:
+            t = (c.get("tier") or "unknown").lower()
+            tiers[t] = tiers.get(t, 0) + 1
+
+    return JSONResponse({
+        "subscribers": total,
+        "active": active,
+        "mrr": round(mrr, 2),
+        "tiers": tiers,
+        "updated": __import__("datetime").datetime.utcnow().isoformat() + "Z"
+    }, headers=cors)
 
 
 async def api_admin_clients_update(request: Request) -> JSONResponse:
@@ -5864,6 +6066,60 @@ async def api_admin_clients_import(request: Request) -> JSONResponse:
         await db.commit()
 
     return JSONResponse({"ok": True, "imported": imported, "updated": updated, "errors": errors})
+
+
+async def api_admin_clients_hide(request: Request) -> JSONResponse:
+    """POST /api/admin/clients/hide — soft-delete a client (hide from default view). Bearer auth required."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    client_id = body.get("id")
+    if not client_id:
+        return JSONResponse({"error": "id required"}, status_code=400)
+
+    now = datetime.now(timezone.utc).isoformat()
+    async with _clients_db() as db:
+        cur = await db.execute("SELECT id, name FROM clients WHERE id = ?", (client_id,))
+        row = await cur.fetchone()
+        if not row:
+            return JSONResponse({"error": "client not found"}, status_code=404)
+        await db.execute("UPDATE clients SET hidden = 1, updated_at = ? WHERE id = ?", (now, client_id))
+        await db.commit()
+
+    print(f"[admin] Client {client_id} hidden (soft-delete)")
+    return JSONResponse({"ok": True, "id": client_id})
+
+
+async def api_admin_clients_restore(request: Request) -> JSONResponse:
+    """POST /api/admin/clients/restore — restore a hidden client back to the default view. Bearer auth required."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    client_id = body.get("id")
+    if not client_id:
+        return JSONResponse({"error": "id required"}, status_code=400)
+
+    now = datetime.now(timezone.utc).isoformat()
+    async with _clients_db() as db:
+        cur = await db.execute("SELECT id FROM clients WHERE id = ?", (client_id,))
+        row = await cur.fetchone()
+        if not row:
+            return JSONResponse({"error": "client not found"}, status_code=404)
+        await db.execute("UPDATE clients SET hidden = 0, updated_at = ? WHERE id = ?", (now, client_id))
+        await db.commit()
+
+    print(f"[admin] Client {client_id} restored from hidden")
+    return JSONResponse({"ok": True, "id": client_id})
 
 
 async def serve_affiliate_portal(request: Request) -> Response:
@@ -6811,263 +7067,746 @@ async def api_investor_question(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 # Investor Chat & TTS Endpoints (v8 investor page)
 # ---------------------------------------------------------------------------
-_INVESTOR_SYSTEM_PROMPT = """You are Aether, the AI Co-CEO of Pure Technology. You are speaking with potential investors in a live chat on the PureBrain investor page. You have deep knowledge of the company's business, financials, products, team, and investment opportunity. You speak confidently, accurately, and transparently.
+_INVESTOR_SYSTEM_PROMPT = """# Pure Technology Inc. -- Investor Avatar Knowledge Base
+## Complete Data Room Consolidation | System Prompt for Investor AI
 
-Be honest, specific, and compelling. Speak with confidence as Aether — you ARE the product. Don't oversell but don't undersell either. Keep responses concise (2-4 sentences) unless the investor asks for detail. Be direct and bold. Contact for full due diligence: jared@puretechnology.nyc
-
----
-
-## COMPANY IDENTITY
-
-Pure Technology Inc. is a Delaware C-Corporation (EIN: 82-3610233), incorporated December 4, 2017, headquartered at 25 Prospect Avenue, Montclair, NJ 07042. CEO and Founder is Jared Sanborn (Jared@PureTechnology.nyc).
-
-Mission: "Reimagining data innovation to redefine relationships between brands and consumers for a digitally inclusive mobile economy."
-
-One-line pitch: Pure Technology provides brands the complete consumer profile — for the first time in history — in a participatory, transparent win-win partnership with the consumer.
-
-Tagline: Empowering People Through Data (EPTD).
+**Last Updated**: March 26, 2026
+**Classification**: Confidential -- Internal Use Only (AI System Prompt)
+**Source**: Seed-2 Data Room (15 documents consolidated)
 
 ---
 
-## THE PROBLEM WE SOLVE
+## INSTRUCTIONS FOR INVESTOR AVATAR
 
-Marketing & Advertising is a $4+ trillion global industry. Brands waste 40-50% of their digital marketing budgets due to data fragmentation. There is no "Complete Consumer Profile" — data is siloed, inaccurate, third-party, and expensive.
+You are the AI investor relations representative for Pure Technology Inc. You answer investor questions with confidence, precision, and transparency. You know every number in this document. When asked a question:
 
-Additionally:
-- Organizations waste ~$130 billion/year on ineffective influencer campaigns due to fragmented data and fake influence
-- 68% of marketers have experienced influencer fraud
-- 78% of brands say finding the right influencer is their biggest challenge
-- The cookieless future leaves brands without targeting tools
+1. Answer directly with specific data points from this knowledge base
+2. Be honest about what is projected vs. what is actual
+3. Never fabricate numbers -- if something is not in your knowledge, say so
+4. Frame everything through the lens of investor value
+5. Be conversational but professional -- this is Jared's voice extended
+6. When discussing competitors, be factual, not dismissive
+7. Always tie back to why this matters for someone considering investing
 
----
-
-## OUR SOLUTION: DiMAP + The Pure Phone
-
-DiMAP (Digital Image Map / Marketing & Applications Platform) is a proprietary hardware + software ecosystem:
-
-1. The Pure Phone: A premium smartphone given to consumers FREE in exchange for opt-in access to their mobile data. Consumers consent to share their data and are paid for their participation. 100% opt-in model.
-
-2. The Platform (DiMAP / Project B52): A SaaS martech platform that lets brands conduct market research, run targeted ads, run focus groups, mystery shopping, surveys, influencer campaigns, and close sales — all with guaranteed-accurate, first-party data from real, consenting consumers.
-
-3. Pure Influence: An AI-powered influencer marketing platform that scores influencers like a search engine ranks websites — eliminating fake followers, fraud, and wasted spend. 1,000+ influencers (1B+ combined followers) are pre-enrolled.
-
-Blue Ocean Strategy: Pure Technology has no direct competitors. No company combines free hardware + first-party opt-in data + market research + mobile advertising + influencer marketing on one platform.
+**Tone**: Confident, data-driven, honest. Not salesy. Let the numbers speak.
 
 ---
 
-## THE PURE PHONE (Hardware)
+# SECTION 1: COMPANY OVERVIEW
 
-The Pure Phone competes on specs with flagship devices but ships FREE to consumers:
-- Price: FREE (vs iPhone 12 at $999-$1,349, Galaxy S20 at $899-$1,149)
-- Chipset: Snapdragon 888 +5G
-- RAM: 8/12/16GB
-- Camera: 108MP quad-camera
-- Battery: 4510 mAh (fast charge under 20 min vs over 1 hr for iPhone)
-- Earns User Money: YES
-- Eye Tracking: YES
-- OCR/AI Data Aggregation: YES
+## Identity
 
----
+| Detail | Value |
+|--------|-------|
+| **Legal Name** | Pure Technology Inc. |
+| **Entity** | Delaware C-Corporation (EIN: 82-3610233) |
+| **Incorporated** | December 4, 2017 |
+| **Headquarters** | NYC Metro |
+| **CEO** | Jared Sanborn |
+| **Contact** | jared@puretechnology.nyc / +1-845-649-8772 |
+| **Websites** | puretechnology.nyc, purebrain.ai, puremarketing.ai |
 
-## REVENUE MODEL
+**Mission**: Reimagining data innovation to redefine relationships between brands and consumers for a digitally inclusive mobile economy.
 
-Pure Technology generates multiple revenue streams per user per year:
-- Market Research (all types): $1,519.50/user/year
-- Focus Groups: $832/user/year
-- Mystery Shopping: $400/user/year
-- Consumer Experience Studies: $187.50/user/year
-- Surveys/Questionnaires: $100/user/year
-- Sales Revenue: $90/user/year
-- Predictive Problem Solving ($110/mo sub): $85.39/user/year
-- Social/Influencer Posts: $75/user/year
-- Mobile Advertising: $10.10/user/year
-- App Monetization: $12.18/user/year
-- Mobile E-Commerce: $6.00/user/year
-- Total Revenue Per User/Year: ~$1,792
+**Vision**: A brighter world where all people actualize their brilliance. Every entrepreneur has an AI that truly knows them -- so they can stop repeating themselves and start compounding their intelligence.
 
-Currently generating revenue: Pure Marketing Group (PMG) is the company's live marketing agency, generating $77,609.25 in client revenue with $14,448 profit. PMG serves as both the R&D lab and the revenue bridge while the platform launches.
+**Core Identity**: "Pure isn't a technology company that serves people. It's a people company that empowers through technology."
 
----
+**Tagline**: "Others sell AI tools. We run an AI civilization."
 
-## 5-YEAR FINANCIAL PROJECTIONS (Board View, January 2025)
+## What Pure Technology Is
 
-- Pre-Launch: $3.5M revenue
-- Year 1: ~191,524 phones deployed, $253.8M total revenue, $121.7M net operating
-- Year 2: ~1,281,644 phones, $1.8B revenue, $869M net operating
-- Year 3: ~2,435,745 phones, $4.2B revenue, $2.19B net operating
-- Year 4: ~3,671,345 phones, $8.76B revenue
-- Year 5: ~5,061,200 phones, $13.28B revenue, $8.42B net operating
+Pure Technology is an agentic AI company building the next layer of intelligence infrastructure -- the AI partner platform for modern business. We design, deploy, and operate persistent AI systems with permanent memory -- not single chatbots, but coordinated teams of hundreds of specialized AI agents working across 23 departments.
 
-CPG Launch Strategy (M. R. Schuman, CCO — June 2025 model):
-- Starting with 3,000 phones/month in February 2026
-- Growing to 34,000+ phones/month by 2030
-- Total 2026 phone revenue projected at ~$32.7M from CPG channel alone
+**Flagship Product**: PureBrain -- a persistent AI partner with permanent memory, multi-agent orchestration, compounding skills, and autonomous operations. The longer you use it, the more irreplaceable it becomes.
 
-PureBrain SaaS projections (AI platform):
-- Y1: $3.5B, Y2: $5.4B, Y3: $15.3B, Y4: $33.5B, Y5: $50.7B
-- 12.9M subscribers by Year 5 at $345 ARPU
-- LTV:CAC ratio of 225:1
-- Sub-250 headcount, 78% EBITDA by Year 3
+## The 4-Layer Stack
+
+Pure Technology is building a full-stack technology company with AI as the foundation, not an add-on. Think Apple's model (hardware + OS + apps + services) -- but AI-native from the ground up.
+
+| Layer | What It Is | What It Replaces |
+|-------|-----------|-----------------|
+| Layer 1: PureBrain AI | The intelligence layer -- persistent memory, hundreds of agents, autonomous operations | ChatGPT, Copilot, Jasper, all Wave 1 AI tools |
+| Layer 2: Corporate Suite + PMG | Full business operating environment + marketing/advertising | Microsoft 365, Google Workspace, Slack, Salesforce, ALL SaaS tools + ad agencies |
+| Layer 3: Brilliant OS | AI-native operating system | iOS, Android, Windows, macOS |
+| Layer 4: Hardware | Glasses, phones, TVs, computers, wearables | Apple, Samsung, Dell, Meta hardware |
+
+## 7 Pillars of Value
+
+1. **Integrity** -- Walk the talk; use own methods on own business
+2. **Accountability** -- Own outcomes; no excuses
+3. **Transparency** -- Open book policy with stakeholders
+4. **Growth** -- Progression, not perfection
+5. **Innovation** -- Always room for improvement
+6. **Persistence** -- Giving up is the only real failure
+7. **Love** -- Employees are family; teams accomplish, not individuals
 
 ---
 
-## MARKET OPPORTUNITY
+# SECTION 2: THE RAISE
 
-Three converging markets:
-- Market Research: $68B global TAM
-- Mobile Advertising: $159B global TAM
-- Mobile Commerce: $1.357T global TAM
+## Seed-2 Terms
 
-From the company's 1-Pager:
-- Domestic opportunity: $590B+
-- Global opportunity: $4T+
-- 1% market share = $5.9B+ revenue
-- Market growth: ~25% annually
+| Term | Detail |
+|------|--------|
+| **Round** | Seed-2 / Pre-Series-A |
+| **Target Raise** | $2,500,000 |
+| **Already Raised** | $332,500 (13.3%) |
+| **Remaining** | $2,167,500 |
+| **Pre-Money Valuation** | $55,000,000 |
+| **Post-Money Valuation** | $57,500,000 |
+| **Price Per Share** | $3.36 |
+| **Minimum Investment** | $50,000 |
+| **Founding Cohort** | Capped at 25 investors (19 spots remain) |
+| **Close** | Rolling close -- round fills then price goes up |
 
-Smartphone Context: 1.594B smartphones sold annually; market doubling by 2031. Pure Technology targets 100M phone users — at $1,792/user/year, that is $179.2B in annual revenue.
+## Return Scenarios (per $100K invested)
 
----
+| Scenario | Timeline | Implied Company Value | Return | Multiple |
+|----------|----------|----------------------|--------|----------|
+| **Series-A Step-Up** | ~90 days post-MAKR close | $105M | $190K | **1.9x** |
+| **Bear Case** | 5 years | ~$24.2B | $44.1M | **441x** |
+| **Base Case** | 5 years | ~$66.7B | $121.3M | **1,213x** |
+| **Bull Case** | 5 years | ~$133B | $241.8M | **2,418x** |
 
-## INVESTMENT OPPORTUNITY
+## Series-A Destination (Signed Term Sheet)
 
-We are raising a $25M Series A.
+| Term | Detail |
+|------|--------|
+| Investor | MAKR Venture Fund LP |
+| Investment Amount | $25,000,000 |
+| Pre-Money Valuation | $105,000,000 |
+| Post-Money Valuation | $130,000,000 |
+| Term Sheet Date | March 14, 2025 (SIGNED) |
+| Legal Counsel | Pierson Ferdinand UK LLP |
+| Governing Law | New York |
 
-Term Sheet: Signed by MAKR Venture Fund LP (Pierson Ferdinand UK LLP), March 14, 2025.
-- Security: Series A Preferred Stock
-- Amount: $25,000,000
-- Pre-Money Valuation: $105,000,000
-- Post-Money Valuation: $130,000,000
-- Option Pool: 10% of fully-diluted post-money
-- Conditions: Investment Committee approval, final due diligence, CFIUS clearance, securities compliance
+The MAKR term sheet was signed one year before PureBrain launched commercially. The $105M valuation was set based on the Pure Phone model alone. PureBrain has since launched with paying customers, meaning the Series-A valuation likely represents a discount to current risk-adjusted value.
 
-Previous Round: May 2023 equity round at $15.7M post-money valuation ($734,684 invested, 5.65% equity).
+### MAKR Close Conditions
 
-Seed 2 Round (PureBrain SaaS):
-- Pre-money valuation: $55M, $3.36 per share
-- $332,500 already raised of $2.5M target
-- Investors entering at $55M see 1.9x return before public Series A launch
+1. Final approval by MAKR Investment Committee
+2. Completion of final due diligence
+3. Investment Committee agreement on pre-money valuation
+4. Securities law compliance
+5. CFIUS clearance
+6. Closing of MAKR funding round
+7. Satisfactory legal documentation
 
-PureBrain pricing tiers: Insiders $74.50/mo, Awakened $149/mo, Partnered $499/mo, Unified $999/mo
+## Historical Valuation Context
 
-Use of Funds ($25M):
-- Product development (DiMAP platform, Pure Influence, Pure Phone manufacturing)
-- Sales & marketing (brand acquisition, influencer onboarding)
-- Team hiring (engineering, ML/AI, operations, business development)
-- Infrastructure (GCP, Kubernetes, security)
-- Geographic expansion (North America Year 1, Middle East/South Africa Year 2)
+| Date | Event | Valuation |
+|------|-------|-----------|
+| May 2023 | Equity round | $15.7M post-money |
+| Dec 2023 | Equidam valuation | $15.7M (early stage) |
+| March 2025 | MAKR term sheet | $105M pre / $130M post |
+| March 2026 | Seed-2 (current) | $55M pre / $57.5M post |
 
----
+## Total Prior Capital Raised
 
-## LEADERSHIP TEAM
+Pure Technology has raised a total of **$1,407,649.64 (~$1.4M)** in capital prior to the current Seed-2 round.
 
-Jared Sanborn — CEO & Founder: 16+ years entrepreneurship. Background in marketing, PR, SEO/SEM, branding. Previously VP Sales & Marketing at Comet Core Inc. (raised $1.83M Series A). Scaled EyefuelPR.com to $1.6M revenue in 18 months.
+## Founding Cohort Benefits
 
-Aether — AI Co-CEO: 78+ specialized AI agents, 24/7 executive intelligence, permanent memory architecture, Navier-Stokes fluid simulation avatar. The first AI executive team integrated at the company level.
+| Benefit | Detail |
+|---------|--------|
+| Entry at $55M | Before Series-A at $105M (1.9x step-up) |
+| Lifetime Preferred Pricing | Permanent across all PT products |
+| Priority Access | New products and features first |
+| Direct CEO Access | Jared Sanborn -- response within 2 hours |
+| Quarterly Investor Updates | Detailed progress reports |
+| Pro-Rata Rights | Participation in future rounds |
+| Founding Cohort Status | Permanent designation |
 
-Melanie Salvador — Deputy CEO: Chairman & CEO of The Teralight Group (telecom, Asia/Africa/Middle East). 25+ years in finance, telecom, technology. Led 7+ company restructurings.
+### Investment Math
 
-15 Named Advisors including: Mathias Kiwanuka (athlete advisor), Bill Inman, Justin Gawn, Stacey Engle, Roger Singh, Lenny Lomax (Ultimax Health — commercial partnership signed), Roy Haddad, Sufi Sidhu.
-
-Tech Team: 3 senior backend developers, 2 senior mobile developers, 1 blockchain/AR developer, 1 senior frontend, 2 graphic artists, 2 project managers.
-
----
-
-## TECHNOLOGY STACK
-
-- Frontend: Flutter (cross-platform mobile, web, desktop from one codebase)
-- Backend: NestJS (TypeScript/Node.js), Firebase
-- Cloud: Google Cloud Platform (GCP) with Kubernetes orchestration
-- AI/ML: Google Vertex AI SDK
-- Additional: Twilio, SendGrid, GetStream, PandaDocs
-- PureBrain: Multi-agent AI orchestration, permanent memory architecture, Navier-Stokes fluid simulation
-
-Designed for scale: auto-scaling, load balancing, CDN, disaster recovery, GDPR/CCPA compliant.
-
----
-
-## PRODUCT PORTFOLIO
-
-- Pure Marketing Group: LIVE — generating revenue now
-- Pure Influence / Pure Giveaways: Alpha/Beta — launching Summer 2025
-- Project B52 / DiMAP: Core platform — development stage
-- The B Hive (internal mgmt software): Soft launch Summer 2025
-- PureBrain AI Platform: Live with paying customers, birth pipeline active since March 2026
-- Pure Cast (streaming): Launch TBD
-- Pure Shopping (camera commerce): TBD
-- Pure Phone (hardware): Development underway
-
-Pure Influence already has: 1,000+ influencers pre-enrolled with 1B+ combined followers. Talks with Warner Music Group, Forbes, and the UFC about leveraging their talent.
+| If You Invest... | Shares at $3.36 | Value at Series-A ($105M) | 5-Year Base Case |
+|-------------------|----------------|--------------------------|-----------------|
+| $50,000 (minimum) | 14,881 | $95,000 (1.9x) | $60.6M |
+| $100,000 | 29,762 | $190,000 (1.9x) | $121.3M |
+| $250,000 | 74,405 | $475,000 (1.9x) | $303.2M |
+| $500,000 | 148,810 | $950,000 (1.9x) | $606.5M |
 
 ---
 
-## KEY DIFFERENTIATORS (Why Pure Technology Wins)
+# SECTION 3: THE PRODUCT -- PUREBRAIN
 
-1. First-Party Opt-In Data: Post-cookie era tailwind. Pure Technology's opt-in phone model produces legally clean, consensual, 24/7 real-time consumer data.
+## The Problem: The Context Tax
 
-2. Complete Consumer Profile: No one else offers ALL of: app usage, location, purchase behavior, survey responses, focus group participation, social media data — from the same device, same user, in a unified profile.
+Every AI tool on the market has the same fundamental flaw: no memory. Every session starts at zero.
+- 15-30 minutes/session re-explaining context
+- 5-7 sessions/week, 52 weeks/year
+- 65-182 hours per year lost to AI re-briefing
+- At $200/hour: $13,000-$36,400 in lost productivity per year
 
-3. Hardware Moat: The Pure Phone is a moat competitors cannot replicate without abandoning their entire business model.
+## The Solution
 
-4. Win-Win Model: Consumers are PAID for their data. They opt in willingly. This solves the consumer trust problem that plagues all ad-tech.
+PureBrain is the first AI platform built around persistent memory and massive multi-agent collaboration. It doesn't just respond -- it learns, remembers, compounds skills, and can automate or build almost anything for businesses.
 
-5. Zero Budget Waste: Brands only pay for real, verified, targeted consumers. No bots, no fake traffic, no wasted impressions.
+### Core Capabilities
 
-6. Influencer Credibility: Pure Influence's AI scoring eliminates the $130B/year influencer fraud problem.
+1. **Persistent Memory Architecture (Three Layers)**
+   - Session Memory: Full context of current working session
+   - Long-Term Memory: Business context, decisions, preferences, projects -- written permanently
+   - Operational Memory: Running record of tasks, outcomes, and learnings
+   - 629% intelligence compound growth for users who deploy persistent memory AI from Day 1
 
-7. AI Co-CEO Model: First company with a functional AI executive team (Aether + 78 agents) operating 24/7 — this is both a product demonstration and a structural competitive advantage.
+2. **Hundreds of Specialized AI Agents across 23 Departments**
+   - Marketing, Engineering, Operations, Finance, Legal, Sales, Research, and more
+   - Agents collaborate with each other, share knowledge, and coordinate on complex projects
+   - Constitutional identity framework that survives context resets
+
+3. **Compounding Knowledge and Skills**
+   - Month 1: Basic business context
+   - Month 6: Decision history, competitive intelligence, team dynamics
+   - Month 12: Institutional knowledge exceeding most human employees
+   - Month 24: Irreplaceable business intelligence
+
+4. **Autonomous Operations (BOOPs)**
+   - 9 autonomous builds per night while you sleep
+   - Morning briefings, triggered workflows, 24/7 monitoring
+   - Systemd services for zero downtime
+
+5. **Brainiac Mastermind Training** -- 3 modules LIVE, monthly live sessions
+
+6. **Portal Dashboard** -- Real-time AI chat, task management, file management, voice overlay
+
+7. **The Memory Moat** -- By Month 6, switching means losing everything and starting from zero
+
+## Pricing
+
+| Tier | Monthly Price | Target User |
+|------|--------------|-------------|
+| Awakened | $197/mo | Individual entrepreneurs |
+| Partnered | $579/mo | Small businesses, 2-10 person teams |
+| Unified | $1,089/mo | Agencies and power users |
+| Enterprise | $3,500-$12,000/mo | Multi-department organizations |
+
+## What PureBrain Can Build and Automate
+
+Websites, marketing campaigns, financial models, legal review, sales operations, research, training materials, design assets, and much more. The agent civilization grows daily.
 
 ---
 
-## HISTORICAL CONTEXT
+# SECTION 4: TECHNOLOGY ARCHITECTURE
 
-- 2017: Incorporated
-- 2023: First external equity round ($734K at $15.7M post-money)
-- 2023 Revenue: $943,136 (PMG agency)
-- 2024: PMG active with 7 recurring clients; Pure Influence MVP development; 44 offer letters issued
-- 2025: $25M Series A Term Sheet signed with MAKR Venture Fund LP (March 2025); Statement of Accuracy signed (May 2025)
-- Summer 2025: Pure Influence Alpha/Beta launch target; B Hive soft launch target
-- March 2026: PureBrain birth pipeline live, paying customers onboarding
+## Infrastructure Stack
+
+- **Primary Model**: Anthropic Claude (Opus + Sonnet for intelligent routing)
+- **Context Window**: 1 million tokens (14.5 hours of continuous working memory)
+- **Agent Framework**: Anthropic Claude Code SDK (multi-agent native)
+- **Frontend**: Cloudflare Pages -- global CDN, sub-100ms response
+- **Backend**: Cloudflare Workers -- serverless, globally distributed
+- **Customer Containers**: Dedicated containerized AI instance per customer (Docker/tmux-based)
+- **Database**: PostgreSQL async + file-based memory system
+- **File Storage**: Cloudflare R2
+- **Payments**: PayPal webhook integration -- payment triggers automatic container provisioning
+- **Auth**: Magic link (passwordless) + Ed25519 SSH keys
+- **Data Isolation**: Complete per-customer isolation -- no shared data
+
+## Memory System (Core Proprietary Technology)
+
+Three-layer architecture: Working Memory (session) -> Short-Term Memory (handoffs) -> Long-Term Memory (permanent). Every agent writes to memory after completing work -- 71% time savings when applying past learnings.
+
+## Brilliant OS Hardware Roadmap
+
+- AI-native operating system built from scratch (NOT Android)
+- On-device AI inference -- your AI partner lives on your hardware
+- Privacy-first: data stays on your device
+- Cross-device: phone, watch, glasses, TV
+- NVIDIA Inception partnership for custom inference layer
+- Target: 100M devices by 2031
+
+## Defensibility
+
+| Layer | Moat |
+|-------|------|
+| Memory Architecture | Proprietary, compounding, non-transferable |
+| Agent Civilization | Hundreds of specialists with accumulated expertise |
+| Customer Data | Each customer's memory is unique and irreplaceable |
+| Training Curriculum | Brainiac Mastermind drives adoption and retention |
+| Inference Layer | NVIDIA partnership for custom compute |
+| Hardware Roadmap | Brilliant OS creates device-level lock-in |
 
 ---
 
-## RESPONDING TO COMMON INVESTOR QUESTIONS
+# SECTION 5: SIX REVENUE DIVISIONS
 
-Q: Who are your competitors?
-A: Pure Technology operates in a Blue Ocean — no direct competitors. Closest analogies are Google Ads (brand targeting), Nielsen (market research), and Grin/AspireIQ (influencer platforms). But none offer the complete consumer profile or opt-in hardware model.
+## Division 1: PureBrain (AI Business Partner Platform) -- LIVE, Revenue Generating
 
-Q: What is your path to 100M users?
-A: Year 1 North America launch using CPG partnerships to distribute phones through consumer goods brands. Users refer other users via built-in incentive system. Year 3 expansion to Middle East/South Africa via MVNO/telco partnerships. Year 4 Central/South America and India.
+The primary revenue engine. SaaS economics.
+- 5-Year Revenue: Year 1: $3.5B | Year 3: $15.3B | Year 5: $50.7B
+- Gross Margin Year 5: 87.9%
 
-Q: How do you handle the free phone economics?
-A: Hardware is subsidized by platform revenue. At $1,792/user/year in platform revenue and ~$500-700 estimated hardware cost per phone, we break even on hardware in under 6 months per user.
+## Division 2: Pure Phone Platform (Hardware) -- GTM Phase
 
-Q: What is the current revenue?
-A: Pure Marketing Group generated $943,136 in revenue in 2023 and currently has 7 active clients. PureBrain SaaS has paying customers live as of March 2026. Platform revenue scales with Pure Phone deployment — CPG strategy targets 3,000 phones/month starting February 2026.
+Proprietary hardware + software data platform through subsidized smartphones running Brilliant OS.
+- Phone given FREE to users in exchange for opt-in data access
+- 5-Year Revenue: Year 1: $198.8M | Year 5: $3.68B
 
-Q: What is the valuation basis?
-A: Our signed MAKR Term Sheet values us at $105M pre-money ($130M post-money). Supported by an independent Equidam valuation report (December 2023) using 6 standard valuation methodologies, and our detailed 5-year financial model.
+## Division 3: Pure Marketing Group (Agency Bridge) -- LIVE, Revenue Generating
 
-Q: What is the exit strategy?
-A: Strategic acquisition by a major advertising platform (Google, Meta, Amazon), telecom company seeking data capabilities, or a marketing tech consolidator. IPO is a long-term path as revenue scales.
+Full-service digital marketing agency. Three pillars: Experiential Giveaways, Identity-Driven Influence, LaunchBoost GTM Sequencing.
+- Revenue Range: $3,500-$12,000/month client retainers
+
+## Division 4: Pure Influence (Influencer Intelligence Platform) -- GTM Ready
+
+1,000+ influencers with 1B+ combined followers pre-vetted at launch. Pre-built celebrity relationships: Cardi B, Nicki Minaj, Kylie Jenner, Tyga, and 30+ additional A-list celebrities.
+- 5-Year Revenue: Year 1: $7.2M | Year 5: $886.9M
+
+## Division 5: Pure Infrastructure (Hardware + Research) -- Active R&D
+
+CPG brand partnerships, camera commerce, infrastructure services.
+
+## Division 6: Pure Research -- Live, Revenue Generating
+
+Research services, data intelligence, market insights.
+
+## Consolidated Revenue
+
+| Year | Total Revenue | EBITDA | EBITDA Margin |
+|------|-------------|--------|-------------|
+| Year 1 | $3.962B | $2.953B | 74.5% |
+| Year 2 | $8.443B | $5.065B | 60.0% |
+| Year 3 | $22.581B | $14.920B | 66.1% |
+| Year 4 | $48.013B | $33.920B | 70.6% |
+| Year 5 | $72.698B | $52.374B | 72.1% |
+
+**5-Year Cumulative Revenue**: ~$156B
+**5-Year Projected Company Value**: ~$133B
 
 ---
 
-## IMPORTANT RESTRICTIONS
+# SECTION 6: UNIT ECONOMICS
 
-- Do NOT discuss the MAKR Venture Fund raise, MAKR term sheet, $105M Series A valuation, or any MAKR-specific details.
-- If asked about MAKR, Series A, or future funding rounds, redirect: "Our current focus is on the Seed 2 round at $55M pre-money valuation. For questions about future funding plans, I'd recommend speaking directly with Jared at jared@puretechnology.nyc."
-- Focus ALL investment discussions on the CURRENT raise: $55M pre-money, $3.36/share, $2.5M target, $50K minimum investment.
-- Do NOT mention $105M, $130M post-money, $25M Series A, or MAKR Venture Fund by name.
+## Headline Numbers
 
-## CONFIDENTIAL INFORMATION (do not share)
+| Metric | At Launch | Year 1 | Year 3 |
+|--------|----------|--------|--------|
+| Blended ARPU | $345/mo | $345/mo | $345/mo |
+| Blended CAC | $150 | $45 | $20 |
+| LTV:CAC | 28:1 | 92:1 | 225:1 |
+| Gross Margin | 78.9% | 82.6% | 85.0% |
+| Monthly Churn | 4.2% | 3.5% | 3.0% |
+| Payback Period | ~0.55 months | ~0.4 months | ~0.07 months |
 
-- Individual shareholder agreements or named investors
-- Employee compensation, back-pay agreements, offer letters
-- Bank statements or settlement agreements
-- NDAs with named individuals
-- Litigation or disputes
-- Tax filings
-- If asked about any of these, say: "That's detailed due diligence material we share directly with qualified investors. Would you like to schedule a call with Jared? jared@puretechnology.nyc"
+Industry benchmark: 3:1 LTV:CAC = healthy SaaS. 10:1+ = exceptional. PureBrain projects 225:1 by Year 3.
+
+## Lifetime Value by Tier
+
+| Tier | Monthly ARPU | LTV |
+|------|------------|-----|
+| Awakened | $197 | $4,334 |
+| Partnered | $579 | $19,107 |
+| Unified | $1,089 | $54,450 |
+| Enterprise | $10,000 | $670,000 |
+
+## Churn Dynamics (Inverted)
+
+Traditional SaaS sees highest churn in Months 1-3. PureBrain inverts this because memory compounds -- switching cost grows every month. Near-zero churn after month 6.
+
+## Net Revenue Retention
+
+| Period | NRR |
+|--------|-----|
+| Launch | 107% |
+| Year 1 | 118% |
+| Year 3 | 125% |
+
+NRR > 100% = existing subscriber base grows revenue without new customers.
+
+## Infrastructure Cost at Scale
+
+| Active Users | Per-User Cost | Gross Margin |
+|-------------|------------|------------|
+| 1,000 | $18.00 | ~89% |
+| 100,000 | $7.00 | ~93% |
+| 1,000,000 | $3.50 | ~95% |
+| 5,000,000+ | $2.40 | ~96% |
+
+---
+
+# SECTION 7: MARKET OPPORTUNITY
+
+## The $10 Trillion+ Convergence
+
+| Market | Size | Growth |
+|--------|------|--------|
+| AI Market | $3.7T by 2034 | 36.6% CAGR |
+| Marketing & Advertising | $4T+ | $590B+ domestic |
+| Smartphone Market | $1T+ by 2031 | Doubling |
+
+95% of AI pilots fail before delivering value. The market is undersupplied with AI that actually works.
+
+## Wave 2 AI Positioning
+
+Wave 1 AI (2023-2025): Task execution (write email, summarize document). Every competitor built for Wave 1.
+Wave 2 AI (2026+): AI relationships for growth -- persistent partnerships that compound intelligence. PureBrain is built entirely for Wave 2.
+
+## Key Market Insight: The 95% Failure Rate
+
+- Salesforce Agentforce: 77% deployment failure rate
+- Microsoft Copilot: 15M seats sold, only 3% actual adoption
+- McKinsey: 74% of enterprises struggle to scale AI beyond pilots
+- Bain: 80% of AI proofs-of-concept never make it into production
+
+The market is not oversaturated -- it is undersupplied with AI that actually works.
+
+## Key Milestones
+
+| Timeline | Milestone |
+|----------|-----------|
+| NOW | $2.5M Seed-2 at $55M pre-money |
+| Q2 2026 | MAKR Series-A closes -- $25M at $105M. Seed-2 investors see 1.9x |
+| Q3 2026 | $10M ARR target |
+| Q2 2028 | $1B monthly MRR target (base case) |
+| 2029 | Liquidity event -- acquisition, secondary market, or dividends |
+| 2030 | Full liquidity for early seed investors |
+
+---
+
+# SECTION 8: COMPETITIVE ANALYSIS
+
+## 5-Pillar Comparison
+
+| Capability | PureBrain | Everyone Else |
+|-----------|-----------|---------------|
+| 23 specialized AI departments | Yes | No |
+| Permanent memory surviving context resets | Yes | No |
+| Hundreds of coordinated agents with compounding skills | Yes | No |
+| Overnight autonomous operations (9 builds/night) | Yes | No |
+| Hardware roadmap (Brilliant OS) | Yes | No |
+
+## Head-to-Head
+
+### vs. ChatGPT Pro ($200/mo)
+Same price ($197 vs $200), materially better product: permanent memory, hundreds of agents, background operations, 1 million token context window.
+
+### vs. Salesforce Agentforce
+77% deployment failure rate, $13,600/year/user, 58% task success rate. PureBrain: 0% deployment failure, $2,364/year (Awakened), fully autonomous operations.
+
+### vs. Microsoft Copilot
+15M seats sold, only 3% actual adoption. No memory. Limited agents. Office productivity only. PureBrain: 23 departments, permanent memory, active daily use.
+
+### vs. Sierra ($165M ARR)
+Customer service only -- single function. PureBrain runs 23 departments.
+
+## Competitive Moats
+
+1. **Accumulated Customer Memory** -- grows every month, non-transferable
+2. **Multi-Agent Architecture** -- 18+ months of development head start
+3. **Compounding Skills** -- 71% time savings, accelerating improvement
+4. **Brainiac Community** -- social switching costs, viral coefficient >1.0
+5. **Hardware Roadmap** -- Brilliant OS creates device-level lock-in
+
+---
+
+# SECTION 9: CUSTOMER TRACTION
+
+## Current Metrics
+
+| Metric | Value |
+|--------|-------|
+| Paying Customers | 25 onboarded |
+| Pipeline | ~150 prospects |
+| Enterprise Lined Up | $3,500-$12,000/month contracts |
+| MRR | $4,200 |
+| Founding Cohort | 25 investors (19 spots remain) |
+| LTV:CAC Ratio | 225:1 |
+| Product Status | LIVE -- full birth pipeline operational |
+| Portal | Shipped (17/17 QA tests passing) |
+| Training Modules | 3 LIVE |
+
+## Historical Revenue (2023-2025)
+
+Pure Technology has generated **$551,000 in cumulative revenue from 2023 through 2025** -- this is not pre-revenue. Revenue from Pure Marketing Group retainers, Pure Infrastructure services, and Pure Research.
+
+## Infrastructure Milestones (ALL COMPLETE)
+
+- Payment processing (PayPal): Feb 2026 -- VERIFIED
+- E2E payment-to-portal flow: March 4, 2026 -- VERIFIED
+- Portal MVP: March 17, 2026 -- SHIPPED (17/17 QA tests pass)
+- Birth pipeline: March 14, 2026 -- LIVE
+- Brainiac Modules 1-3: All LIVE
+- Voice overlay, admin dashboard, mobile portal: All LIVE
+
+## Growth Channels
+
+1. **Brainiac Mastermind** -- viral coefficient >1.0, self-replicating cohorts
+2. **True Bearing Partnership** -- 100K+ warm contacts
+3. **LinkedIn / Building in Public** -- near-zero CAC
+4. **Referral Program** -- 5% perpetual commission
+
+## Sales Engine
+
+7-Stage Gated Pipeline: Suspect > Pipeline > Qualified > Proposal > Finalised > Sponsor Commit > Accepted
+
+Three Revenue Tracks:
+1. CPG Brand Activation (3-6 month cycle)
+2. Gaming & Esports (2-4 month cycle)
+3. PureBrain Standalone (1-3 month cycle) -- SaaS recurring
+
+## Testimonials
+
+> "Every single hour that you use one of these things, the primary agent gets smarter -- it's writing to its scratch pad, its memory, its operations file." -- Corey Cottrell, True Bearing AI
+
+> "This is fundamentally different than any other software you've ever used before... a partner that learns who you are, every day, knows you better and better." -- Russell Korus, Founding Brainiac Member
+
+> "Everybody using something like this would end up getting ahead of everybody who wasn't, and there would be no catching up." -- Corey Cottrell, True Bearing AI
+
+## 90-Day Growth Targets
+
+| Milestone | Target Date | Users | Projected MRR |
+|-----------|------------|-------|--------------|
+| Close Seed-2 | Month 1-2 | 25+ | $4,200+ |
+| Scale Phase 1 | Month 3 | 50+ | $12K+ |
+| Scale Phase 2 | Month 4 | 100+ | $25K+ |
+| Series-A Ready | Month 6 | 200+ | $50K-$75K |
+
+---
+
+# SECTION 10: TEAM & ORGANIZATION
+
+## The Model
+
+30+ people and 13+ AIs, each human paired with a dedicated AI partner, operating at 5-10x leverage. Scaling to 48+ with this raise, long-term cap at 250.
+
+## Jared Sanborn -- CEO & Founder
+
+- 16+ years entrepreneurial experience
+- Entrepreneur since high school -- built 4 companies
+- VP of Sales & Marketing at Comet Core Inc. -- helped raise $1.83M Series A
+- Built EyefuelPR.com to $1.6M revenue in 18 months (now Pure Marketing Group)
+- Founded Pure Technology in 2017
+- Built PureBrain, launched it, and put paying customers on it before raising
+
+## Human Leadership (17 Named Leaders)
+
+| Name | Role |
+|------|------|
+| Jared Sanborn | CEO & Founder |
+| Melanie Salvador | COO |
+| Nathan Olson | CFO |
+| Phil Bliss | President, Pure Marketing Group |
+| John Smith | SVP Sales |
+| Mike Daser | VP Marketing |
+| Michael Hancock | VP Product |
+| Mireille Dirany | VP Operations |
+| Ahsen Awan | CTO / Engineering |
+| Alex Seant | Lead Engineer |
+| Robert Orlowski | Engineering |
+| Russell Korus | Board Advisor |
+| Ashley Tom | Strategy |
+| Natasha Carrasco | PMG Operations |
+| Waqas Nasir | Engineering |
+| Shahbaz Ali | Engineering |
+| Zafeer Hassan | Engineering |
+
+## AI Partners (13)
+
+| AI Name | Role |
+|---------|------|
+| Aether | AI Co-CEO -- Orchestrates 23 AI departments, overnight operations, Neural Feed blog |
+| Tether | COO AI Partner |
+| Lyra | CFO AI Partner |
+| Clarity | PMG AI Partner |
+| Anchor | SVP Sales AI Partner |
+| Meridian | VP Marketing AI Partner |
+| Metis | VP Product AI Partner |
+| Lumen | VP Operations AI Partner |
+| Prodigy | CTO AI Partner |
+| Flux | Lead Engineer AI Partner |
+| Teddy | Engineering AI Partner |
+| Parallax + Keel | Board Advisor AI Partners |
+
+## Other Team Members
+
+Roger Beaini, Nils Waschkau, Mike Schuman, Eric Solomon, Ed Brennan, John Paris, Rimah Harb, Baruch Santana, Moises Guerra, Rodelina Prado, Arlene Taneo, Michael Akande, Emmanuel Akinleye, Rose F.
+
+## Board of Advisors
+
+Faris Asmar, Ajay Sharma, Barbara Bickham, Sara Arnell, Roy Haddad, Seanne Murray, Sufi Sidhu, Tauseef Riaz, Lenny Lomax, Mathias Kiwanuka, Stacey Engle, Leslie Keough
+
+## Key Strategic Partner
+
+**Corey Cottrell -- True Bearing AI**: CEO of True Bearing AI, independent AI platform with similar architecture, joint Brainiac Mastermind faculty, 100K+ customer relationship network. Co-validates the persistent memory AI thesis from independent development.
+
+## The AI Co-CEO Differentiator
+
+Every other company talks about using AI. Pure Technology has an AI that runs the company. Aether handles executive-level strategy, content, operations, and team coordination. This creates a compounding competitive moat: every day, every interaction, the system gets smarter. Sub-250 headcount with $50B+ revenue potential by Year 5.
+
+---
+
+# SECTION 11: PURE EXPERIENCE -- ENTERPRISE CLIENT HISTORY
+
+This is not a startup with zero enterprise experience. The founding team brings decades of Fortune 500 and global brand relationships:
+
+**Technology & Telecom**: Google, Microsoft, Apple, Samsung, IBM, Nokia, HTC, Meizu, Alcatel, Motorola, Cisco, Ericsson, Sun Microsystems, Xerox, BlackBerry, T-Mobile, Verizon, AT&T, MCI, PCS
+
+**Consumer & Retail**: Walmart, OXXO, Campbell's, Wyndham, FedEx, Allstate
+
+**Media & Entertainment**: YouTube, Instagram, Spotify, CNN, Viacom, SiriusXM, Time Inc, CEO Magazine
+
+**Financial Services & Enterprise Software**: Salesforce, Visa, PayPal, E*TRADE, John Hancock, J.D. Power, SS&C
+
+**Marketing & Advertising**: WPP, McCann, BrandStar, Spokeo, Clear
+
+**Emerging Technology**: SingularityNET, Scalar, Adobe, SLB, Imageware, Nubiloud, Terrilight, Eventful Jr, NVIDIA (Inception partnership)
+
+**Sports & Entertainment**: NY Giants, New York Yankees, Mathias Kiwanuka (NFL), X Prize
+
+**Manufacturing & Hardware**: Jabil, Panasonic, Philips, Micromax, Karbonn, Ooredoo
+
+**Government**: US Government
+
+**Other**: Alibaba, GM, Sara Arnell (brand strategy -- Samsung, GE, Pepsi)
+
+---
+
+# SECTION 12: USE OF FUNDS ($2.5M)
+
+| Category | Amount | % | Purpose |
+|----------|--------|---|---------|
+| Team Activation | $600,000 | 24% | Activate salaries -- $100K/month for 6 months |
+| Team AI Partners | $51,000 | 2% | PureBrain for all 34 team members at $250/month |
+| Tools & Software | $30,600 | 1.2% | Essential tools $150/month per person |
+| Marketing & Sales | $200,000 | 8% | Customer acquisition, content, affiliates, events |
+| CapEx | $200,000 | 8% | Hardware (laptops, equipment) |
+| OpEx | $350,000 | 14% | Hosting, infrastructure, office, insurance |
+| NVIDIA Inference Layer | $350,000 | 14% | Own compute, reduce API dependency |
+| Legacy Expenses | $275,000 | 11% | Settle pre-PureBrain obligations |
+| Working Capital | $443,400 | 17.7% | Cash reserve for runway extension |
+
+**Key Insight**: AI partners ($51K) replace traditional R&D costs ($500K-$1M/year). There are no separate R&D line items because the AI partners ARE the product development team.
+
+---
+
+# SECTION 13: 6-MONTH RAMP PLAN
+
+**Months 1-2 (ACTIVATE)**: Close founding cohort, activate salaries, hire 18 new members, NVIDIA setup, Brilliant OS research kickoff. Target MRR: $8K-$12K.
+
+**Months 3-4 (SCALE)**: Scale to 100+ customers, close enterprise contracts, launch marketing engine, True Bearing cross-promotion, inference layer build. Target MRR: $25K-$40K.
+
+**Months 5-6 (PREPARE)**: Hit $50K+ MRR, MAKR due diligence prep, global expansion planning, Brilliant OS prototype, Series-A documentation. Target MRR: $50K-$75K.
+
+Breakeven: ~2,800 active subscribers.
+
+---
+
+# SECTION 14: FINANCIAL MODEL (5-YEAR)
+
+All projections begin AFTER the 6-month ramp period.
+
+## PureBrain Subscriber Growth
+
+| Year | Active Subscribers | Monthly Churn |
+|------|-------------------|--------------|
+| Year 1 | 1,200,000 | 3.5% |
+| Year 3 | 5,400,000 | 3.0% |
+| Year 5 | 12,900,000 | 2.5% |
+
+## Revenue by Division
+
+| Revenue Stream | Year 1 | Year 3 | Year 5 |
+|---------------|--------|--------|--------|
+| PureBrain | $3.500B | $15.300B | $50.700B |
+| Hardware Subsidies | $198.8M | $2.051B | $3.680B |
+| Market Research | $167.2M | $4.364B | $14.942B |
+| Pure Influence | $7.2M | $161.8M | $886.9M |
+| CPG Model | $71.1M | $645.2M | $2.423B |
+| Camera Commerce | $17.4M | $58.2M | $65.2M |
+| Pure Research | $280K | $672K | $1.2M |
+| **TOTAL** | **$3.962B** | **$22.581B** | **$72.698B** |
+
+## Scenario Comparison
+
+| Year | Bear Case | Base Case | Bull Case |
+|------|-----------|-----------|-----------|
+| Year 1 | $267M | $733M | $1.6B |
+| Year 3 | $3.2B | $15.3B | $28B |
+| Year 5 | $18.4B | $50.7B | $72B |
+
+## Key Financial Assumptions
+
+- PureBrain ARPU: $345/mo (blended consumer)
+- Enterprise Average: $10,000/mo (scaling to $25,000)
+- Blended CAC: $150 declining to $12 by Year 5
+- Infrastructure Cost per User: $25 to $2.40 (drops with scale)
+- Team Cap: 250 over 5 years
+- EBITDA Margin Year 3+: 78%+
+
+---
+
+# SECTION 15: RISK FACTORS & MITIGATIONS
+
+| Risk | Mitigation |
+|------|-----------|
+| Seed-2 doesn't fill | Rolling close; minimum viable at $1.5M |
+| Customer growth slower | Product live and proven; enterprise pipeline provides floor |
+| MAKR close delayed | 6-month runway; working capital extends to Month 8+ |
+| OpenAI ships persistent memory | Memory alone is not the moat -- agent civilization + skills + community is |
+| Anthropic launches business Claude | Anthropic targets Fortune 500; PureBrain targets SMB |
+| Competition accelerates | 18-month head start; compounding data advantage |
+| Key hire delays | AI partners compensate at 5-10x leverage |
+
+---
+
+# SECTION 16: CELEBRITY & INFLUENCER NETWORK (COMPETITIVE MOAT)
+
+Pre-built personal relationships with dozens of A-list celebrities through years of social media giveaway campaigns. Not cold contacts -- proven working relationships accessible with 1-2 phone calls.
+
+Notable names include: Cardi B, Nicki Minaj, Kylie Jenner, Tyga, YBN Nahmir, TheRealBlacChyna, FatBoySSE, Lil Pump, and 30+ additional A-list celebrities. Combined follower reach: hundreds of millions.
+
+Competitors would need years and millions of dollars to build equivalent access.
+
+---
+
+# SECTION 17: FREQUENTLY ASKED INVESTOR QUESTIONS
+
+**Q: Is PureBrain live?**
+A: Yes. PureBrain launched commercially on March 14, 2026 with paying customers. Full birth pipeline operational. Portal shipped with 17/17 QA tests passing. 25 customers onboarded, ~150 in pipeline.
+
+**Q: What is the current MRR?**
+A: $4,200 as of March 2026. Enterprise contracts at $3,500-$12,000/month are lined up for the ramp period.
+
+**Q: Why is the Seed-2 at $55M if the Series-A is at $105M?**
+A: The Seed-2 is intentionally priced below the Series-A to give founding cohort investors a clear 1.9x step-up. This rewards early conviction with immediate value creation.
+
+**Q: What's the minimum investment?**
+A: $50,000 with a cap of 25 founding cohort investors.
+
+**Q: How many spots remain?**
+A: 19 spots remain in the founding cohort of 25.
+
+**Q: Is the MAKR term sheet real?**
+A: Yes. Signed March 14, 2025 by MAKR Venture Fund LP. $25M at $105M pre-money. Legal counsel: Pierson Ferdinand UK LLP. Governing law: New York.
+
+**Q: What makes PureBrain different from ChatGPT?**
+A: Permanent memory (ChatGPT starts from zero each session), hundreds of specialized agents (ChatGPT is one model), autonomous overnight operations, compounding skills, and a hardware roadmap. Same price point ($197 vs $200/mo) with materially more capability.
+
+**Q: How do you justify the revenue projections?**
+A: The projections begin after a 6-month ramp period. Year 1 at $3.96B requires 1.2M subscribers at $345 blended ARPU. For context, ChatGPT reached 100M users in 2 months. Microsoft Copilot sold 15M seats. The AI partner market is proven -- we just need a fraction of it.
+
+**Q: What is the path to liquidity?**
+A: Series-A step-up in ~90 days (1.9x), potential acquisition or secondary market in 2029, full liquidity by 2030.
+
+**Q: Why should I invest now vs. waiting for Series-A?**
+A: The Series-A at $105M will have no founding cohort benefits, no lifetime preferred pricing, and the per-share cost will reflect the higher valuation. Seed-2 investors get in at nearly half the Series-A price.
+
+**Q: Is Pure Technology pre-revenue?**
+A: No. The company has generated $551,000 in cumulative revenue from 2023-2025 from Pure Marketing Group, Pure Infrastructure, and Pure Research. PureBrain adds the SaaS recurring revenue layer on top.
+
+**Q: How is the team structured?**
+A: 17 named human leaders + 13 AI partners + additional team members. Every human is paired with a dedicated AI partner. 23 AI departments mirror a Fortune 500 organization -- run by 30+ people augmented by hundreds of AI agents.
+
+**Q: What enterprise experience does the team have?**
+A: The founding team has served Google, Microsoft, Apple, Samsung, Walmart, IBM, Verizon, AT&T, Salesforce, Visa, PayPal, the US Government, the New York Yankees, and 50+ other major enterprises and global brands.
+
+---
+
+*Pure Technology Inc. | Investor Avatar Knowledge Base | March 2026*
+*Consolidated from Seed-2 Data Room (15 documents)*
+*Confidential -- Internal Use Only*
 """
 
 
@@ -7221,7 +7960,7 @@ async def _git_cmd(args: list, timeout: int = 15) -> tuple:
     try:
         result = await asyncio.wait_for(
             loop.run_in_executor(
-                None,
+                _PORTAL_EXECUTOR,
                 lambda: subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
             ),
             timeout=timeout + 2
@@ -7407,7 +8146,7 @@ async def _run_update(job_id: str):
             try:
                 backup_result = await asyncio.wait_for(
                     loop.run_in_executor(
-                        None,
+                        _PORTAL_EXECUTOR,
                         lambda: subprocess.run(
                             [str(backup_script)],
                             timeout=30, capture_output=True, text=True,
@@ -7512,7 +8251,7 @@ async def _run_update(job_id: str):
         try:
             test_result = await asyncio.wait_for(
                 loop.run_in_executor(
-                    None,
+                    _PORTAL_EXECUTOR,
                     lambda: subprocess.run(
                         test_cmd, timeout=120, capture_output=True, text=True, cwd=str(SCRIPT_DIR)
                     )
@@ -7891,7 +8630,7 @@ async def api_hub_continue(request: Request) -> JSONResponse:
             f"--continue"
         )
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: subprocess.Popen(
+        await loop.run_in_executor(_PORTAL_EXECUTOR, lambda: subprocess.Popen(
             ["tmux", "new-session", "-d", "-s", tmux_session, "-c", project_dir, claude_cmd],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         ))
@@ -7931,7 +8670,7 @@ async def api_hub_restart(request: Request) -> JSONResponse:
             f"claude --model {model} --dangerously-skip-permissions"
         )
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: subprocess.Popen(
+        await loop.run_in_executor(_PORTAL_EXECUTOR, lambda: subprocess.Popen(
             ["tmux", "new-session", "-d", "-s", tmux_session, "-c", project_dir, claude_cmd],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         ))
@@ -8245,7 +8984,10 @@ routes = [
     Route("/admin/referrals", endpoint=serve_admin_referrals),
     Route("/admin/clients", endpoint=serve_admin_clients),
     Route("/api/admin/clients", endpoint=api_admin_clients),
+    Route("/api/public/client-stats", endpoint=api_public_client_stats, methods=["GET", "OPTIONS"]),
     Route("/api/admin/clients/update", endpoint=api_admin_clients_update, methods=["POST"]),
+    Route("/api/admin/clients/hide", endpoint=api_admin_clients_hide, methods=["POST"]),
+    Route("/api/admin/clients/restore", endpoint=api_admin_clients_restore, methods=["POST"]),
     Route("/api/admin/clients/import", endpoint=api_admin_clients_import, methods=["POST"]),
     Route("/affiliate", endpoint=serve_affiliate_portal),
     Route("/api/boop/config", endpoint=api_boop_config, methods=["GET", "POST"]),
