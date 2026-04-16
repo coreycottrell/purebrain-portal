@@ -654,9 +654,13 @@ class TestTrackingBrevoIntegration:
         assert result["processed"] is True
         # Brevo should have been called
         mock_req.assert_called()
-        call_args = mock_req.call_args[0]
-        assert call_args[0] == "PUT"  # PUT to update contact
-        assert call_args[2]["attributes"]["PAYMENT_STATUS"] == "subscription_cancelled"
+        # Find the status update call (PUT to /contacts/...)
+        put_calls = [
+            c for c in mock_req.call_args_list
+            if c[0][0] == "PUT"
+        ]
+        assert len(put_calls) >= 1, "Should have at least one PUT call for status update"
+        assert put_calls[0][0][2]["attributes"]["PAYMENT_STATUS"] == "subscription_cancelled"
 
     @patch("brevo_sync._brevo_request")
     def test_webhook_payment_completed_uses_billing_agreement_id(self, mock_req, populated_db):
@@ -1049,3 +1053,349 @@ class TestFailureAlerting:
 
         assert result["ok"] is False
         mock_notify.assert_not_called()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEST SUITE 13: List management — add_to_list / remove_from_list
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestListManagement:
+    """Test low-level list add/remove helpers."""
+
+    @patch("brevo_sync._brevo_request")
+    def test_remove_from_list_sends_correct_payload(self, mock_req):
+        """Should POST to /contacts/lists/{id}/contacts/remove with email array."""
+        from brevo_sync import remove_from_list
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        remove_from_list("alice@example.com", 8)
+
+        mock_req.assert_called_once_with(
+            "POST", "/contacts/lists/8/contacts/remove",
+            {"emails": ["alice@example.com"]},
+        )
+
+    @patch("brevo_sync._brevo_request")
+    def test_add_to_list_sends_correct_payload(self, mock_req):
+        """Should POST to /contacts/lists/{id}/contacts/add with email array."""
+        from brevo_sync import add_to_list
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        add_to_list("bob@example.com", 35)
+
+        mock_req.assert_called_once_with(
+            "POST", "/contacts/lists/35/contacts/add",
+            {"emails": ["bob@example.com"]},
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEST SUITE 14: Route 4 — Payment Failed (Dunning)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPaymentFailedRouting:
+    """Test sync_payment_failed routing logic."""
+
+    @patch("brevo_sync._brevo_request")
+    def test_removes_from_active_list(self, mock_req):
+        """Payment failed should remove from List 8 (Active)."""
+        from brevo_sync import sync_payment_failed, LIST_ACTIVE
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_payment_failed("alice@example.com")
+
+        # First call should be remove from active list
+        remove_call = mock_req.call_args_list[0]
+        assert remove_call == call(
+            "POST", f"/contacts/lists/{LIST_ACTIVE}/contacts/remove",
+            {"emails": ["alice@example.com"]},
+        )
+
+    @patch("brevo_sync._brevo_request")
+    def test_adds_to_dunning_list(self, mock_req):
+        """Payment failed should add to List 35 (Dunning)."""
+        from brevo_sync import sync_payment_failed, LIST_DUNNING
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_payment_failed("alice@example.com")
+
+        # Second call should be add to dunning list
+        add_call = mock_req.call_args_list[1]
+        assert add_call == call(
+            "POST", f"/contacts/lists/{LIST_DUNNING}/contacts/add",
+            {"emails": ["alice@example.com"]},
+        )
+
+    @patch("brevo_sync._brevo_request")
+    def test_calls_both_operations(self, mock_req):
+        """Payment failed should make exactly 2 Brevo calls."""
+        from brevo_sync import sync_payment_failed
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_payment_failed("alice@example.com")
+
+        assert mock_req.call_count == 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEST SUITE 15: Route 5 — Subscription Cancelled (Win-back tiers)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCancelledRouting:
+    """Test sync_subscription_cancelled routing with win-back tiers."""
+
+    @patch("brevo_sync._brevo_request")
+    def test_removes_from_active_list(self, mock_req):
+        """Cancelled should remove from List 8 (Active)."""
+        from brevo_sync import sync_subscription_cancelled, LIST_ACTIVE
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_subscription_cancelled("alice@example.com", 45)
+
+        remove_call = mock_req.call_args_list[0]
+        assert remove_call == call(
+            "POST", f"/contacts/lists/{LIST_ACTIVE}/contacts/remove",
+            {"emails": ["alice@example.com"]},
+        )
+
+    @patch("brevo_sync._brevo_request")
+    def test_tier1_under_60_days(self, mock_req):
+        """0-59 days since payment -> List 32 (Win-Back T1)."""
+        from brevo_sync import sync_subscription_cancelled, LIST_WINBACK_T1
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_subscription_cancelled("alice@example.com", 45)
+
+        add_call = mock_req.call_args_list[1]
+        assert add_call == call(
+            "POST", f"/contacts/lists/{LIST_WINBACK_T1}/contacts/add",
+            {"emails": ["alice@example.com"]},
+        )
+
+    @patch("brevo_sync._brevo_request")
+    def test_tier2_60_to_89_days(self, mock_req):
+        """60-89 days since payment -> List 33 (Win-Back T2)."""
+        from brevo_sync import sync_subscription_cancelled, LIST_WINBACK_T2
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_subscription_cancelled("alice@example.com", 75)
+
+        add_call = mock_req.call_args_list[1]
+        assert add_call == call(
+            "POST", f"/contacts/lists/{LIST_WINBACK_T2}/contacts/add",
+            {"emails": ["alice@example.com"]},
+        )
+
+    @patch("brevo_sync._brevo_request")
+    def test_tier3_90_plus_days(self, mock_req):
+        """90+ days since payment -> List 34 (Win-Back T3)."""
+        from brevo_sync import sync_subscription_cancelled, LIST_WINBACK_T3
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_subscription_cancelled("alice@example.com", 120)
+
+        add_call = mock_req.call_args_list[1]
+        assert add_call == call(
+            "POST", f"/contacts/lists/{LIST_WINBACK_T3}/contacts/add",
+            {"emails": ["alice@example.com"]},
+        )
+
+    @patch("brevo_sync._brevo_request")
+    def test_default_tier_when_unknown(self, mock_req):
+        """0 days (unknown) -> List 32 (safest default, shortest tier)."""
+        from brevo_sync import sync_subscription_cancelled, LIST_WINBACK_T1
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_subscription_cancelled("alice@example.com", 0)
+
+        add_call = mock_req.call_args_list[1]
+        assert add_call == call(
+            "POST", f"/contacts/lists/{LIST_WINBACK_T1}/contacts/add",
+            {"emails": ["alice@example.com"]},
+        )
+
+    @patch("brevo_sync._brevo_request")
+    def test_boundary_60_days_is_tier2(self, mock_req):
+        """Exactly 60 days -> List 33 (Win-Back T2)."""
+        from brevo_sync import sync_subscription_cancelled, LIST_WINBACK_T2
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_subscription_cancelled("alice@example.com", 60)
+
+        add_call = mock_req.call_args_list[1]
+        assert add_call == call(
+            "POST", f"/contacts/lists/{LIST_WINBACK_T2}/contacts/add",
+            {"emails": ["alice@example.com"]},
+        )
+
+    @patch("brevo_sync._brevo_request")
+    def test_boundary_90_days_is_tier3(self, mock_req):
+        """Exactly 90 days -> List 34 (Win-Back T3)."""
+        from brevo_sync import sync_subscription_cancelled, LIST_WINBACK_T3
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_subscription_cancelled("alice@example.com", 90)
+
+        add_call = mock_req.call_args_list[1]
+        assert add_call == call(
+            "POST", f"/contacts/lists/{LIST_WINBACK_T3}/contacts/add",
+            {"emails": ["alice@example.com"]},
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEST SUITE 16: Route 6 — Subscription Reactivated
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestReactivatedRouting:
+    """Test sync_subscription_reactivated routing logic."""
+
+    @patch("brevo_sync._brevo_request")
+    def test_readds_to_active_list(self, mock_req):
+        """Reactivated should add to List 8 (Active)."""
+        from brevo_sync import sync_subscription_reactivated, LIST_ACTIVE
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_subscription_reactivated("alice@example.com")
+
+        # Last call should be add to active list
+        add_call = mock_req.call_args_list[-1]
+        assert add_call == call(
+            "POST", f"/contacts/lists/{LIST_ACTIVE}/contacts/add",
+            {"emails": ["alice@example.com"]},
+        )
+
+    @patch("brevo_sync._brevo_request")
+    def test_removes_from_all_churn_lists(self, mock_req):
+        """Reactivated should remove from Lists 32, 33, 34, 35, 30."""
+        from brevo_sync import (
+            sync_subscription_reactivated,
+            LIST_WINBACK_T1, LIST_WINBACK_T2, LIST_WINBACK_T3,
+            LIST_DUNNING, LIST_LAPSED,
+        )
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_subscription_reactivated("alice@example.com")
+
+        # Should have 6 calls: 5 removes + 1 add
+        assert mock_req.call_count == 6
+
+        # Verify all churn list removals
+        expected_removals = [LIST_WINBACK_T1, LIST_WINBACK_T2, LIST_WINBACK_T3,
+                             LIST_DUNNING, LIST_LAPSED]
+        for i, list_id in enumerate(expected_removals):
+            remove_call = mock_req.call_args_list[i]
+            assert remove_call == call(
+                "POST", f"/contacts/lists/{list_id}/contacts/remove",
+                {"emails": ["alice@example.com"]},
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEST SUITE 17: Tracking webhook integration with new routing
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestTrackingWebhookRouting:
+    """Test that tracking.py webhooks call the new Brevo routing functions."""
+
+    @patch("brevo_sync._brevo_request")
+    def test_payment_failed_webhook_calls_routing(self, mock_req, populated_db):
+        """PAYMENT.FAILED webhook should call sync_payment_failed."""
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        conn = sqlite3.connect(populated_db)
+        conn.execute(
+            "UPDATE clients SET paypal_subscription_id = 'I-FAIL1' WHERE email = ?",
+            ("alice@example.com",),
+        )
+        conn.commit()
+        conn.close()
+
+        from tracking import process_webhook_event
+        event = {
+            "id": "WH-FAIL-1",
+            "event_type": "BILLING.SUBSCRIPTION.PAYMENT.FAILED",
+            "resource": {"id": "I-FAIL1"},
+        }
+        result = process_webhook_event(populated_db, event)
+
+        assert result["processed"] is True
+        # Should have calls for: sync_contact_status + sync_payment_failed (remove + add)
+        # Find the list management calls
+        list_remove_calls = [
+            c for c in mock_req.call_args_list
+            if "/contacts/lists/8/contacts/remove" in str(c)
+        ]
+        list_add_calls = [
+            c for c in mock_req.call_args_list
+            if "/contacts/lists/35/contacts/add" in str(c)
+        ]
+        assert len(list_remove_calls) >= 1, "Should remove from Active list"
+        assert len(list_add_calls) >= 1, "Should add to Dunning list"
+
+    @patch("brevo_sync._brevo_request")
+    def test_cancelled_webhook_calls_routing(self, mock_req, populated_db):
+        """CANCELLED webhook should call sync_subscription_cancelled."""
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        conn = sqlite3.connect(populated_db)
+        conn.execute(
+            "UPDATE clients SET paypal_subscription_id = 'I-CANC1' WHERE email = ?",
+            ("alice@example.com",),
+        )
+        conn.commit()
+        conn.close()
+
+        from tracking import process_webhook_event
+        event = {
+            "id": "WH-CANC-1",
+            "event_type": "BILLING.SUBSCRIPTION.CANCELLED",
+            "resource": {"id": "I-CANC1"},
+        }
+        result = process_webhook_event(populated_db, event)
+
+        assert result["processed"] is True
+        # Should have calls for: sync_contact_status + sync_subscription_cancelled (remove + add)
+        list_remove_calls = [
+            c for c in mock_req.call_args_list
+            if "/contacts/lists/8/contacts/remove" in str(c)
+        ]
+        assert len(list_remove_calls) >= 1, "Should remove from Active list"
+        # Should add to a win-back tier (default T1 since days=0 approximation)
+        list_add_calls = [
+            c for c in mock_req.call_args_list
+            if "/contacts/lists/32/contacts/add" in str(c)
+            or "/contacts/lists/33/contacts/add" in str(c)
+            or "/contacts/lists/34/contacts/add" in str(c)
+        ]
+        assert len(list_add_calls) >= 1, "Should add to a win-back tier"
+
+    @patch("brevo_sync._brevo_request")
+    def test_activated_webhook_calls_routing(self, mock_req, populated_db):
+        """ACTIVATED webhook should call sync_subscription_reactivated."""
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        conn = sqlite3.connect(populated_db)
+        conn.execute(
+            "UPDATE clients SET paypal_subscription_id = 'I-REACT1' WHERE email = ?",
+            ("alice@example.com",),
+        )
+        conn.commit()
+        conn.close()
+
+        from tracking import process_webhook_event
+        event = {
+            "id": "WH-ACT-1",
+            "event_type": "BILLING.SUBSCRIPTION.ACTIVATED",
+            "resource": {"id": "I-REACT1"},
+        }
+        result = process_webhook_event(populated_db, event)
+
+        assert result["processed"] is True
+        # Should have calls for: sync_contact_status + sync_subscription_reactivated
+        # Reactivated removes from 5 churn lists and adds to active
+        list_add_active = [
+            c for c in mock_req.call_args_list
+            if "/contacts/lists/8/contacts/add" in str(c)
+        ]
+        assert len(list_add_active) >= 1, "Should re-add to Active list"

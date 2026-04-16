@@ -337,7 +337,11 @@ def process_webhook_event(db_path: str, event: dict) -> dict:
 
     if result["processed"]:
         try:
-            from brevo_sync import sync_contact_status, sync_contact_payment
+            from brevo_sync import (
+                sync_contact_status, sync_contact_payment,
+                sync_payment_failed, sync_subscription_cancelled,
+                sync_subscription_reactivated,
+            )
             status_map = {
                 "BILLING.SUBSCRIPTION.CANCELLED": "subscription_cancelled",
                 "BILLING.SUBSCRIPTION.SUSPENDED": "subscription_suspended",
@@ -362,7 +366,36 @@ def process_webhook_event(db_path: str, event: dict) -> dict:
                 row2 = cur2.fetchone()
                 conn2.close()
                 if row2:
+                    # Status attribute update (existing behavior)
                     sync_contact_status(row2["email"], brevo_status)
+
+                    # Route 4: Payment failed -> dunning list
+                    if event_type == "BILLING.SUBSCRIPTION.PAYMENT.FAILED":
+                        sync_payment_failed(row2["email"])
+
+                    # Route 5: Cancelled -> win-back tier
+                    elif event_type == "BILLING.SUBSCRIPTION.CANCELLED":
+                        # Calculate days since last payment from updated_at
+                        conn_days = sqlite3.connect(db_path)
+                        conn_days.row_factory = sqlite3.Row
+                        cur_days = conn_days.execute(
+                            "SELECT updated_at FROM clients WHERE paypal_subscription_id = ? COLLATE NOCASE",
+                            (resource_id,),
+                        )
+                        row_days = cur_days.fetchone()
+                        conn_days.close()
+                        days = 0
+                        if row_days and row_days["updated_at"]:
+                            try:
+                                last_update = datetime.fromisoformat(row_days["updated_at"])
+                                days = (datetime.now(timezone.utc) - last_update).days
+                            except Exception:
+                                pass
+                        sync_subscription_cancelled(row2["email"], days_since_last_payment=days)
+
+                    # Route 6: Reactivated -> remove from all churn lists, re-add to active
+                    elif event_type == "BILLING.SUBSCRIPTION.ACTIVATED":
+                        sync_subscription_reactivated(row2["email"])
 
                     # For payment events, also call sync_contact_payment
                     # to auto-add to List 8 with AI name + portal URL

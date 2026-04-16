@@ -19,6 +19,16 @@ BREVO_API_URL = "https://api.brevo.com/v3"
 SHARED_CONFIG_URL = "https://cc.purebrain.ai/api/config/shared-keys"
 _brevo_key_cache: Optional[str] = None
 
+# Brevo list IDs (from Lyra's inventory)
+LIST_ACTIVE = 8
+LIST_WARM_LEADS = 24
+LIST_LAPSED = 30
+LIST_WINBACK_T1 = 32  # 30-60 days
+LIST_WINBACK_T2 = 33  # 60-90 days
+LIST_WINBACK_T3 = 34  # 90+ days
+LIST_DUNNING = 35
+LIST_CUSTOMER_AIS = 37
+
 
 def _fetch_shared_key() -> str:
     """Fetch Brevo API key from the central config endpoint (cc.purebrain.ai)."""
@@ -271,3 +281,48 @@ def upsert_contact(
     if list_ids:
         body["listIds"] = list_ids
     return _brevo_request("POST", "/contacts", body)
+
+
+# ── List Management ─────────────────────────────────────────────────────────
+
+def remove_from_list(email: str, list_id: int) -> dict:
+    """Remove a contact from a Brevo list."""
+    return _brevo_request("POST", f"/contacts/lists/{list_id}/contacts/remove", {
+        "emails": [email],
+    })
+
+
+def add_to_list(email: str, list_id: int) -> dict:
+    """Add an existing contact to a Brevo list."""
+    return _brevo_request("POST", f"/contacts/lists/{list_id}/contacts/add", {
+        "emails": [email],
+    })
+
+
+# ── Lifecycle Routing ───────────────────────────────────────────────────────
+
+def sync_payment_failed(email: str) -> dict:
+    """Route: payment failed -> add to dunning list, remove from active list."""
+    remove_from_list(email, LIST_ACTIVE)
+    return add_to_list(email, LIST_DUNNING)
+
+
+def sync_subscription_cancelled(email: str, days_since_last_payment: int = 0) -> dict:
+    """Route: cancelled -> remove from active, add to appropriate win-back tier."""
+    remove_from_list(email, LIST_ACTIVE)
+    # Tier assignment based on days since last payment
+    if days_since_last_payment >= 90:
+        tier_list = LIST_WINBACK_T3
+    elif days_since_last_payment >= 60:
+        tier_list = LIST_WINBACK_T2
+    else:
+        tier_list = LIST_WINBACK_T1  # default (includes 0 = unknown)
+    return add_to_list(email, tier_list)
+
+
+def sync_subscription_reactivated(email: str) -> dict:
+    """Route: reactivated -> re-add to active, remove from all churn/dunning lists."""
+    for list_id in [LIST_WINBACK_T1, LIST_WINBACK_T2, LIST_WINBACK_T3,
+                    LIST_DUNNING, LIST_LAPSED]:
+        remove_from_list(email, list_id)
+    return add_to_list(email, LIST_ACTIVE)
