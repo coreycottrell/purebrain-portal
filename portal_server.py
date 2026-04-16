@@ -26,6 +26,17 @@ from pathlib import Path
 
 import aiosqlite
 
+# ── User tracking module ────────────────────────────────────────────────────
+from tracking import (
+    ensure_tracking_columns,
+    record_login,
+    record_activity,
+    log_webhook_event,
+    process_webhook_event,
+    update_next_billing_date,
+    get_tracking_stats,
+)
+
 from html import escape
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -1024,6 +1035,228 @@ def check_auth(request: Request) -> bool:
     return False
 
 
+# ── User activity tracking (throttled, in-memory gate) ──────────────────────
+# We track the portal owner's activity for session counting.
+# In-memory cache prevents hitting DB on every single request.
+_last_activity_track_time: float = 0.0
+_ACTIVITY_TRACK_INTERVAL = 60  # seconds — matches tracking.ACTIVITY_THROTTLE_SECONDS
+
+
+def _maybe_track_activity() -> None:
+    """Fire-and-forget: track portal owner activity (throttled to 1x/min).
+
+    Called on authenticated requests. Uses in-memory gate so we don't
+    even open the DB more than once per minute.
+    """
+    global _last_activity_track_time
+    now = time.time()
+    if now - _last_activity_track_time < _ACTIVITY_TRACK_INTERVAL:
+        return
+    _last_activity_track_time = now
+
+    try:
+        owner_file = SCRIPT_DIR / "portal_owner.json"
+        if owner_file.exists():
+            owner = json.loads(owner_file.read_text())
+            email = owner.get("human_email", "")
+            if email:
+                record_activity(str(CLIENTS_DB), email)
+    except Exception as e:
+        print(f"[tracking] activity track error: {e}")
+
+
+_login_recorded_this_process: bool = False
+
+def check_auth_and_track(request: Request) -> bool:
+    """check_auth + activity tracking + first-request login recording."""
+    global _login_recorded_this_process
+    authed = check_auth(request)
+    if authed:
+        # C-1: Record login on the FIRST authenticated request per process lifetime.
+        # Since the portal uses a single Bearer token (no per-user sessions),
+        # we detect "login" as the first auth'd request after process start.
+        if not _login_recorded_this_process:
+            _login_recorded_this_process = True
+            try:
+                owner_file = SCRIPT_DIR / "portal_owner.json"
+                if owner_file.exists():
+                    owner = json.loads(owner_file.read_text())
+                    email = owner.get("human_email", "")
+                    if email:
+                        record_login(str(CLIENTS_DB), email)
+                        print(f"[tracking] recorded login for {email}")
+            except Exception as e:
+                print(f"[tracking] login record error: {e}")
+        _maybe_track_activity()
+    return authed
+
+
+# ── PayPal Webhook Endpoint ─────────────────────────────────────────────────
+
+async def api_webhooks_paypal(request: Request) -> JSONResponse:
+    """POST /api/webhooks/paypal -- receive PayPal push notifications.
+
+    No Bearer auth required (PayPal sends these). Basic header validation
+    blocks casual spoofing; full signature verification is Phase 2.
+
+    # TODO: Full PayPal webhook signature validation using PayPal API (Phase 2)
+    # TODO: Push to Brevo when API key is configured
+    """
+    # C-3: Basic PayPal header validation -- blocks casual spoofing.
+    # Real PayPal webhooks always include these transmission headers.
+    transmission_id = request.headers.get("PAYPAL-TRANSMISSION-ID")
+    if not transmission_id:
+        print("[paypal-webhook] REJECTED: missing PAYPAL-TRANSMISSION-ID header")
+        return JSONResponse(
+            {"error": "missing PayPal transmission headers"},
+            status_code=400,
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    event_type = body.get("event_type", "")
+    event_id = body.get("id", "")
+
+    if not event_type:
+        return JSONResponse({"error": "missing event_type"}, status_code=400)
+
+    db_path = str(CLIENTS_DB)
+
+    # H-5: Idempotency -- skip if this event_id was already processed
+    if event_id:
+        try:
+            conn = sqlite3.connect(db_path)
+            cur = conn.execute(
+                "SELECT id FROM paypal_webhook_log WHERE event_id = ? AND processed = 1",
+                (event_id,),
+            )
+            already_done = cur.fetchone()
+            conn.close()
+            if already_done:
+                print(f"[paypal-webhook] DUPLICATE event_id={event_id}, skipping")
+                return JSONResponse({
+                    "status": "duplicate",
+                    "event_type": event_type,
+                    "processed": False,
+                    "detail": "duplicate event",
+                })
+        except Exception as e:
+            print(f"[paypal-webhook] idempotency check error: {e}")
+            # Non-fatal -- continue processing
+
+    # Log every event (even unknown types)
+    log_id = None
+    try:
+        log_id = log_webhook_event(db_path, body)
+        print(f"[paypal-webhook] Received {event_type} (event_id={event_id}, log_id={log_id})")
+    except Exception as e:
+        print(f"[paypal-webhook] ERROR logging event: {e}")
+        return JSONResponse({"error": "internal error"}, status_code=500)
+
+    # Process known event types
+    try:
+        result = process_webhook_event(db_path, body)
+        print(f"[paypal-webhook] Processed: {result}")
+
+        # H-4: Mark webhook log entry as processed after successful processing
+        if result.get("processed") and log_id is not None:
+            try:
+                conn = sqlite3.connect(db_path)
+                conn.execute(
+                    "UPDATE paypal_webhook_log SET processed = 1 WHERE id = ?",
+                    (log_id,),
+                )
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                print(f"[paypal-webhook] ERROR marking processed: {e}")
+    except Exception as e:
+        print(f"[paypal-webhook] ERROR processing event: {e}")
+        result = {"processed": False, "event_type": event_type, "detail": str(e)}
+
+    return JSONResponse({
+        "status": "received",
+        "event_type": event_type,
+        "processed": result.get("processed", False),
+    })
+
+
+# ── Tracking Status Endpoint ────────────────────────────────────────────────
+
+async def api_tracking_status(request: Request) -> JSONResponse:
+    """GET /api/tracking/status — tracking health dashboard.
+
+    Returns webhook log stats, last events, sync status.
+    Bearer auth required.
+    """
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    db_path = str(CLIENTS_DB)
+    result = {"healthy": True, "webhook_log": {}, "tracking_columns": False}
+
+    try:
+        import sqlite3 as _sq3
+        conn = _sq3.connect(db_path)
+        conn.row_factory = _sq3.Row
+
+        # Check tracking columns exist
+        cur = conn.execute("PRAGMA table_info(clients)")
+        columns = {row[1] for row in cur.fetchall()}
+        result["tracking_columns"] = all(
+            c in columns for c in ("last_login_at", "login_count", "session_count", "next_billing_date")
+        )
+
+        # Webhook log stats
+        try:
+            cur = conn.execute("SELECT COUNT(*) as total FROM paypal_webhook_log")
+            total = cur.fetchone()[0]
+            cur = conn.execute(
+                "SELECT COUNT(*) as processed FROM paypal_webhook_log WHERE processed = 1"
+            )
+            processed = cur.fetchone()[0]
+            cur = conn.execute(
+                "SELECT event_type, received_at FROM paypal_webhook_log "
+                "ORDER BY id DESC LIMIT 5"
+            )
+            recent = [{"event_type": r["event_type"], "received_at": r["received_at"]}
+                      for r in cur.fetchall()]
+            result["webhook_log"] = {
+                "total_events": total,
+                "processed_events": processed,
+                "recent": recent,
+            }
+        except Exception:
+            result["webhook_log"] = {"error": "paypal_webhook_log table not found"}
+
+        # Clients with tracking data
+        try:
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM clients WHERE login_count > 0"
+            )
+            result["clients_with_logins"] = cur.fetchone()[0]
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM clients WHERE session_count > 0"
+            )
+            result["clients_with_sessions"] = cur.fetchone()[0]
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM clients WHERE next_billing_date != ''"
+            )
+            result["clients_with_renewal_date"] = cur.fetchone()[0]
+        except Exception:
+            pass
+
+        conn.close()
+    except Exception as e:
+        result["healthy"] = False
+        result["error"] = str(e)
+
+    return JSONResponse(result)
+
+
 # ---------------------------------------------------------------------------
 
 # ── Favicon ──────────────────────────────────────────────────────────────
@@ -1176,7 +1409,7 @@ async def index_react(request: Request) -> Response:
 
 
 async def api_status(request: Request) -> JSONResponse:
-    if not check_auth(request):
+    if not check_auth_and_track(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
     session = get_tmux_session()
@@ -1227,7 +1460,7 @@ async def api_release_notes(request: Request) -> JSONResponse:
 
 async def api_chat_history(request: Request) -> JSONResponse:
     """Return recent chat messages from JSONL session log."""
-    if not check_auth(request):
+    if not check_auth_and_track(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
     last_n = int(request.query_params.get("last", "100"))
@@ -1254,7 +1487,7 @@ async def api_chat_history(request: Request) -> JSONResponse:
 
 async def api_chat_send(request: Request) -> JSONResponse:
     """Inject a message into the tmux session. Response comes via /api/chat/stream or history."""
-    if not check_auth(request):
+    if not check_auth_and_track(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
         body = await request.json()
@@ -1458,7 +1691,7 @@ async def ws_chat(websocket: WebSocket) -> None:
 
 async def api_chat_upload(request: Request) -> JSONResponse:
     """Accept a file upload, save to UPLOADS_DIR + docs/from-telegram/, log to portal chat, inject tmux notification."""
-    if not check_auth(request):
+    if not check_auth_and_track(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
         form = await request.form()
@@ -5797,6 +6030,9 @@ async def _init_clients_db() -> None:
             pass  # column already exists
         await db.commit()
 
+    # Add tracking columns (login_count, session_count, etc.) + webhook log table
+    ensure_tracking_columns(str(CLIENTS_DB))
+
 
 async def serve_admin_clients(request: Request) -> Response:
     """GET /admin/clients — serve clients admin dashboard HTML."""
@@ -9287,6 +9523,9 @@ routes = [
     Route("/api/admin/clients/hide", endpoint=api_admin_clients_hide, methods=["POST"]),
     Route("/api/admin/clients/restore", endpoint=api_admin_clients_restore, methods=["POST"]),
     Route("/api/admin/clients/import", endpoint=api_admin_clients_import, methods=["POST"]),
+    # ── User tracking & PayPal webhook routes ──
+    Route("/api/webhooks/paypal", endpoint=api_webhooks_paypal, methods=["POST"]),
+    Route("/api/tracking/status", endpoint=api_tracking_status),
     Route("/affiliate", endpoint=serve_affiliate_portal),
     Route("/api/boop/config", endpoint=api_boop_config, methods=["GET", "POST"]),
     Route("/api/boop/status", endpoint=api_boop_status),
