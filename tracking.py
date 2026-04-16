@@ -8,7 +8,6 @@ All functions use synchronous sqlite3 for simplicity in the tracking module.
 The portal_server.py integration uses aiosqlite wrappers that call these
 functions in a thread pool.
 
-# TODO: Push to Brevo when API key is configured
 """
 
 import json
@@ -66,7 +65,6 @@ def record_login(db_path: str, email: str) -> bool:
     Updates last_login_at and increments login_count.
     Returns True if client found and updated, False otherwise.
 
-    # TODO: Push to Brevo when API key is configured
     """
     now = datetime.now(timezone.utc).isoformat()
     conn = sqlite3.connect(db_path)
@@ -81,6 +79,22 @@ def record_login(db_path: str, email: str) -> bool:
     updated = cur.rowcount > 0
     conn.commit()
     conn.close()
+
+    if updated:
+        try:
+            from brevo_sync import sync_contact_login
+            conn2 = sqlite3.connect(db_path)
+            cur2 = conn2.execute(
+                "SELECT login_count FROM clients WHERE email = ? COLLATE NOCASE",
+                (email,),
+            )
+            row2 = cur2.fetchone()
+            count = row2[0] if row2 else 1
+            conn2.close()
+            sync_contact_login(email, count)
+        except Exception:
+            pass  # Brevo sync is best-effort
+
     return updated
 
 
@@ -98,7 +112,6 @@ def record_activity(
 
     Returns dict with keys: new_session (bool), throttled (bool), updated (bool)
 
-    # TODO: Push to Brevo when API key is configured
     """
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
@@ -166,6 +179,14 @@ def record_activity(
 
     conn.commit()
     conn.close()
+
+    if new_session:
+        try:
+            from brevo_sync import sync_contact_session
+            sync_contact_session(email, session_count + 1)
+        except Exception:
+            pass  # Brevo sync is best-effort
+
     return {"new_session": new_session, "throttled": False, "updated": True}
 
 
@@ -208,7 +229,6 @@ def process_webhook_event(db_path: str, event: dict) -> dict:
 
     Returns dict with: processed (bool), event_type (str), detail (str)
 
-    # TODO: Push to Brevo when API key is configured
     """
     event_type = event.get("event_type", "")
     resource = event.get("resource", {})
@@ -299,6 +319,37 @@ def process_webhook_event(db_path: str, event: dict) -> dict:
 
     conn.commit()
     conn.close()
+
+    if result["processed"]:
+        try:
+            from brevo_sync import sync_contact_status
+            status_map = {
+                "BILLING.SUBSCRIPTION.CANCELLED": "subscription_cancelled",
+                "BILLING.SUBSCRIPTION.SUSPENDED": "subscription_suspended",
+                "BILLING.SUBSCRIPTION.ACTIVATED": "subscription_active",
+                "PAYMENT.SALE.COMPLETED": "subscription_active",
+                "BILLING.SUBSCRIPTION.PAYMENT.FAILED": "payment_failed",
+            }
+            brevo_status = status_map.get(event_type)
+            if brevo_status:
+                # For PAYMENT.SALE.COMPLETED, the subscription ID is in billing_agreement_id,
+                # not resource_id (which is the sale ID). For all other events, resource_id
+                # is the subscription ID.
+                lookup_id = resource.get("billing_agreement_id", "") if event_type == "PAYMENT.SALE.COMPLETED" else resource_id
+                if not lookup_id:
+                    lookup_id = resource_id  # fallback
+                conn2 = sqlite3.connect(db_path)
+                cur2 = conn2.execute(
+                    "SELECT email FROM clients WHERE paypal_subscription_id = ? COLLATE NOCASE",
+                    (lookup_id,),
+                )
+                row2 = cur2.fetchone()
+                conn2.close()
+                if row2:
+                    sync_contact_status(row2[0], brevo_status)
+        except Exception:
+            pass  # Brevo sync is best-effort
+
     return result
 
 
