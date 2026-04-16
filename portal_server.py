@@ -5,6 +5,7 @@ Auth via Bearer token. JSONL-based chat history (same as TG bot).
 import asyncio
 import concurrent.futures
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -61,7 +62,7 @@ PORTAL_HTML = SCRIPT_DIR / "portal.html"
 PORTAL_PB_HTML = SCRIPT_DIR / "portal-pb-styled.html"
 REACT_DIST = SCRIPT_DIR / "react-portal" / "dist"
 START_TIME = time.time()
-PORTAL_VERSION = "1.3.0"
+PORTAL_VERSION = "1.3.1"
 RELEASE_NOTES_FILE = SCRIPT_DIR / "release_notes.json"
 # Auto-detect CIV_NAME and HUMAN_NAME from identity file — works in any fleet container.
 # Falls back to generic defaults if identity file not found (local dev).
@@ -1013,13 +1014,13 @@ def _parse_all_messages(last_n=100):
 def check_auth(request: Request) -> bool:
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
-        return auth[7:] == BEARER_TOKEN
+        return hmac.compare_digest(auth[7:], BEARER_TOKEN)
     # Allow query param token for WebSocket paths (browsers cannot set headers on WS upgrade)
     # and for /api/chat/uploads/ (inline images in chat rendered via <img src="...?token=">)
     # and for /api/download (browser navigates directly to download URL, cannot set headers)
     path = request.url.path
-    if "/ws" in path or "/api/chat/uploads/" in path or "/api/referral/" in path or "/api/download" in path:
-        return request.query_params.get("token") == BEARER_TOKEN
+    if "/ws" in path or "/api/chat/uploads/" in path or "/api/download" in path:
+        return hmac.compare_digest(request.query_params.get("token", ""), BEARER_TOKEN)
     return False
 
 
@@ -3499,8 +3500,101 @@ async def _init_referral_db() -> None:
                 created_at TEXT NOT NULL
             )
         """)
+        # ── payout_requests (replaces JSONL file) ──
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS payout_requests (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id   TEXT NOT NULL UNIQUE,
+                referral_code TEXT NOT NULL COLLATE NOCASE,
+                paypal_email TEXT NOT NULL DEFAULT '',
+                amount       REAL NOT NULL DEFAULT 0.0,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                batch_id     TEXT NOT NULL DEFAULT '',
+                notes        TEXT NOT NULL DEFAULT '',
+                created_at   TEXT NOT NULL,
+                paid_at      TEXT
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_payouts_code ON payout_requests(referral_code)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_payouts_status ON payout_requests(status)")
+
+        # ── financial_audit_log (immutable ledger) ──
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS financial_audit_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type  TEXT NOT NULL,
+                actor       TEXT NOT NULL DEFAULT '',
+                referral_code TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
+                amount      REAL NOT NULL DEFAULT 0.0,
+                details     TEXT NOT NULL DEFAULT '',
+                ip_address  TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL
+            )
+        """)
+
+        # ── Performance indexes for common query patterns ──
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer_status ON referrals(referrer_id, status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referred_email ON referrals(referred_email)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_rewards_referrer ON rewards(referrer_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_clicks_code ON referral_clicks(referral_code)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_commissions_referrer ON commission_payments(referrer_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_commissions_order ON commission_payments(order_id)")
+
         await db.commit()
+
+        # ── One-time migration: import existing JSONL payout requests into SQLite ──
+        if PAYOUT_REQUESTS_FILE.exists():
+            try:
+                with PAYOUT_REQUESTS_FILE.open("r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                            await db.execute(
+                                """INSERT OR IGNORE INTO payout_requests
+                                   (request_id, referral_code, paypal_email, amount, status, batch_id, notes, created_at, paid_at)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (entry.get("request_id", ""), entry.get("referral_code", ""),
+                                 entry.get("paypal_email", ""), entry.get("amount", 0.0),
+                                 entry.get("status", "pending"), entry.get("batch_id", ""),
+                                 entry.get("notes", ""), entry.get("created_at", ""),
+                                 entry.get("paid_at"))
+                            )
+                        except Exception:
+                            continue
+                await db.commit()
+                # Rename JSONL file to .migrated to prevent re-import
+                PAYOUT_REQUESTS_FILE.rename(PAYOUT_REQUESTS_FILE.with_suffix(".jsonl.migrated"))
+                print("[referral] Migrated payout requests from JSONL to SQLite")
+            except Exception as e:
+                print(f"[referral] JSONL migration error (non-fatal): {e}")
+
     print(f"[referral] SQLite DB ready: {REFERRALS_DB}")
+
+
+async def _log_financial_event(
+    event_type: str,
+    referral_code: str = "",
+    amount: float = 0.0,
+    actor: str = "",
+    details: str = "",
+    ip_address: str = "",
+) -> None:
+    """Write an immutable audit log entry for financial operations."""
+    try:
+        async with _referral_db() as db:
+            await db.execute(
+                """INSERT INTO financial_audit_log
+                   (event_type, actor, referral_code, amount, details, ip_address, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (event_type, actor, referral_code, amount, details, ip_address,
+                 datetime.now(timezone.utc).isoformat())
+            )
+            await db.commit()
+    except Exception as e:
+        print(f"[referral][AUDIT] Failed to log event: {e}")
 
 
 def _generate_referral_code() -> str:
@@ -3672,7 +3766,7 @@ def _verify_affiliate_password(password: str, stored_hash: str) -> bool:
         return False
     salt_val, expected_hex = parts
     h = hashlib.sha256(f"{salt_val}:{password}".encode()).hexdigest()
-    return h == expected_hex
+    return hmac.compare_digest(h, expected_hex)
 
 
 # ── Password reset tokens (in-memory, expire after 1 hour) ──────────────────
@@ -3820,17 +3914,6 @@ async def api_referral_reset_password(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "message": "Password updated successfully. You can now log in."})
 
 
-def _check_admin_auth(request: Request) -> bool:
-    """Returns True if request has main bearer token OR a valid admin_token query param."""
-    if check_auth(request):
-        return True
-    # Also accept ?admin_token=XXX or header X-Admin-Token
-    admin_token = (
-        request.query_params.get("admin_token", "").strip()
-        or request.headers.get("x-admin-token", "").strip()
-    )
-    return bool(admin_token)  # full validation done in endpoint (needs async DB)
-
 
 async def api_referral_register(request: Request) -> JSONResponse:
     """POST /api/referral/register — register as referrer, get unique code back."""
@@ -3904,6 +3987,11 @@ async def api_referral_login(request: Request) -> JSONResponse:
     if not code and not email:
         return JSONResponse({"error": "referral_code or email required"}, status_code=400)
 
+    # Rate-limit by IP (H1 fix — matches /session endpoint)
+    client_ip = request.client.host if request.client else "unknown"
+    if not _affiliate_login_rate_check(client_ip):
+        return JSONResponse({"error": "too many login attempts — try again later"}, status_code=429)
+
     async with _referral_db() as db:
         db.row_factory = aiosqlite.Row
         if code:
@@ -3931,6 +4019,17 @@ async def api_referral_login(request: Request) -> JSONResponse:
                 (pw_hash, row["referral_code"])
             )
             await db.commit()
+        # Log the first-time password claim for security audit (H2 fix)
+        print(f"[referral][SECURITY] First password claim for {row['referral_code']} from IP {client_ip}")
+        try:
+            _send_telegram_notification(
+                f"FIRST PASSWORD SET\n"
+                f"Code: {row['referral_code']}\n"
+                f"IP: {client_ip}\n"
+                f"Via: /api/referral/login"
+            )
+        except Exception:
+            pass  # notification is best-effort
     elif not _verify_affiliate_password(password, stored_hash):
         return JSONResponse({"error": "incorrect password"}, status_code=401)
     elif not (stored_hash.startswith("$2b$") or stored_hash.startswith("$2a$")):
@@ -4034,10 +4133,9 @@ async def api_referral_session(request: Request) -> JSONResponse:
 
 
 async def api_referral_dashboard(request: Request) -> JSONResponse:
-    """GET /api/referral/dashboard?code=PB-XXXX — referrer stats. Requires ?password= or portal token."""
+    """GET /api/referral/dashboard?code=PB-XXXX — referrer stats. Requires session token or portal bearer token."""
     code     = request.query_params.get("code", "").strip().upper()
     email    = request.query_params.get("email", "").strip().lower()
-    password = request.query_params.get("password", "").strip()
     # Portal owner (admin) can see any dashboard without affiliate password
     portal_authed = check_auth(request)
 
@@ -4067,21 +4165,15 @@ async def api_referral_dashboard(request: Request) -> JSONResponse:
                 request.query_params.get("session", "").strip()
                 or request.headers.get("x-affiliate-session", "").strip()
             )
-            password_param = request.query_params.get("password", "").strip()
             session_code = _verify_affiliate_session(session_token)
             if session_code:
                 # Session token valid — verify it belongs to this referrer
                 if session_code.upper() != referrer["referral_code"].upper():
                     return JSONResponse({"error": "session token does not match this account"}, status_code=403)
-            elif password_param:
-                stored_hash = referrer["password_hash"]
-                if not stored_hash:
-                    # Account has no password yet — deny, prompt to set one via /api/referral/login
-                    return JSONResponse({"error": "no password set for this account. Please login via the referral portal to set one."}, status_code=401)
-                if not _verify_affiliate_password(password_param, stored_hash):
-                    return JSONResponse({"error": "incorrect password"}, status_code=401)
             else:
-                return JSONResponse({"error": "authentication required. Please login at purebrain.ai/refer/"}, status_code=401)
+                # Password-in-URL removed (security: passwords in query params leak to logs/history).
+                # Use POST /api/referral/session to get a session token, then pass ?session=TOKEN.
+                return JSONResponse({"error": "authentication required — use a session token (?session=TOKEN) or login at purebrain.ai/refer/"}, status_code=401)
 
         referrer_id   = referrer["id"]
         referral_code = referrer["referral_code"]
@@ -4222,6 +4314,13 @@ async def api_referral_complete(request: Request) -> JSONResponse:
     Single-referrer enforcement: any previous completed referral for this email under
     a DIFFERENT referrer is deleted before recording the new one.
     """
+    # If a completion secret is configured, require it (C2 security fix)
+    complete_secret = os.environ.get("REFERRAL_COMPLETE_SECRET", "")
+    if complete_secret:
+        provided = request.headers.get("x-referral-secret", "")
+        if not hmac.compare_digest(provided, complete_secret):
+            return JSONResponse({"error": "unauthorized"}, status_code=403)
+
     try:
         body = await request.json()
     except Exception:
@@ -4424,6 +4523,12 @@ async def api_referral_record_commission(request: Request) -> JSONResponse:
 
 async def api_referral_code_lookup(request: Request) -> JSONResponse:
     """GET /api/referral/code/{email} — get referral code for a registered email."""
+    # Require portal bearer token or affiliate session (H4 fix — prevent email enumeration)
+    if not check_auth(request):
+        session_token = request.query_params.get("session", "") or request.headers.get("x-affiliate-session", "")
+        if not session_token or not _verify_affiliate_session(session_token):
+            return JSONResponse({"error": "authentication required"}, status_code=401)
+
     email = request.path_params.get("email", "").strip().lower()
     if not email:
         return JSONResponse({"error": "missing email"}, status_code=400)
@@ -4585,8 +4690,8 @@ def _send_telegram_notification(message: str) -> bool:
     return False
 
 
-def _read_payout_requests() -> list:
-    """Read all payout requests from JSONL file."""
+def _read_payout_requests_legacy() -> list:
+    """(LEGACY) Read all payout requests from JSONL file. Kept for migration only."""
     requests_list = []
     if not PAYOUT_REQUESTS_FILE.exists():
         return requests_list
@@ -4605,15 +4710,15 @@ def _read_payout_requests() -> list:
     return requests_list
 
 
-def _write_payout_request(entry: dict) -> None:
-    """Append a payout request to JSONL file."""
+def _write_payout_request_legacy(entry: dict) -> None:
+    """(LEGACY) Append a payout request to JSONL file. Kept for migration only."""
     with PAYOUT_REQUESTS_FILE.open("a") as f:
         f.write(json.dumps(entry) + "\n")
 
 
-def _update_payout_status(request_id: str, status: str, batch_id: str = "") -> bool:
-    """Update the status of an existing payout request in the JSONL file."""
-    all_requests = _read_payout_requests()
+def _update_payout_status_legacy(request_id: str, status: str, batch_id: str = "") -> bool:
+    """(LEGACY) Update payout request in JSONL file. Kept for migration only."""
+    all_requests = _read_payout_requests_legacy()
     found = False
     for req in all_requests:
         if req.get("request_id") == request_id:
@@ -4633,6 +4738,59 @@ def _update_payout_status(request_id: str, status: str, batch_id: str = "") -> b
     except Exception:
         return False
     return True
+
+
+# ── New SQLite-backed payout helpers (replace JSONL) ──
+
+async def _read_payout_requests_db() -> list:
+    """Read all payout requests from SQLite."""
+    async with _referral_db() as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM payout_requests ORDER BY created_at DESC")
+        rows = await cur.fetchall()
+        result = []
+        for row in rows:
+            d = dict(row)
+            # Synthesize created_at_ts from ISO created_at for backward compat
+            try:
+                dt = datetime.fromisoformat(d.get("created_at", ""))
+                d["created_at_ts"] = dt.timestamp()
+            except (ValueError, TypeError):
+                d["created_at_ts"] = 0.0
+            result.append(d)
+        return result
+
+
+async def _write_payout_request_db(entry: dict) -> None:
+    """Insert a payout request into SQLite. Raises IntegrityError on duplicate request_id."""
+    async with _referral_db() as db:
+        await db.execute(
+            """INSERT INTO payout_requests
+               (request_id, referral_code, paypal_email, amount, status, batch_id, notes, created_at, paid_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (entry["request_id"], entry["referral_code"], entry.get("paypal_email", ""),
+             entry.get("amount", 0.0), entry.get("status", "pending"),
+             entry.get("batch_id", ""), entry.get("notes", ""),
+             entry.get("created_at", ""), entry.get("paid_at"))
+        )
+        await db.commit()
+
+
+async def _update_payout_status_db(request_id: str, status: str, batch_id: str = "", notes: str = "") -> bool:
+    """Update payout request status in SQLite. Returns True if row was found and updated."""
+    async with _referral_db() as db:
+        paid_at = datetime.now(timezone.utc).isoformat() if status in ("completed", "paid") else None
+        cur = await db.execute(
+            """UPDATE payout_requests
+               SET status = ?,
+                   batch_id = CASE WHEN ? != '' THEN ? ELSE batch_id END,
+                   notes = CASE WHEN ? != '' THEN ? ELSE notes END,
+                   paid_at = CASE WHEN ? IS NOT NULL THEN ? ELSE paid_at END
+               WHERE request_id = ?""",
+            (status, batch_id, batch_id, notes, notes, paid_at, paid_at, request_id)
+        )
+        await db.commit()
+        return cur.rowcount > 0
 
 
 async def api_referral_payout_request(request: Request) -> JSONResponse:
@@ -4681,7 +4839,7 @@ async def api_referral_payout_request(request: Request) -> JSONResponse:
             status_code=400
         )
 
-    existing = _read_payout_requests()
+    existing = await _read_payout_requests_db()
     cooldown_secs = PAYOUT_COOLDOWN_DAYS * 86400
     now_ts = time.time()
     for req in existing:
@@ -4707,8 +4865,31 @@ async def api_referral_payout_request(request: Request) -> JSONResponse:
             )
             _row = await _cur.fetchone()
             actual_earnings = float(_row[0]) if _row else 0.0
-    except Exception:
-        actual_earnings = amount  # allow through on DB error
+    except Exception as e:
+        print(f"[referral] DB error during payout balance check: {e}")
+        return JSONResponse(
+            {"error": "unable to verify balance — please try again later"},
+            status_code=503
+        )
+
+    # Subtract already-paid amounts from available balance (C4 fix, now atomic via SQLite)
+    try:
+        async with _referral_db() as _db:
+            _cur = await _db.execute(
+                """SELECT COALESCE(SUM(amount), 0) FROM payout_requests
+                   WHERE referral_code = ? COLLATE NOCASE
+                   AND status IN ('completed', 'paid')""",
+                (referral_code,)
+            )
+            _row = await _cur.fetchone()
+            paid_total = float(_row[0]) if _row else 0.0
+            actual_earnings -= paid_total
+    except Exception as e:
+        print(f"[referral] Error reading payout history for balance deduction: {e}")
+        return JSONResponse(
+            {"error": "unable to verify payout history — please try again later"},
+            status_code=503
+        )
 
     if amount > actual_earnings:
         return JSONResponse(
@@ -4728,7 +4909,18 @@ async def api_referral_payout_request(request: Request) -> JSONResponse:
         "paid_at": None,
         "notes": "",
     }
-    _write_payout_request(entry)
+    await _write_payout_request_db(entry)
+
+    # Audit log: payout requested
+    client_ip = request.client.host if request.client else "unknown"
+    await _log_financial_event(
+        event_type="payout_requested",
+        referral_code=referral_code,
+        amount=round(amount, 2),
+        actor=f"affiliate:{referral_code}",
+        details=f"paypal={paypal_email}, request_id={request_id}, available_balance=${actual_earnings:.2f}",
+        ip_address=client_ip,
+    )
 
     # Auto-approve payouts up to $1,000; larger amounts require manual approval
     if amount <= PAYOUT_AUTO_APPROVE_LIMIT:
@@ -4741,7 +4933,16 @@ async def api_referral_payout_request(request: Request) -> JSONResponse:
             )
             if payout_result.get("ok"):
                 # Update payout status to completed
-                _update_payout_status(request_id, "completed", payout_result.get("batch_id", ""))
+                await _update_payout_status_db(request_id, "completed", batch_id=payout_result.get("batch_id", ""))
+                # Audit log: auto-payout sent
+                await _log_financial_event(
+                    event_type="auto_payout_sent",
+                    referral_code=referral_code,
+                    amount=round(amount, 2),
+                    actor=f"affiliate:{referral_code}",
+                    details=f"paypal={paypal_email}, batch_id={payout_result.get('batch_id', 'n/a')}, request_id={request_id}",
+                    ip_address=client_ip,
+                )
                 tg_msg = (
                     f"AUTO-PAYOUT SENT\n"
                     f"Referral: {referral_code}\n"
@@ -4824,7 +5025,7 @@ async def api_referral_payout_history(request: Request) -> JSONResponse:
     if not portal_authed and session_code and session_code.upper() != referral_code.upper():
         return JSONResponse({"error": "access denied"}, status_code=403)
 
-    all_requests = _read_payout_requests()
+    all_requests = await _read_payout_requests_db()
     user_requests = [r for r in all_requests if r.get("referral_code") == referral_code]
     user_requests.sort(key=lambda r: r.get("created_at_ts", 0), reverse=True)
 
@@ -4864,44 +5065,36 @@ async def api_admin_payout_mark_paid(request: Request) -> JSONResponse:
     if not request_id:
         return JSONResponse({"error": "missing request_id"}, status_code=400)
 
-    all_requests = _read_payout_requests()
-    found = False
-    updated = []
+    # Read the target request from DB first to get details for notification
+    all_requests = await _read_payout_requests_db()
     paid_entry = None
     for req in all_requests:
         if req.get("request_id") == request_id:
-            req["status"] = "paid"
-            req["paid_at"] = datetime.now(timezone.utc).isoformat()
-            if notes:
-                req["notes"] = notes
             paid_entry = req
-            found = True
-        updated.append(req)
+            break
 
-    if not found:
+    if not paid_entry:
         return JSONResponse({"error": "request_id not found"}, status_code=404)
 
-    try:
-        with PAYOUT_REQUESTS_FILE.open("w") as f:
-            for req in updated:
-                f.write(json.dumps(req) + "\n")
-    except Exception as e:
-        return JSONResponse({"error": f"failed to update file: {e}"}, status_code=500)
+    ok = await _update_payout_status_db(request_id, "paid", notes=notes)
+    if not ok:
+        return JSONResponse({"error": "failed to update payout status"}, status_code=500)
 
-    if paid_entry:
-        tg_msg = (
-            f"PAYOUT MARKED PAID\n"
-            f"Request: {request_id}\n"
-            f"Amount: ${paid_entry.get('amount', 0):.2f}\n"
-            f"PayPal: {paid_entry.get('paypal_email', '')}"
-        )
-        _send_telegram_notification(tg_msg)
+    paid_at = datetime.now(timezone.utc).isoformat()
+
+    tg_msg = (
+        f"PAYOUT MARKED PAID\n"
+        f"Request: {request_id}\n"
+        f"Amount: ${paid_entry.get('amount', 0):.2f}\n"
+        f"PayPal: {paid_entry.get('paypal_email', '')}"
+    )
+    _send_telegram_notification(tg_msg)
 
     return JSONResponse({
         "ok": True,
         "request_id": request_id,
         "status": "paid",
-        "paid_at": paid_entry.get("paid_at") if paid_entry else None,
+        "paid_at": paid_at,
     })
 
 
@@ -5028,16 +5221,15 @@ async def api_referral_payout_approve(request: Request) -> JSONResponse:
     if not request_id:
         return JSONResponse({"error": "missing request_id"}, status_code=400)
 
-    all_requests = _read_payout_requests()
-    found = False
+    # Read target request from SQLite
+    all_requests = await _read_payout_requests_db()
     target = None
     for req in all_requests:
         if req.get("request_id") == request_id:
             target = req
-            found  = True
             break
 
-    if not found:
+    if not target:
         return JSONResponse({"error": "request_id not found"}, status_code=404)
 
     if target.get("status") in ("completed", "paid"):
@@ -5069,26 +5261,23 @@ async def api_referral_payout_approve(request: Request) -> JSONResponse:
         note=f"PureBrain affiliate commission — request {request_id}",
     )
 
-    now_iso = datetime.now(timezone.utc).isoformat()
-    updated = []
-    for req in all_requests:
-        if req.get("request_id") == request_id:
-            if payout_result["ok"]:
-                req["status"]          = "completed"
-                req["paid_at"]         = now_iso
-                req["paypal_batch_id"] = payout_result.get("batch_id", "")
-                req["notes"]           = f"Auto-paid via PayPal Payouts API. Batch: {payout_result.get('batch_id', '')}"
-            else:
-                req["status"] = "failed"
-                req["notes"]  = f"PayPal error: {payout_result.get('error', 'unknown')}"
-        updated.append(req)
+    if payout_result["ok"]:
+        batch_id = payout_result.get("batch_id", "")
+        notes_text = f"Auto-paid via PayPal Payouts API. Batch: {batch_id}"
+        await _update_payout_status_db(request_id, "completed", batch_id=batch_id, notes=notes_text)
+    else:
+        error_notes = f"PayPal error: {payout_result.get('error', 'unknown')}"
+        await _update_payout_status_db(request_id, "failed", notes=error_notes)
 
-    try:
-        with PAYOUT_REQUESTS_FILE.open("w") as f:
-            for req in updated:
-                f.write(json.dumps(req) + "\n")
-    except Exception as e:
-        return JSONResponse({"error": f"failed to persist payout status: {e}"}, status_code=500)
+    # Audit log: payout approval attempt
+    await _log_financial_event(
+        event_type="payout_approved" if payout_result["ok"] else "payout_approve_failed",
+        referral_code=target.get("referral_code", ""),
+        amount=amount,
+        actor="admin:bearer",
+        details=f"request_id={request_id}, batch_id={payout_result.get('batch_id', 'n/a')}, paypal={paypal_email}",
+        ip_address=request.client.host if request.client else "unknown",
+    )
 
     if payout_result["ok"]:
         tg_msg = (
@@ -5213,7 +5402,7 @@ async def api_admin_payouts(request: Request) -> JSONResponse:
         if not await _is_valid_admin_token(admin_token):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
-    requests_list = _read_payout_requests()
+    requests_list = await _read_payout_requests_db()
     requests_list.sort(key=lambda r: r.get("created_at_ts", 0), reverse=True)
     return JSONResponse({"requests": requests_list, "count": len(requests_list)})
 
@@ -5436,6 +5625,16 @@ async def api_admin_referral_update(request: Request) -> JSONResponse:
         updated_fields.append("status")
 
     print(f"[admin] Referral {referral_id} updated — fields: {updated_fields}")
+
+    # Audit log: admin referral update
+    await _log_financial_event(
+        event_type="admin_referral_update",
+        referral_code=str(referral_id),
+        details=f"fields={updated_fields}, email={referred_email}, name={referred_name}, status={status}",
+        actor="admin:bearer",
+        ip_address=request.client.host if request.client else "unknown",
+    )
+
     return JSONResponse({"ok": True, "updated_fields": updated_fields})
 
 
@@ -5527,6 +5726,16 @@ async def api_admin_referral_assign(request: Request) -> JSONResponse:
     if removed_count > 0:
         print(f"[admin] Single-referrer enforcement: removed {removed_count} prior referral record(s) for {client_email} from other referrers")
     print(f"[admin] Referral assigned: {referral_code} → {client_email} ({action})")
+
+    # Audit log: admin referral assign
+    await _log_financial_event(
+        event_type="admin_referral_assign",
+        referral_code=referral_code,
+        details=f"client={client_email}, action={action}, removed_prior={removed_count}",
+        actor="admin:bearer",
+        ip_address=request.client.host if request.client else "unknown",
+    )
+
     return JSONResponse({"ok": True, "action": action, "removed_prior": removed_count, "message": f"Client {client_email} assigned to referrer {referral_code}."})
 
 
