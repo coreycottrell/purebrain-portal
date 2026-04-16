@@ -1,6 +1,28 @@
 {
-  "current_version": "1.3.0",
+  "current_version": "1.3.1",
   "releases": [
+    {
+      "version": "1.3.1",
+      "date": "2026-04-16",
+      "title": "Referral System Security Hardening",
+      "highlights": [
+        "SECURITY: Bearer token no longer accepted as URL query parameter on referral endpoints — prevents token leakage to logs and browser history.",
+        "SECURITY: Referral completion endpoint now supports shared secret verification (REFERRAL_COMPLETE_SECRET) to prevent unauthorized referral inflation.",
+        "SECURITY: Payout balance check no longer falls through on database errors — returns 503 instead of allowing unverified payouts.",
+        "SECURITY: Payout balance now correctly deducts previously completed payouts — prevents re-claiming the same earnings.",
+        "SECURITY: Rate limiting added to /api/referral/login (was missing, only /session had it).",
+        "SECURITY: First-time password claims now logged and notified via Telegram for account takeover detection.",
+        "SECURITY: All token and password comparisons now use constant-time hmac.compare_digest to prevent timing attacks.",
+        "SECURITY: /api/referral/code/{email} now requires authentication — prevents email enumeration.",
+        "SECURITY: Password-in-URL query param removed from dashboard endpoint — use session tokens instead.",
+        "SECURITY: Removed dead _check_admin_auth function that would accept any non-empty token.",
+        "INFRA: Payout tracking migrated from JSONL flat file to SQLite — eliminates race condition on concurrent payout requests.",
+        "INFRA: 6 performance indexes added to referral database for leaderboard, rewards, clicks, and commission queries.",
+        "INFRA: New financial_audit_log table provides immutable audit trail for all payout and admin operations.",
+        "INFRA: New payout_requests table with automatic one-time migration from existing JSONL file.",
+        "TEST: 46 security and regression tests covering all fixes."
+      ]
+    },
     {
       "version": "1.3.0",
       "date": "2026-04-02",
