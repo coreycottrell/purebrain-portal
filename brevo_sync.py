@@ -24,6 +24,8 @@ def _fetch_shared_key() -> str:
     """Fetch Brevo API key from the central config endpoint (cc.purebrain.ai)."""
     try:
         req = urllib.request.Request(SHARED_CONFIG_URL, method="GET")
+        req.add_header("User-Agent", "PureBrain-Portal/1.3.1")
+        req.add_header("Accept", "application/json")
         resp = urllib.request.urlopen(req, timeout=5)
         data = json.loads(resp.read().decode("utf-8"))
         return data.get("brevo_api_key", "")
