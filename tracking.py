@@ -13,7 +13,19 @@ functions in a thread pool.
 import json
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
+
+
+def _get_portal_url() -> str:
+    """Get this portal's public URL."""
+    try:
+        cname_file = Path.home() / ".portal-cname"
+        if cname_file.exists():
+            return "https://" + cname_file.read_text().strip()
+    except Exception:
+        pass
+    return "https://app.purebrain.ai"
 
 
 # ── Session gap threshold (seconds) ─────────────────────────────────────────
@@ -84,14 +96,17 @@ def record_login(db_path: str, email: str) -> bool:
         try:
             from brevo_sync import sync_contact_login
             conn2 = sqlite3.connect(db_path)
+            conn2.row_factory = sqlite3.Row
             cur2 = conn2.execute(
-                "SELECT login_count FROM clients WHERE email = ? COLLATE NOCASE",
+                "SELECT login_count, ai_name FROM clients WHERE email = ? COLLATE NOCASE",
                 (email,),
             )
             row2 = cur2.fetchone()
-            count = row2[0] if row2 else 1
             conn2.close()
-            sync_contact_login(email, count)
+            count = row2["login_count"] if row2 else 1
+            ai_name = row2["ai_name"] if row2 else ""
+            portal_url = _get_portal_url()
+            sync_contact_login(email, count, ai_name=ai_name, portal_url=portal_url)
         except Exception:
             pass  # Brevo sync is best-effort
 
@@ -322,7 +337,7 @@ def process_webhook_event(db_path: str, event: dict) -> dict:
 
     if result["processed"]:
         try:
-            from brevo_sync import sync_contact_status
+            from brevo_sync import sync_contact_status, sync_contact_payment
             status_map = {
                 "BILLING.SUBSCRIPTION.CANCELLED": "subscription_cancelled",
                 "BILLING.SUBSCRIPTION.SUSPENDED": "subscription_suspended",
@@ -339,6 +354,7 @@ def process_webhook_event(db_path: str, event: dict) -> dict:
                 if not lookup_id:
                     lookup_id = resource_id  # fallback
                 conn2 = sqlite3.connect(db_path)
+                conn2.row_factory = sqlite3.Row
                 cur2 = conn2.execute(
                     "SELECT email FROM clients WHERE paypal_subscription_id = ? COLLATE NOCASE",
                     (lookup_id,),
@@ -346,7 +362,29 @@ def process_webhook_event(db_path: str, event: dict) -> dict:
                 row2 = cur2.fetchone()
                 conn2.close()
                 if row2:
-                    sync_contact_status(row2[0], brevo_status)
+                    sync_contact_status(row2["email"], brevo_status)
+
+                    # For payment events, also call sync_contact_payment
+                    # to auto-add to List 8 with AI name + portal URL
+                    if event_type == "PAYMENT.SALE.COMPLETED":
+                        conn3 = sqlite3.connect(db_path)
+                        conn3.row_factory = sqlite3.Row
+                        cur3 = conn3.execute(
+                            "SELECT ai_name FROM clients WHERE email = ? COLLATE NOCASE",
+                            (row2["email"],),
+                        )
+                        client_row = cur3.fetchone()
+                        conn3.close()
+                        ai_name = client_row["ai_name"] if client_row else ""
+                        portal_url = _get_portal_url()
+                        sync_contact_payment(
+                            email=row2["email"],
+                            amount=float(resource.get("amount", {}).get("total", "0")),
+                            payment_status="subscription_active",
+                            subscription_id=lookup_id,
+                            ai_name=ai_name,
+                            portal_url=portal_url,
+                        )
         except Exception:
             pass  # Brevo sync is best-effort
 

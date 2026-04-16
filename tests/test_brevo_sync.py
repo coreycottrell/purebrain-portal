@@ -404,15 +404,15 @@ class TestEnsureAttributes:
     """Test custom attribute creation."""
 
     @patch("brevo_sync._brevo_request")
-    def test_creates_all_five_attributes(self, mock_req):
-        """Should make 5 POST requests for the 5 custom attributes."""
+    def test_creates_all_attributes(self, mock_req):
+        """Should make POST requests for all custom attributes."""
         from brevo_sync import ensure_brevo_attributes
         mock_req.return_value = {"ok": True, "status": 201, "body": {}}
 
         results = ensure_brevo_attributes()
 
-        assert len(results) == 5
-        assert mock_req.call_count == 5
+        assert len(results) == 7
+        assert mock_req.call_count == 7
 
         # Verify attribute names
         attr_names = [r["name"] for r in results]
@@ -421,6 +421,8 @@ class TestEnsureAttributes:
         assert "SESSION_COUNT" in attr_names
         assert "NEXT_BILLING_DATE" in attr_names
         assert "PAYMENT_STATUS" in attr_names
+        assert "AI_NAME" in attr_names
+        assert "MAGIC_PORTAL_LINK" in attr_names
 
     @patch("brevo_sync._brevo_request")
     def test_handles_already_exists(self, mock_req):
@@ -429,7 +431,7 @@ class TestEnsureAttributes:
         mock_req.return_value = {"ok": False, "status": 400, "body": "attribute already exists"}
 
         results = ensure_brevo_attributes()
-        assert len(results) == 5  # All 5 attempted even if all fail
+        assert len(results) == 7  # All 7 attempted even if all fail
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -685,8 +687,13 @@ class TestTrackingBrevoIntegration:
         assert result["processed"] is True
         # Brevo should have been called (found email via billing_agreement_id, not resource_id)
         mock_req.assert_called()
-        call_args = mock_req.call_args[0]
-        assert call_args[2]["attributes"]["PAYMENT_STATUS"] == "subscription_active"
+        # Find the status update call (PUT to /contacts/...)
+        put_calls = [
+            c for c in mock_req.call_args_list
+            if c[0][0] == "PUT"
+        ]
+        assert len(put_calls) >= 1, "Should have at least one PUT call for status update"
+        assert put_calls[0][0][2]["attributes"]["PAYMENT_STATUS"] == "subscription_active"
 
     @patch("brevo_sync._brevo_request")
     def test_webhook_succeeds_when_brevo_fails(self, mock_req, populated_db):
@@ -709,3 +716,336 @@ class TestTrackingBrevoIntegration:
         }
         result = process_webhook_event(populated_db, event)
         assert result["processed"] is True  # Must succeed regardless
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEST SUITE 10: Enhancement 1 — List 8 auto-add on payment_completed
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPaymentList8AutoAdd:
+    """Test that sync_contact_payment upserts contact to List 8."""
+
+    @patch("brevo_sync._brevo_request")
+    def test_payment_completed_adds_to_list_8(self, mock_req):
+        """sync_contact_payment should upsert contact to List 8 before firing event."""
+        from brevo_sync import sync_contact_payment
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_contact_payment(
+            "alice@example.com", 149.0, "subscription_active", "I-ABC123"
+        )
+
+        # Should have been called twice: first upsert (to List 8), then event
+        assert mock_req.call_count == 2
+
+        # First call: upsert to /contacts with listIds=[8]
+        first_call = mock_req.call_args_list[0]
+        assert first_call[0][0] == "POST"
+        assert first_call[0][1] == "/contacts"
+        body = first_call[0][2]
+        assert body["listIds"] == [8]
+        assert body["attributes"]["PAYMENT_STATUS"] == "subscription_active"
+
+        # Second call: event to /events
+        second_call = mock_req.call_args_list[1]
+        assert second_call[0][1] == "/events"
+        assert second_call[0][2]["event_name"] == "payment_completed"
+
+    @patch("brevo_sync._brevo_request")
+    def test_payment_completed_includes_ai_name(self, mock_req):
+        """sync_contact_payment should include AI_NAME in attributes when provided."""
+        from brevo_sync import sync_contact_payment
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_contact_payment(
+            "alice@example.com", 149.0, "subscription_active",
+            "I-ABC123", ai_name="Lyra"
+        )
+
+        # First call (upsert) should include AI_NAME
+        first_call = mock_req.call_args_list[0]
+        body = first_call[0][2]
+        assert body["attributes"]["AI_NAME"] == "Lyra"
+
+    @patch("brevo_sync._brevo_request")
+    def test_payment_completed_includes_portal_url(self, mock_req):
+        """sync_contact_payment should include MAGIC_PORTAL_LINK when provided."""
+        from brevo_sync import sync_contact_payment
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_contact_payment(
+            "alice@example.com", 149.0, "subscription_active",
+            "I-ABC123", portal_url="https://my.purebrain.ai"
+        )
+
+        first_call = mock_req.call_args_list[0]
+        body = first_call[0][2]
+        assert body["attributes"]["MAGIC_PORTAL_LINK"] == "https://my.purebrain.ai"
+
+    @patch("brevo_sync._brevo_request")
+    def test_payment_completed_omits_empty_optionals(self, mock_req):
+        """Empty ai_name/portal_url should not appear in attributes."""
+        from brevo_sync import sync_contact_payment
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_contact_payment(
+            "alice@example.com", 149.0, "subscription_active", "I-ABC123"
+        )
+
+        first_call = mock_req.call_args_list[0]
+        body = first_call[0][2]
+        assert "AI_NAME" not in body["attributes"]
+        assert "MAGIC_PORTAL_LINK" not in body["attributes"]
+
+    @patch("brevo_sync._brevo_request")
+    def test_webhook_payment_calls_sync_contact_payment_with_ai_name(
+        self, mock_req, populated_db
+    ):
+        """PAYMENT.SALE.COMPLETED webhook should pass ai_name to sync_contact_payment."""
+        mock_req.return_value = {"ok": True, "status": 204, "body": {}}
+
+        # Set up client with subscription and ai_name
+        conn = sqlite3.connect(populated_db)
+        conn.execute(
+            "UPDATE clients SET payment_status = 'subscription_active', "
+            "paypal_subscription_id = 'I-SUB999', ai_name = 'Lyra' "
+            "WHERE email = ?",
+            ("alice@example.com",),
+        )
+        conn.commit()
+        conn.close()
+
+        from tracking import process_webhook_event
+        event = {
+            "id": "WH-PAY-2",
+            "event_type": "PAYMENT.SALE.COMPLETED",
+            "resource": {
+                "id": "SALE-99",
+                "billing_agreement_id": "I-SUB999",
+                "amount": {"total": "49.00"},
+            },
+        }
+        result = process_webhook_event(populated_db, event)
+        assert result["processed"] is True
+
+        # Should have multiple Brevo calls: status update + payment sync
+        # Find the upsert call (POST to /contacts with listIds)
+        upsert_calls = [
+            c for c in mock_req.call_args_list
+            if c[0][1] == "/contacts" and c[0][0] == "POST"
+        ]
+        assert len(upsert_calls) >= 1, "Should upsert contact to List 8"
+        upsert_body = upsert_calls[0][0][2]
+        assert upsert_body["attributes"]["AI_NAME"] == "Lyra"
+        assert upsert_body["listIds"] == [8]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEST SUITE 11: Enhancement 2 — AI_NAME + MAGIC_PORTAL_LINK attributes
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestAINamePortalLinkAttributes:
+    """Test AI_NAME and MAGIC_PORTAL_LINK attribute sync."""
+
+    @patch("brevo_sync._brevo_request")
+    def test_ensure_attributes_includes_ai_name(self, mock_req):
+        """ensure_brevo_attributes should create AI_NAME attribute."""
+        from brevo_sync import ensure_brevo_attributes
+        mock_req.return_value = {"ok": True, "status": 201, "body": {}}
+
+        results = ensure_brevo_attributes()
+
+        attr_names = [r["name"] for r in results]
+        assert "AI_NAME" in attr_names
+
+    @patch("brevo_sync._brevo_request")
+    def test_ensure_attributes_includes_magic_portal_link(self, mock_req):
+        """ensure_brevo_attributes should create MAGIC_PORTAL_LINK attribute."""
+        from brevo_sync import ensure_brevo_attributes
+        mock_req.return_value = {"ok": True, "status": 201, "body": {}}
+
+        results = ensure_brevo_attributes()
+
+        attr_names = [r["name"] for r in results]
+        assert "MAGIC_PORTAL_LINK" in attr_names
+
+    @patch("brevo_sync._brevo_request")
+    def test_ensure_attributes_creates_seven_total(self, mock_req):
+        """ensure_brevo_attributes should create 7 attributes (5 original + 2 new)."""
+        from brevo_sync import ensure_brevo_attributes
+        mock_req.return_value = {"ok": True, "status": 201, "body": {}}
+
+        results = ensure_brevo_attributes()
+        assert len(results) == 7
+        assert mock_req.call_count == 7
+
+    @patch("brevo_sync._brevo_request")
+    def test_login_sync_includes_ai_name(self, mock_req):
+        """sync_contact_login should include AI_NAME when provided."""
+        from brevo_sync import sync_contact_login
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_contact_login("alice@example.com", 5, ai_name="Lyra")
+
+        body = mock_req.call_args[0][2]
+        assert body["contact_properties"]["AI_NAME"] == "Lyra"
+
+    @patch("brevo_sync._brevo_request")
+    def test_login_sync_includes_portal_url(self, mock_req):
+        """sync_contact_login should include MAGIC_PORTAL_LINK when provided."""
+        from brevo_sync import sync_contact_login
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_contact_login("alice@example.com", 5, portal_url="https://my.purebrain.ai")
+
+        body = mock_req.call_args[0][2]
+        assert body["contact_properties"]["MAGIC_PORTAL_LINK"] == "https://my.purebrain.ai"
+
+    @patch("brevo_sync._brevo_request")
+    def test_login_sync_omits_empty_optionals(self, mock_req):
+        """sync_contact_login should not include AI_NAME/MAGIC_PORTAL_LINK when empty."""
+        from brevo_sync import sync_contact_login
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        sync_contact_login("alice@example.com", 5)
+
+        body = mock_req.call_args[0][2]
+        assert "AI_NAME" not in body["contact_properties"]
+        assert "MAGIC_PORTAL_LINK" not in body["contact_properties"]
+
+    @patch("brevo_sync._brevo_request")
+    def test_record_login_passes_ai_name_to_brevo(self, mock_req, populated_db):
+        """record_login should look up ai_name from DB and pass to Brevo."""
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        # Set ai_name for the test client
+        conn = sqlite3.connect(populated_db)
+        conn.execute(
+            "UPDATE clients SET ai_name = 'Meridian' WHERE email = ?",
+            ("alice@example.com",),
+        )
+        conn.commit()
+        conn.close()
+
+        from tracking import record_login
+        record_login(populated_db, "alice@example.com")
+
+        body = mock_req.call_args[0][2]
+        assert body["contact_properties"]["AI_NAME"] == "Meridian"
+
+    @patch("brevo_sync._brevo_request")
+    def test_record_login_passes_portal_url_to_brevo(self, mock_req, populated_db, tmp_path):
+        """record_login should resolve portal URL and pass to Brevo."""
+        mock_req.return_value = {"ok": True, "status": 200, "body": {}}
+
+        # Create a fake .portal-cname file
+        cname_file = tmp_path / ".portal-cname"
+        cname_file.write_text("mike.purebrain.ai")
+
+        from tracking import record_login
+        with patch("tracking._get_portal_url", return_value="https://mike.purebrain.ai"):
+            record_login(populated_db, "alice@example.com")
+
+        body = mock_req.call_args[0][2]
+        assert body["contact_properties"]["MAGIC_PORTAL_LINK"] == "https://mike.purebrain.ai"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEST SUITE 12: Enhancement 3 — Failure alerting via AgentMail
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestFailureAlerting:
+    """Test Brevo failure alert emails via AgentMail."""
+
+    @patch("brevo_sync.urllib.request.urlopen")
+    def test_failure_alert_sends_email(self, mock_urlopen):
+        """Brevo API failure should trigger alert email to Lyra + Aether."""
+        from brevo_sync import _notify_sync_failure
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b'{"id": "msg-1"}'
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        with patch.dict(os.environ, {"AGENTMAIL_API_KEY": "test-key-123"}):
+            _notify_sync_failure("alice@example.com", "portal_login", "HTTP 500: Internal")
+
+        # Should have made a request to AgentMail
+        mock_urlopen.assert_called_once()
+        req = mock_urlopen.call_args[0][0]
+        body = json.loads(req.data.decode("utf-8"))
+        assert body["subject"] == "[Brevo Sync Failed] alice@example.com"
+        assert "portal_login" in body["text"]
+        assert "HTTP 500" in body["text"]
+        # Should send to both Lyra and Aether
+        to_emails = [r["email"] for r in body["to"]]
+        assert "lyra-pmg@agentmail.to" in to_emails
+        assert "aethergottaeat@agentmail.to" in to_emails
+
+    def test_failure_alert_does_not_fire_on_no_key(self):
+        """'No AGENTMAIL_API_KEY' should NOT trigger alert (silently skip)."""
+        from brevo_sync import _notify_sync_failure
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("AGENTMAIL_API_KEY", None)
+            # Should not raise
+            _notify_sync_failure("alice@example.com", "portal_login", "HTTP 500")
+
+    @patch("brevo_sync.urllib.request.urlopen")
+    def test_failure_alert_does_not_block_on_agentmail_failure(self, mock_urlopen):
+        """Alert email failure should be silently swallowed."""
+        from brevo_sync import _notify_sync_failure
+        mock_urlopen.side_effect = Exception("AgentMail is down")
+
+        with patch.dict(os.environ, {"AGENTMAIL_API_KEY": "test-key-123"}):
+            # Should not raise
+            _notify_sync_failure("alice@example.com", "portal_login", "HTTP 500")
+
+    @patch("brevo_sync.urllib.request.urlopen")
+    def test_brevo_http_error_triggers_alert(self, mock_urlopen):
+        """_brevo_request with alert_on_failure=True should call _notify on HTTP error."""
+        from brevo_sync import _brevo_request
+        import urllib.error
+
+        # First call: Brevo returns HTTP error
+        error_resp = MagicMock()
+        error_resp.read.return_value = b"Bad Request"
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "https://api.brevo.com/v3/events", 400, "Bad Request",
+            {}, error_resp
+        )
+
+        encoded = _make_encoded_key("xkeysib-test")
+        with patch.dict(os.environ, {"BREVO_API_KEY": encoded, "AGENTMAIL_API_KEY": "ak-123"}):
+            with patch("brevo_sync._notify_sync_failure") as mock_notify:
+                result = _brevo_request(
+                    "POST", "/events",
+                    {"event_name": "portal_login", "identifiers": {"email_id": "bob@x.com"}},
+                    alert_on_failure=True,
+                )
+
+        assert result["ok"] is False
+        mock_notify.assert_called_once()
+        call_args = mock_notify.call_args
+        assert call_args[1]["email"] == "bob@x.com" or call_args[0][0] == "bob@x.com"
+
+    @patch("brevo_sync.urllib.request.urlopen")
+    def test_brevo_no_alert_by_default(self, mock_urlopen):
+        """_brevo_request without alert_on_failure should NOT call _notify."""
+        from brevo_sync import _brevo_request
+        import urllib.error
+
+        error_resp = MagicMock()
+        error_resp.read.return_value = b"Bad Request"
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "https://api.brevo.com/v3/events", 400, "Bad Request",
+            {}, error_resp
+        )
+
+        encoded = _make_encoded_key("xkeysib-test")
+        with patch.dict(os.environ, {"BREVO_API_KEY": encoded}):
+            with patch("brevo_sync._notify_sync_failure") as mock_notify:
+                result = _brevo_request("POST", "/events", {"test": True})
+
+        assert result["ok"] is False
+        mock_notify.assert_not_called()

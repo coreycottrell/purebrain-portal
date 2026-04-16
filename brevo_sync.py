@@ -59,7 +59,50 @@ def _get_brevo_key() -> str:
     return _brevo_key_cache
 
 
-def _brevo_request(method: str, path: str, body: Optional[dict] = None) -> dict:
+def _notify_sync_failure(email: str, event_name: str, error: str) -> None:
+    """Send a one-line alert when Brevo sync fails for a customer.
+
+    Uses AgentMail to notify Lyra + Aether. Best-effort, never raises.
+    """
+    try:
+        agentmail_key = os.environ.get("AGENTMAIL_API_KEY", "")
+        if not agentmail_key:
+            return
+
+        subject = f"[Brevo Sync Failed] {email}"
+        body = (
+            f"Customer: {email}\n"
+            f"Event: {event_name}\n"
+            f"Error: {error}\n"
+            f"Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+        )
+
+        payload = {
+            "to": [
+                {"email": "lyra-pmg@agentmail.to"},
+                {"email": "aethergottaeat@agentmail.to"},
+            ],
+            "from": {"email": "flux.civ@agentmail.to", "name": "Flux2 Portal"},
+            "subject": subject,
+            "text": body,
+        }
+
+        req = urllib.request.Request(
+            "https://api.agentmail.to/v0/inboxes/flux.civ@agentmail.to/messages",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {agentmail_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass  # Alert is best-effort
+
+
+def _brevo_request(method: str, path: str, body: Optional[dict] = None,
+                   alert_on_failure: bool = False) -> dict:
     """Make a request to the Brevo API. Returns {"ok": bool, "status": int, "body": ...}."""
     key = _get_brevo_key()
     if not key:
@@ -85,21 +128,39 @@ def _brevo_request(method: str, path: str, body: Optional[dict] = None) -> dict:
         }
     except urllib.error.HTTPError as e:
         err_body = e.read().decode(errors="replace")[:500]
+        if alert_on_failure:
+            _notify_sync_failure(
+                email=body.get("identifiers", {}).get("email_id", "") if body else "",
+                event_name=body.get("event_name", path) if body else path,
+                error=f"HTTP {e.code}: {err_body[:100]}",
+            )
         return {"ok": False, "status": e.code, "body": err_body}
     except Exception as e:
+        if alert_on_failure:
+            _notify_sync_failure(
+                email=body.get("identifiers", {}).get("email_id", "") if body else "",
+                event_name=body.get("event_name", path) if body else path,
+                error=str(e)[:200],
+            )
         return {"ok": False, "status": 0, "body": str(e)[:200]}
 
 
-def sync_contact_login(email: str, login_count: int) -> dict:
+def sync_contact_login(email: str, login_count: int, ai_name: str = "",
+                       portal_url: str = "") -> dict:
     """Push login event + updated attributes to Brevo."""
+    contact_props: dict = {
+        "LAST_LOGIN_AT": time.strftime("%Y-%m-%d"),
+        "LOGIN_COUNT": login_count,
+    }
+    if ai_name:
+        contact_props["AI_NAME"] = ai_name
+    if portal_url:
+        contact_props["MAGIC_PORTAL_LINK"] = portal_url
     return _brevo_request("POST", "/events", {
         "event_name": "portal_login",
         "identifiers": {"email_id": email},
-        "contact_properties": {
-            "LAST_LOGIN_AT": time.strftime("%Y-%m-%d"),
-            "LOGIN_COUNT": login_count,
-        },
-    })
+        "contact_properties": contact_props,
+    }, alert_on_failure=True)
 
 
 def sync_contact_session(email: str, session_count: int) -> dict:
@@ -110,7 +171,7 @@ def sync_contact_session(email: str, session_count: int) -> dict:
         "contact_properties": {
             "SESSION_COUNT": session_count,
         },
-    })
+    }, alert_on_failure=True)
 
 
 def sync_contact_payment(
@@ -118,8 +179,19 @@ def sync_contact_payment(
     amount: float,
     payment_status: str,
     subscription_id: str = "",
+    ai_name: str = "",
+    portal_url: str = "",
 ) -> dict:
-    """Push payment event to Brevo."""
+    """Push payment event + auto-add to List 8 (PureBrain Active)."""
+    # First: upsert contact to List 8 with attributes
+    attrs: dict = {"PAYMENT_STATUS": payment_status}
+    if ai_name:
+        attrs["AI_NAME"] = ai_name
+    if portal_url:
+        attrs["MAGIC_PORTAL_LINK"] = portal_url
+    upsert_contact(email, attributes=attrs, list_ids=[8])
+
+    # Then: fire the payment event
     return _brevo_request("POST", "/events", {
         "event_name": "payment_completed",
         "identifiers": {"email_id": email},
@@ -130,7 +202,7 @@ def sync_contact_payment(
         "contact_properties": {
             "PAYMENT_STATUS": payment_status,
         },
-    })
+    }, alert_on_failure=True)
 
 
 def sync_contact_status(email: str, payment_status: str) -> dict:
@@ -163,6 +235,8 @@ def ensure_brevo_attributes() -> list:
         ("SESSION_COUNT", "float"),
         ("NEXT_BILLING_DATE", "date"),
         ("PAYMENT_STATUS", "text"),
+        ("AI_NAME", "text"),
+        ("MAGIC_PORTAL_LINK", "text"),
     ]
     results = []
     for name, attr_type in attributes:
