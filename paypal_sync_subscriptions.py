@@ -259,6 +259,7 @@ def run_sync(dry_run: bool = False) -> dict:
         last_payment = billing.get("last_payment", {})
         amount = float((last_payment.get("amount") or {}).get("value") or 0)
         last_payment_time = last_payment.get("time", "")
+        next_billing_time = billing.get("next_billing_time", "")
 
         plan_id = data.get("plan_id", "")
         status = data.get("status", "")
@@ -272,6 +273,7 @@ def run_sync(dry_run: bool = False) -> dict:
                 "status": status,
                 "amount": amount,
                 "last_payment_time": last_payment_time,
+                "next_billing_time": next_billing_time,
                 "tier_from_plan": tier_from_plan,
                 "given_name": subscriber.get("name", {}).get("given_name", ""),
                 "surname": subscriber.get("name", {}).get("surname", ""),
@@ -293,6 +295,7 @@ def run_sync(dry_run: bool = False) -> dict:
                 last_payment = billing.get("last_payment", {})
                 amount = float((last_payment.get("amount") or {}).get("value") or 0)
                 last_payment_time = last_payment.get("time", "")
+                next_billing_time = billing.get("next_billing_time", "")
                 plan_id = data.get("plan_id", "")
                 tier_from_plan = PLAN_TIER_MAP.get(plan_id, "")
                 email_to_sub[email] = {
@@ -300,6 +303,7 @@ def run_sync(dry_run: bool = False) -> dict:
                     "status": data.get("status", ""),
                     "amount": amount,
                     "last_payment_time": last_payment_time,
+                    "next_billing_time": next_billing_time,
                     "tier_from_plan": tier_from_plan,
                     "given_name": subscriber.get("name", {}).get("given_name", ""),
                     "surname": subscriber.get("name", {}).get("surname", ""),
@@ -331,6 +335,7 @@ def run_sync(dry_run: bool = False) -> dict:
         sub_id = sub_data["sub_id"]
         amount = sub_data["amount"]
         tier_from_plan = sub_data["tier_from_plan"]
+        next_billing = sub_data.get("next_billing_time", "")
 
         # Determine new payment_status
         if status == "ACTIVE":
@@ -402,6 +407,15 @@ def run_sync(dry_run: bool = False) -> dict:
                     email,
                 ),
             )
+            # Store next_billing_date if the column exists and we have data
+            if next_billing:
+                try:
+                    cur.execute(
+                        "UPDATE clients SET next_billing_date = ? WHERE email = ? COLLATE NOCASE",
+                        (next_billing, email),
+                    )
+                except Exception:
+                    pass  # Column may not exist yet on older schemas
         updated += 1
 
     if not dry_run:
