@@ -170,19 +170,31 @@ class TestBrevoKeyDecoding:
             key = _get_brevo_key()
         assert key == "xkeysib-real-key-123"
 
-    def test_empty_key_returns_empty(self):
-        """No env var should return empty string."""
+    @patch("brevo_sync._fetch_shared_key", return_value="xkeysib-from-cc")
+    def test_empty_env_fetches_from_config_endpoint(self, mock_fetch):
+        """No env var should fetch key from central config endpoint."""
         from brevo_sync import _get_brevo_key
         with patch.dict(os.environ, {}, clear=True):
-            # Ensure BREVO_API_KEY is not set
             os.environ.pop("BREVO_API_KEY", None)
             key = _get_brevo_key()
-        assert key == ""
+        mock_fetch.assert_called_once()
+        assert key == "xkeysib-from-cc"
 
-    def test_invalid_base64_returns_empty(self):
-        """Invalid base64 should return empty string, not crash."""
+    @patch("brevo_sync._fetch_shared_key", return_value="xkeysib-from-cc")
+    def test_invalid_base64_fetches_from_config_endpoint(self, mock_fetch):
+        """Invalid base64 should fall back to central config endpoint."""
         from brevo_sync import _get_brevo_key
         with patch.dict(os.environ, {"BREVO_API_KEY": "not-valid-base64!!!"}):
+            key = _get_brevo_key()
+        mock_fetch.assert_called_once()
+        assert key == "xkeysib-from-cc"
+
+    @patch("brevo_sync._fetch_shared_key", return_value="")
+    def test_no_env_no_endpoint_returns_empty(self, mock_fetch):
+        """If both .env and config endpoint fail, return empty string."""
+        from brevo_sync import _get_brevo_key
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("BREVO_API_KEY", None)
             key = _get_brevo_key()
         assert key == ""
 
@@ -223,8 +235,25 @@ class TestBrevoRequest:
         assert req.get_header("Api-key") == "xkeysib-test"
         assert req.get_header("Content-type") == "application/json"
 
-    def test_request_without_key_returns_error(self):
-        """No API key should return ok=False without making request."""
+    @patch("brevo_sync._fetch_shared_key", return_value="xkeysib-from-endpoint")
+    @patch("brevo_sync.urllib.request.urlopen")
+    def test_request_without_env_key_uses_config_endpoint(self, mock_urlopen, mock_fetch):
+        """No env var should fetch key from config endpoint and use it."""
+        from brevo_sync import _brevo_request
+        mock_resp = MagicMock()
+        mock_resp.status = 204
+        mock_resp.read.return_value = b""
+        mock_urlopen.return_value = mock_resp
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("BREVO_API_KEY", None)
+            result = _brevo_request("POST", "/events", {"test": True})
+        assert result["ok"] is True
+        call_args = mock_urlopen.call_args[0][0]
+        assert call_args.get_header("Api-key") == "xkeysib-from-endpoint"
+
+    @patch("brevo_sync._fetch_shared_key", return_value="")
+    def test_request_without_any_key_returns_error(self, mock_fetch):
+        """No env var + failed config endpoint should return ok=False."""
         from brevo_sync import _brevo_request
         with patch.dict(os.environ, {}, clear=True):
             os.environ.pop("BREVO_API_KEY", None)

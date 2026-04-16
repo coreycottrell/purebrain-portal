@@ -16,22 +16,44 @@ from typing import Optional
 
 
 BREVO_API_URL = "https://api.brevo.com/v3"
+SHARED_CONFIG_URL = "https://cc.purebrain.ai/api/config/shared-keys"
 _brevo_key_cache: Optional[str] = None
 
 
+def _fetch_shared_key() -> str:
+    """Fetch Brevo API key from the central config endpoint (cc.purebrain.ai)."""
+    try:
+        req = urllib.request.Request(SHARED_CONFIG_URL, method="GET")
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read().decode("utf-8"))
+        return data.get("brevo_api_key", "")
+    except Exception:
+        return ""
+
+
 def _get_brevo_key() -> str:
-    """Decode and cache the Brevo API key from environment."""
+    """Get Brevo API key: .env first, then central config endpoint, cached after first call."""
     global _brevo_key_cache
     if _brevo_key_cache is not None:
         return _brevo_key_cache
+    # Priority 1: .env (base64-encoded JSON format)
     encoded = os.environ.get("BREVO_API_KEY", "")
-    if not encoded:
-        return ""
-    try:
-        decoded = json.loads(base64.b64decode(encoded))
-        _brevo_key_cache = decoded.get("api_key", "")
-    except Exception:
-        _brevo_key_cache = ""
+    if encoded:
+        try:
+            decoded = json.loads(base64.b64decode(encoded))
+            key = decoded.get("api_key", "")
+            if key:
+                _brevo_key_cache = key
+                return _brevo_key_cache
+        except Exception:
+            pass
+    # Priority 2: Central config endpoint (cc.purebrain.ai)
+    key = _fetch_shared_key()
+    if key:
+        _brevo_key_cache = key
+        return _brevo_key_cache
+    # No key available — Brevo sync disabled
+    _brevo_key_cache = ""
     return _brevo_key_cache
 
 
