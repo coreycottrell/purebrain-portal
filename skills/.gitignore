@@ -1,0 +1,6 @@
+# Protect ALL local/CIV-specific skills from git pull
+# Only skills/core/ is tracked and ships with updates
+*
+!.gitignore
+!core/
+!core/**

@@ -1,6 +1,25 @@
 {
-  "current_version": "1.3.1",
+  "current_version": "1.4.0",
   "releases": [
+    {
+      "version": "1.4.0",
+      "date": "2026-04-22",
+      "title": "Update Safety & Portal Mod Protocol",
+      "highlights": [
+        "NEW: Portal Mod Protocol — mandatory skill teaching AiCIVs the proper way to modify their portal so customizations survive updates (skills/core/portal-mod-protocol/SKILL.md).",
+        "NEW: Startup health check — detects tracked file modifications on boot and warns with specific migration guidance.",
+        "NEW: GET /api/health/mods — API endpoint showing which files have local modifications and how to migrate them to the custom/ overlay system.",
+        "NEW: Skills directory with core/local split — core/ ships with updates, everything else is gitignored and protected.",
+        "SECURITY: Fixed critical lock race condition in update mechanism — concurrent update requests can no longer corrupt git state.",
+        "SAFETY: Shim survival check — update now verifies the custom overlay system marker survives git pull, rolls back if missing.",
+        "SAFETY: Mandatory tests — updates abort if test files are missing (no skip path).",
+        "SAFETY: Panel injection validation — missing HTML markers now produce specific warnings instead of silent failures.",
+        "SAFETY: Watchdog detection — portal detects process manager before self-restart, falls back to exec restart if none found.",
+        "SAFETY: Smarter update blocker — shows specific modified files and migration guidance instead of generic error.",
+        "INFRA: Update logs now persist to logs/update.log instead of /tmp (survives reboots).",
+        "TEST: 49 new safety tests covering lock discipline, shim survival, panel injection, watchdog detection, and behavioral scenarios (88 total update-related tests)."
+      ]
+    },
     {
       "version": "1.3.1",
       "date": "2026-04-16",

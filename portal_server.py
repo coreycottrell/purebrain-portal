@@ -73,7 +73,7 @@ PORTAL_HTML = SCRIPT_DIR / "portal.html"
 PORTAL_PB_HTML = SCRIPT_DIR / "portal-pb-styled.html"
 REACT_DIST = SCRIPT_DIR / "react-portal" / "dist"
 START_TIME = time.time()
-PORTAL_VERSION = "1.3.1"
+PORTAL_VERSION = "1.4.0"
 RELEASE_NOTES_FILE = SCRIPT_DIR / "release_notes.json"
 # Auto-detect CIV_NAME and HUMAN_NAME from identity file — works in any fleet container.
 # Falls back to generic defaults if identity file not found (local dev).
@@ -1346,29 +1346,47 @@ def _inject_custom_panels(html: str) -> str:
     if not nav_items:
         return html
 
+    markers_found = 0
+    markers_expected = 3
+
     # Inject nav items among other panel nav items (before <!-- /nav-panels --> marker)
-    nav_inject = '\n'.join(nav_items)
-    html = html.replace(
-        '    <!-- /nav-panels -->',
-        f'{nav_inject}\n    <!-- /nav-panels -->',
-        1
-    )
+    if '<!-- /nav-panels -->' in html:
+        nav_inject = '\n'.join(nav_items)
+        html = html.replace(
+            '    <!-- /nav-panels -->',
+            f'{nav_inject}\n    <!-- /nav-panels -->',
+            1
+        )
+        markers_found += 1
+    else:
+        print("[portal-custom] WARNING: <!-- /nav-panels --> marker not found — custom nav items not injected")
 
     # Inject panel divs inside .content area, before <!-- /panels --> marker
-    panels_inject = '\n'.join(panel_html_parts)
-    html = html.replace(
-        '<!-- /panels -->',
-        f'{panels_inject}\n  <!-- /panels -->',
-        1
-    )
+    if '<!-- /panels -->' in html:
+        panels_inject = '\n'.join(panel_html_parts)
+        html = html.replace(
+            '<!-- /panels -->',
+            f'{panels_inject}\n  <!-- /panels -->',
+            1
+        )
+        markers_found += 1
+    else:
+        print("[portal-custom] WARNING: <!-- /panels --> marker not found — custom panels not injected")
 
     # Inject mobile menu items inside #mobile-more-menu, before its closing marker
-    mobile_inject = '\n'.join(mobile_items)
-    html = html.replace(
-        '    <!-- /mobile-menu-items -->',
-        f'{mobile_inject}\n    <!-- /mobile-menu-items -->',
-        1
-    )
+    if '<!-- /mobile-menu-items -->' in html:
+        mobile_inject = '\n'.join(mobile_items)
+        html = html.replace(
+            '    <!-- /mobile-menu-items -->',
+            f'{mobile_inject}\n    <!-- /mobile-menu-items -->',
+            1
+        )
+        markers_found += 1
+    else:
+        print("[portal-custom] WARNING: <!-- /mobile-menu-items --> marker not found — mobile items not injected")
+
+    if markers_found < markers_expected:
+        print(f"[portal-custom] WARNING: Only {markers_found}/{markers_expected} injection markers found — some custom panels may not display")
 
     return html
 
@@ -3387,6 +3405,7 @@ async def api_patch_scheduled_task(request) -> JSONResponse:
 
 async def _startup() -> None:
     """Start background tasks on server startup."""
+    _check_tracked_modifications()  # Warn about tracked file edits early
     _init_portal_log_ids()
     await _init_referral_db()
     await _init_clients_db()
@@ -8398,6 +8417,87 @@ async def _get_update_lock() -> asyncio.Lock:
     return _update_lock
 
 
+# ─── MODIFICATION DETECTION & HEALTH CHECK ─────────────────────────────
+_MIGRATION_GUIDANCE = {
+    "portal-pb-styled.html": "UI changes should be in custom/panels/*.html -- see portal-mod-protocol skill",
+    "portal_server.py": "Endpoints should be in custom/routes.py, config in custom/config.json -- see portal-mod-protocol skill",
+    "static/commands-shortcuts.js": "Quick Fire customizations should be in custom/quickfire.json -- see portal-mod-protocol skill",
+}
+_MIGRATION_GUIDANCE_DEFAULT = "Move to the custom/ overlay system -- see skills/core/portal-mod-protocol/SKILL.md"
+
+
+def _check_tracked_modifications() -> dict:
+    """Detect modifications to tracked files via git status.
+
+    Runs synchronously (intended for startup).  Returns a dict with
+    has_tracked_modifications, modified_files, migration_guidance, etc.
+    """
+    result = {"has_tracked_modifications": False, "modified_files": [], "migration_guidance": {},
+              "skill_path": "skills/core/portal-mod-protocol/SKILL.md", "update_safe": True}
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(SCRIPT_DIR), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode != 0:
+            return result  # Not a git repo or git error -- nothing to report
+        if not proc.stdout.strip():
+            return result  # Clean working tree
+
+        tracked_changes = []
+        for line in proc.stdout.strip().split("\n"):
+            if not line.strip():
+                continue
+            # Skip untracked files (lines starting with ??)
+            if line.startswith("??"):
+                continue
+            # Extract filename (strip XY status prefix + space)
+            # Format: "XY filename" or "XY filename -> newname"
+            fname = line[3:].strip()
+            if " -> " in fname:
+                fname = fname.split(" -> ")[-1]
+            tracked_changes.append(fname)
+
+        if tracked_changes:
+            result["has_tracked_modifications"] = True
+            result["modified_files"] = tracked_changes
+            result["update_safe"] = False
+            for f in tracked_changes:
+                result["migration_guidance"][f] = _MIGRATION_GUIDANCE.get(f, _MIGRATION_GUIDANCE_DEFAULT)
+
+            # Print warnings to portal log
+            print("[portal-health] WARNING: Tracked file modifications detected!")
+            print("[portal-health] The following tracked files have local changes that WILL BE LOST on next update:")
+            for f in tracked_changes:
+                print(f"[portal-health]   M {f}")
+            print("[portal-health] ")
+            print("[portal-health] These modifications should be migrated to the custom/ overlay system:")
+            print("[portal-health]   - UI changes (HTML/CSS/JS) -> custom/panels/*.html")
+            print("[portal-health]   - API endpoints -> custom/routes.py")
+            print("[portal-health]   - Config values -> custom/config.json")
+            print("[portal-health]   - Startup logic -> custom/startup.py")
+            print("[portal-health] ")
+            print("[portal-health] See skills/core/portal-mod-protocol/SKILL.md for migration instructions.")
+            print("[portal-health] Run GET /api/health/mods to see details.")
+    except Exception as e:
+        print(f"[portal-health] WARNING: tracked modification check failed: {e}")
+
+    return result
+
+
+async def api_health_mods(request: Request) -> JSONResponse:
+    """GET /api/health/mods -- Report tracked file modifications and migration guidance."""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    # Run the check in an executor to avoid blocking the event loop
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(_PORTAL_EXECUTOR, _check_tracked_modifications)
+    return JSONResponse(result)
+
+# ─── END MODIFICATION DETECTION ─────────────────────────────────────────
+
+
 async def _git_cmd(args: list, timeout: int = 15) -> tuple:
     """Run a git command in the portal directory. Returns (returncode, stdout)."""
     cmd = ["git", "-C", str(SCRIPT_DIR)] + args
@@ -8556,18 +8656,28 @@ async def api_update_apply(request: Request) -> JSONResponse:
 
     lock = await _get_update_lock()
 
+    # Guard 1: If lock is already held, another update is running
+    if lock.locked():
+        return JSONResponse({"status": "error", "error": "Update already in progress"})
+
+    # Guard 2: Check state flag (belt-and-suspenders with the lock)
     if _update_state["status"] == "in_progress":
         return JSONResponse({"status": "error", "error": "Update already in progress"})
+
+    # Acquire the lock before mutating state — background task will release it
+    await lock.acquire()
 
     # Ensure git is configured (auto-heal for non-git-clone deployments)
     ok, heal_msg = await _ensure_git_repo()
     if not ok:
+        lock.release()
         return JSONResponse({"status": "error", "error": f"Git setup failed: {heal_msg}"})
 
     # Quick check: are we up to date?
     rc_local, local_sha = await _git_cmd(["rev-parse", "HEAD"])
     rc_remote, remote_sha = await _git_cmd(["rev-parse", "origin/main"])
     if rc_local == 0 and rc_remote == 0 and local_sha == remote_sha:
+        lock.release()
         return JSONResponse({"status": "error", "error": "Already up to date"})
 
     # Check for uncommitted changes to tracked files (only if we have commits)
@@ -8580,9 +8690,23 @@ async def api_update_apply(request: Request) -> JSONResponse:
                 if line.strip() and not line.startswith("??")
             ]
             if tracked_changes:
+                lock.release()
+                # Extract filenames from status lines (strip "XY " prefix)
+                tracked_files = []
+                for _tc_line in tracked_changes:
+                    _tc_fname = _tc_line[3:].strip() if len(_tc_line) > 3 else _tc_line.strip()
+                    if " -> " in _tc_fname:
+                        _tc_fname = _tc_fname.split(" -> ")[-1]
+                    tracked_files.append(_tc_fname)
                 return JSONResponse({
                     "status": "error",
-                    "error": "Uncommitted changes to tracked files. Commit or stash before updating.",
+                    "error": "Tracked files have local modifications that would be lost on update.",
+                    "modified_files": tracked_files,
+                    "guidance": (
+                        "These changes need to be migrated to the custom/ overlay system before updating. "
+                        "UI changes -> custom/panels/*.html, API endpoints -> custom/routes.py, "
+                        "Config -> custom/config.json. See skills/core/portal-mod-protocol/SKILL.md for details."
+                    ),
                 })
 
     job_id = f"update-{datetime.now():%Y%m%d-%H%M%S}"
@@ -8595,7 +8719,7 @@ async def api_update_apply(request: Request) -> JSONResponse:
         "steps_completed": [],
         "steps_remaining": ["ensure_git", "fetch", "compare", "check_tree",
                             "record_rollback", "verify_custom", "verify_preserved",
-                            "pull", "running_tests", "read_version", "restart"],
+                            "pull", "verify_shim", "running_tests", "read_version", "restart"],
         "started_at": datetime.now(timezone.utc).isoformat(),
         "completed_at": None,
         "error": None,
@@ -8608,8 +8732,8 @@ async def api_update_apply(request: Request) -> JSONResponse:
         "message": None,
     })
 
-    # Launch background task
-    asyncio.create_task(_run_update(job_id))
+    # Launch background task (lock is held; _run_update releases it in finally)
+    asyncio.create_task(_run_update(job_id, lock))
 
     return JSONResponse({
         "status": "started",
@@ -8627,17 +8751,27 @@ def _update_step(step_name: str):
         _update_state["steps_completed"].append(step_name)
 
 
+# Update log lives alongside portal code (should be .gitignored via logs/)
+_UPDATE_LOG_DIR = SCRIPT_DIR / "logs"
+_UPDATE_LOG_FILE = _UPDATE_LOG_DIR / "update.log"
+
 def _log_update(message: str):
     """Append a message to the update log file."""
     try:
-        with open("/tmp/portal-update.log", "a") as f:
+        _UPDATE_LOG_DIR.mkdir(exist_ok=True)
+        with open(_UPDATE_LOG_FILE, "a") as f:
             f.write(f"[{datetime.now(timezone.utc).isoformat()}] {message}\n")
     except Exception:
         pass
 
 
-async def _run_update(job_id: str):
-    """Execute the 11-step safe update algorithm as a background task."""
+async def _run_update(job_id: str, lock: asyncio.Lock):
+    """Execute the 11-step safe update algorithm as a background task.
+
+    The caller must hold ``lock`` before calling; this function releases it
+    in its ``finally`` block so that a new update can be triggered after
+    completion (success or failure).
+    """
     previous_sha = None
     fresh_init = False  # True if repo was just git-init'd (no prior commits)
     try:
@@ -8776,10 +8910,32 @@ async def _run_update(job_id: str):
                     )
                 raise RuntimeError(f"git pull --ff-only failed: {pull_output.split(chr(10))[0]}")
 
-        # Step 9: RUN TESTS
+        # Step 8b: VERIFY SHIM SURVIVED PULL
+        _update_step("verify_shim")
+        _log_update(f"[{job_id}] Step 8b: Verifying customization shim survived pull...")
+        server_file = SCRIPT_DIR / "portal_server.py"
+        if server_file.exists():
+            server_content = server_file.read_text()
+            if "CUSTOMIZATION LAYER" not in server_content:
+                raise RuntimeError(
+                    "ABORT: Customization shim (CUSTOMIZATION LAYER marker) was removed by upstream update. "
+                    "Custom routes, panels, and config overrides will not load. "
+                    "Rolling back to preserve local customizations."
+                )
+            _log_update(f"[{job_id}] Customization shim verified present")
+        else:
+            raise RuntimeError("ABORT: portal_server.py missing after pull")
+
+        # Step 9: RUN TESTS (mandatory — tests must exist and pass)
         _update_step("running_tests")
         _log_update(f"[{job_id}] Step 9: Running tests...")
-        test_cmd = [sys.executable, "-m", "pytest", str(SCRIPT_DIR / "tests"), "--tb=short", "-q"]
+        tests_dir = SCRIPT_DIR / "tests"
+        if not tests_dir.exists() or not any(tests_dir.glob("test_*.py")):
+            raise RuntimeError(
+                "ABORT: No tests directory or test files found. "
+                "Tests are mandatory for safe updates — the update cannot proceed without them."
+            )
+        test_cmd = [sys.executable, "-m", "pytest", str(tests_dir), "--tb=short", "-q"]
         loop = asyncio.get_event_loop()
         try:
             test_result = await asyncio.wait_for(
@@ -8819,10 +8975,45 @@ async def _run_update(job_id: str):
         prev_label = previous_sha[:7] if previous_sha else "fresh"
         _log_update(f"[{job_id}] SUCCESS: Updated from {prev_label} to {_update_state['new_sha'][:7]}")
 
-        # Delay 2s so the success status can be polled, then SIGTERM
+        # Delay 2s so the success status can be polled, then restart
         await asyncio.sleep(2)
-        _log_update(f"[{job_id}] Sending SIGTERM for watchdog restart...")
-        os.kill(os.getpid(), signal.SIGTERM)
+
+        # Check for watchdog before self-terminating
+        has_watchdog = False
+        try:
+            # Check if running under a process manager
+            ppid = os.getppid()
+            ppid_comm = Path(f"/proc/{ppid}/comm")
+            ppid_name = ppid_comm.read_text().strip() if ppid_comm.exists() else ""
+            if ppid_name in ("systemd", "supervisord", "s6-supervise", "runit", "init"):
+                has_watchdog = True
+                _log_update(f"[{job_id}] Process manager detected: {ppid_name} (PID {ppid})")
+            # Also check for systemd service
+            for svc in ["portal", "purebrain-portal", "puresurf-portal"]:
+                result = subprocess.run(
+                    ["systemctl", "is-active", svc],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    has_watchdog = True
+                    _log_update(f"[{job_id}] systemd service '{svc}' is active")
+                    break
+        except Exception as e:
+            _log_update(f"[{job_id}] Watchdog detection error (non-fatal): {e}")
+
+        if has_watchdog:
+            _log_update(f"[{job_id}] Sending SIGTERM for watchdog restart...")
+            os.kill(os.getpid(), signal.SIGTERM)
+        else:
+            _log_update(f"[{job_id}] WARNING: No process manager detected. Attempting exec restart...")
+            try:
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            except Exception as e:
+                _log_update(f"[{job_id}] WARNING: exec restart failed: {e}. Portal needs manual restart.")
+                _update_state["message"] = (
+                    "Update complete but automatic restart failed. "
+                    "No process manager detected. Please restart the portal manually."
+                )
 
     except Exception as e:
         error_msg = str(e)
@@ -8830,7 +9021,7 @@ async def _run_update(job_id: str):
 
         # Rollback if we already pulled
         rolled_back_to = None
-        if previous_sha and _update_state["step"] in ("running_tests", "read_version", "restart"):
+        if previous_sha and _update_state["step"] in ("verify_shim", "running_tests", "read_version", "restart"):
             _log_update(f"[{job_id}] Rolling back to {previous_sha}...")
             rc_reset, _ = await _git_cmd(["reset", "--hard", previous_sha])
             if rc_reset == 0:
@@ -8852,6 +9043,10 @@ async def _run_update(job_id: str):
                 "completed_at": datetime.now(timezone.utc).isoformat(),
             },
         })
+    finally:
+        # Always release the lock so a new update can be triggered
+        if lock.locked():
+            lock.release()
 
 
 async def api_update_status(request: Request) -> JSONResponse:
@@ -9555,6 +9750,7 @@ routes = [
     Route("/api/whatsapp/status", endpoint=api_whatsapp_status),
     Route("/api/settings", endpoint=api_user_settings, methods=["GET", "POST", "PUT"]),
     Route("/api/bookmarks", endpoint=api_bookmarks, methods=["GET", "POST"]),
+    Route("/api/health/mods", endpoint=api_health_mods),
     Route("/api/update/check", endpoint=api_update_check),
     Route("/api/update/apply", endpoint=api_update_apply, methods=["POST"]),
     Route("/api/update/status", endpoint=api_update_status),
