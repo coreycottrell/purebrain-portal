@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -73,7 +74,7 @@ PORTAL_HTML = SCRIPT_DIR / "portal.html"
 PORTAL_PB_HTML = SCRIPT_DIR / "portal-pb-styled.html"
 REACT_DIST = SCRIPT_DIR / "react-portal" / "dist"
 START_TIME = time.time()
-PORTAL_VERSION = "1.4.0"
+PORTAL_VERSION = "1.4.1"
 RELEASE_NOTES_FILE = SCRIPT_DIR / "release_notes.json"
 # Auto-detect CIV_NAME and HUMAN_NAME from identity file — works in any fleet container.
 # Falls back to generic defaults if identity file not found (local dev).
@@ -8742,6 +8743,122 @@ async def api_update_apply(request: Request) -> JSONResponse:
     })
 
 
+async def api_update_apply_force(request: Request) -> JSONResponse:
+    """POST /api/update/apply-force -- Backup local changes and update anyway."""
+    if not check_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, 401)
+
+    lock = await _get_update_lock()
+
+    # Guard 1: If lock is already held, another update is running
+    if lock.locked():
+        return JSONResponse({"status": "error", "error": "Update already in progress"})
+
+    # Guard 2: Check state flag (belt-and-suspenders with the lock)
+    if _update_state["status"] == "in_progress":
+        return JSONResponse({"status": "error", "error": "Update already in progress"})
+
+    # Acquire the lock before mutating state — background task will release it
+    await lock.acquire()
+
+    # Ensure git is configured (auto-heal for non-git-clone deployments)
+    ok, heal_msg = await _ensure_git_repo()
+    if not ok:
+        lock.release()
+        return JSONResponse({"status": "error", "error": f"Git setup failed: {heal_msg}"})
+
+    # Check for dirty tracked files
+    rc_status, status_output = await _git_cmd(["status", "--porcelain"])
+    tracked_changes = []
+    if rc_status == 0 and status_output:
+        tracked_changes = [
+            line for line in status_output.split("\n")
+            if line.strip() and not line.startswith("??")
+        ]
+
+    # Backup modified tracked files before discarding
+    backed_up_files = []
+    backup_dir = None
+    if tracked_changes:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_dir = SCRIPT_DIR / "backups" / "pre-update" / timestamp
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate full diff against HEAD
+        rc_diff, diff_output = await _git_cmd(["diff", "HEAD"], timeout=30)
+        if rc_diff == 0 and diff_output:
+            (backup_dir / "CHANGES.diff").write_text(diff_output)
+
+        # Copy each modified tracked file into the backup directory
+        for tc_line in tracked_changes:
+            fname = tc_line[3:].strip() if len(tc_line) > 3 else tc_line.strip()
+            if " -> " in fname:
+                fname = fname.split(" -> ")[-1]
+            src = SCRIPT_DIR / fname
+            if src.exists():
+                dest = backup_dir / fname
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(dest))
+                backed_up_files.append(fname)
+
+        # Write a human-readable summary
+        summary = f"# Pre-Update Backup\n\n"
+        summary += f"**Date**: {datetime.now(timezone.utc).isoformat()}\n"
+        summary += f"**Files backed up**: {len(backed_up_files)}\n\n"
+        for f in backed_up_files:
+            summary += f"- {f}\n"
+        summary += f"\n**Diff**: See CHANGES.diff in this directory\n"
+        summary += f"\n**To migrate**: Move your changes to the custom/ overlay system.\n"
+        summary += f"See skills/core/portal-mod-protocol/SKILL.md for instructions.\n"
+        (backup_dir / "README.md").write_text(summary)
+
+        # Discard local tracked changes so git pull can proceed
+        rc_checkout, checkout_out = await _git_cmd(["checkout", "--", "."], timeout=15)
+        if rc_checkout != 0:
+            lock.release()
+            return JSONResponse({
+                "status": "error",
+                "error": f"Failed to discard local changes: {checkout_out}",
+                "backup_dir": str(backup_dir.relative_to(SCRIPT_DIR)),
+            })
+
+    # Now proceed with normal update flow
+    job_id = f"update-force-{datetime.now():%Y%m%d-%H%M%S}"
+
+    _update_state.update({
+        "status": "in_progress",
+        "job_id": job_id,
+        "step": "starting",
+        "steps_completed": [],
+        "steps_remaining": ["ensure_git", "fetch", "compare", "check_tree",
+                            "record_rollback", "verify_custom", "verify_preserved",
+                            "pull", "verify_shim", "running_tests", "read_version", "restart"],
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None,
+        "error": None,
+        "previous_sha": None,
+        "new_sha": None,
+        "new_version": None,
+        "rolled_back_to": None,
+        "step_failed": None,
+        "tests_passed": None,
+        "message": None,
+        "backed_up_files": backed_up_files,
+        "backup_dir": str(backup_dir.relative_to(SCRIPT_DIR)) if backup_dir else None,
+    })
+
+    # Launch background task (lock is held; _run_update releases it in finally)
+    asyncio.create_task(_run_update(job_id, lock))
+
+    return JSONResponse({
+        "status": "started",
+        "job_id": job_id,
+        "backed_up_files": backed_up_files,
+        "backup_dir": str(backup_dir.relative_to(SCRIPT_DIR)) if backup_dir else None,
+        "message": f"Backed up {len(backed_up_files)} file(s). Update in progress. Poll /api/update/status for progress.",
+    })
+
+
 def _update_step(step_name: str):
     """Mark a step as current and move it from remaining to completed."""
     _update_state["step"] = step_name
@@ -9076,6 +9193,8 @@ async def api_update_status(request: Request) -> JSONResponse:
             "tests_passed": _update_state["tests_passed"],
             "message": _update_state["message"],
             "completed_at": _update_state["completed_at"],
+            "backed_up_files": _update_state.get("backed_up_files"),
+            "backup_dir": _update_state.get("backup_dir"),
         })
 
     if status == "failed":
@@ -9753,6 +9872,7 @@ routes = [
     Route("/api/health/mods", endpoint=api_health_mods),
     Route("/api/update/check", endpoint=api_update_check),
     Route("/api/update/apply", endpoint=api_update_apply, methods=["POST"]),
+    Route("/api/update/apply-force", endpoint=api_update_apply_force, methods=["POST"]),
     Route("/api/update/status", endpoint=api_update_status),
     Route("/api/evolution/status", endpoint=api_evolution_status),
     Route("/api/evolution/first-boot", endpoint=api_first_boot, methods=["POST"]),

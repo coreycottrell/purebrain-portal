@@ -1,6 +1,18 @@
 {
-  "current_version": "1.4.0",
+  "current_version": "1.4.1",
   "releases": [
+    {
+      "version": "1.4.1",
+      "date": "2026-04-23",
+      "title": "Update UX + Backup-and-Update Option",
+      "highlights": [
+        "NEW: 'Update Anyway' button — when blocked by tracked file changes, backs up modified files to backups/pre-update/ then proceeds with update. Changes are recoverable.",
+        "UX: Error messages are now persistent — stay visible until user clicks Check for Updates again.",
+        "UX: Error messages styled with red background/border for better visibility.",
+        "UX: When blocked by uncommitted changes, shows exact file list and migration guidance.",
+        "FIX: Version display now shows actual version (was showing 1.2.0-flux2 due to config override)."
+      ]
+    },
     {
       "version": "1.4.0",
       "date": "2026-04-22",

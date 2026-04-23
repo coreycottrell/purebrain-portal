@@ -17,6 +17,7 @@ portal.log.*
 logs/
 
 # Backups
+backups/
 *.bak
 *.bak-*
 

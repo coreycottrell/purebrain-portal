@@ -7425,10 +7425,11 @@
       </div>
       <div id="update-uptodate-msg" style="display:none;font-size:0.85rem;color:#22c55e;">&#x2714; Portal is up to date.</div>
       <div id="update-success-msg" style="display:none;flex-direction:column;gap:6px;background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.25);border-radius:8px;padding:12px;font-size:0.85rem;color:#22c55e;"></div>
-      <div id="update-error-msg" style="display:none;font-size:0.85rem;color:#ef4444;"></div>
+      <div id="update-error-msg" style="display:none;flex-direction:column;gap:6px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.25);border-radius:8px;padding:12px;font-size:0.85rem;color:#ef4444;"></div>
       <div style="display:flex;gap:8px;align-items:center;">
         <button id="update-check-btn" onclick="checkForUpdates()" style="padding:8px 16px;background:var(--surface2);border:1px solid var(--border2);border-radius:6px;color:#e8ecf4;font-size:0.88rem;cursor:pointer;">Check for Updates</button>
         <button id="update-apply-btn" onclick="applyUpdate()" style="display:none;padding:8px 18px;background:linear-gradient(135deg,var(--gold),var(--teal));color:#fff;border:none;border-radius:6px;font-size:0.88rem;font-weight:700;cursor:pointer;">Update Now</button>
+        <button id="update-force-btn" onclick="applyForceUpdate()" style="display:none;padding:8px 18px;background:linear-gradient(135deg,#ef4444,#dc2626);color:#fff;border:none;border-radius:6px;font-size:0.88rem;font-weight:700;cursor:pointer;">Update Anyway (backup changes)</button>
       </div>
       <div id="update-progress" style="display:none;flex-direction:column;gap:6px;">
         <div style="display:flex;align-items:center;gap:8px;">
@@ -12962,6 +12963,22 @@
     return d.innerHTML;
   }
 
+  /* Show a styled, persistent error in the update-error-msg container.
+     Accepts raw HTML (caller must escape user-supplied strings). */
+  function _showUpdateError(html) {
+    var el = document.getElementById('update-error-msg');
+    if (!el) return;
+    el.innerHTML = html;
+    el.style.display = 'flex';
+  }
+
+  function _hideUpdateError() {
+    var el = document.getElementById('update-error-msg');
+    if (!el) return;
+    el.innerHTML = '';
+    el.style.display = 'none';
+  }
+
   function showSettingsUpdateDot(show) {
     var gear = document.getElementById('settings-btn');
     if (!gear) return;
@@ -12983,9 +13000,11 @@
     btn.textContent = 'Checking...';
     btn.disabled = true;
 
-    // Hide previous messages
+    // Hide previous messages (errors persist until user clicks Check again)
     var successMsg = document.getElementById('update-success-msg');
     if (successMsg) successMsg.style.display = 'none';
+    _hideUpdateError();
+    document.getElementById('update-force-btn').style.display = 'none';
 
     fetch('/api/update/check', {
       headers: { 'Authorization': 'Bearer ' + token }
@@ -12994,8 +13013,6 @@
     .then(function(data) {
       btn.textContent = 'Check for Updates';
       btn.disabled = false;
-
-      document.getElementById('update-error-msg').style.display = 'none';
 
       if (data.status === 'available') {
         _updateCurrentVersion = data.current_version || '';
@@ -13043,15 +13060,13 @@
         if (newBadge) newBadge.style.display = 'none';
 
       } else if (data.status === 'error') {
-        document.getElementById('update-error-msg').textContent = data.error;
-        document.getElementById('update-error-msg').style.display = 'block';
+        _showUpdateError(_escapeHtmlUpdate(data.error || 'Unknown error'));
       }
     })
     .catch(function(err) {
       btn.textContent = 'Check for Updates';
       btn.disabled = false;
-      document.getElementById('update-error-msg').textContent = 'Network error: ' + err.message;
-      document.getElementById('update-error-msg').style.display = 'block';
+      _showUpdateError('Network error: ' + _escapeHtmlUpdate(err.message));
     });
   }
 
@@ -13082,16 +13097,78 @@
       } else {
         document.getElementById('update-progress').style.display = 'none';
         document.getElementById('update-check-btn').style.display = 'inline-block';
-        document.getElementById('update-error-msg').textContent = data.error || 'Unexpected response';
-        document.getElementById('update-error-msg').style.display = 'block';
+        var errHtml = _escapeHtmlUpdate(data.error || 'Unexpected response');
+        if (data.modified_files && data.modified_files.length > 0) {
+          errHtml += '<div style="margin-top:6px;font-family:var(--font-mono);font-size:0.82rem;">';
+          errHtml += 'Modified files:<br>';
+          data.modified_files.forEach(function(f) {
+            errHtml += '&nbsp;&nbsp;\u2022 <code>' + _escapeHtmlUpdate(f) + '</code><br>';
+          });
+          errHtml += '</div>';
+        }
+        if (data.guidance) {
+          errHtml += '<div style="margin-top:6px;font-size:0.82rem;color:#b0b8c8;">' + _escapeHtmlUpdate(data.guidance) + '</div>';
+        }
+        _showUpdateError(errHtml);
+        btn.style.display = 'inline-block';
+        // Show "Update Anyway" button when blocked by tracked changes
+        if (data.modified_files && data.modified_files.length > 0) {
+          document.getElementById('update-force-btn').style.display = 'inline-block';
+        }
+      }
+    })
+    .catch(function(err) {
+      document.getElementById('update-progress').style.display = 'none';
+      document.getElementById('update-check-btn').style.display = 'inline-block';
+      _showUpdateError('Failed to start update: ' + _escapeHtmlUpdate(err.message));
+      btn.style.display = 'inline-block';
+    });
+  }
+
+  function applyForceUpdate() {
+    if (!confirm(
+      'This will:\n' +
+      '1. Back up your modified files to backups/pre-update/\n' +
+      '2. Discard local tracked file changes\n' +
+      '3. Pull the latest update\n\n' +
+      'Your changes will be saved but need to be migrated to custom/ afterwards.\n\n' +
+      'Continue?'
+    )) return;
+
+    var btn = document.getElementById('update-force-btn');
+    btn.style.display = 'none';
+    document.getElementById('update-apply-btn').style.display = 'none';
+    document.getElementById('update-check-btn').style.display = 'none';
+    document.getElementById('update-progress').style.display = 'flex';
+    document.getElementById('update-progress-text').textContent = 'Backing up changes and updating...';
+    document.getElementById('update-steps').innerHTML = '';
+    _hideUpdateError();
+
+    fetch('/api/update/apply-force', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: '{}'
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.status === 'started') {
+        // Show backup info
+        if (data.backed_up_files && data.backed_up_files.length > 0) {
+          var stepEl = document.getElementById('update-steps');
+          stepEl.innerHTML = '<div style="color:#f59e0b;">&#x1F4E6; Backed up ' + data.backed_up_files.length + ' file(s) to ' + _escapeHtmlUpdate(data.backup_dir || 'backups/') + '</div>';
+        }
+        pollUpdateStatus(data.job_id);
+      } else {
+        document.getElementById('update-progress').style.display = 'none';
+        document.getElementById('update-check-btn').style.display = 'inline-block';
+        _showUpdateError(_escapeHtmlUpdate(data.error || 'Unexpected response'));
         btn.style.display = 'inline-block';
       }
     })
     .catch(function(err) {
       document.getElementById('update-progress').style.display = 'none';
       document.getElementById('update-check-btn').style.display = 'inline-block';
-      document.getElementById('update-error-msg').textContent = 'Failed to start update: ' + err.message;
-      document.getElementById('update-error-msg').style.display = 'block';
+      _showUpdateError('Failed to start force update: ' + _escapeHtmlUpdate(err.message));
       btn.style.display = 'inline-block';
     });
   }
@@ -13151,6 +13228,13 @@
             successEl.innerHTML =
               '<div style="font-weight:700;">&#x2714; Updated to v' + _escapeHtmlUpdate(newVer) + ' successfully!</div>' +
               '<div style="font-size:0.82rem;color:#b0b8c8;">Portal will restart in 5 seconds. The page will reload automatically.</div>';
+            // Show backup notification if files were backed up during force update
+            if (data.backed_up_files && data.backed_up_files.length > 0) {
+              successEl.innerHTML += '<div style="margin-top:8px;padding:8px;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.25);border-radius:6px;font-size:0.82rem;color:#f59e0b;">' +
+                '&#x1F4E6; ' + data.backed_up_files.length + ' file(s) were backed up to <code>' + _escapeHtmlUpdate(data.backup_dir || 'backups/') + '</code>.<br>' +
+                'Migrate your changes to <code>custom/</code> &mdash; see the Portal Mod Protocol skill for instructions.' +
+                '</div>';
+            }
             successEl.style.display = 'flex';
           }
 
@@ -13161,12 +13245,11 @@
           document.getElementById('update-progress').style.display = 'none';
           document.getElementById('update-check-btn').style.display = 'inline-block';
 
-          var errMsg = 'Update failed: ' + (data.error || 'Unknown error');
+          var errHtml = 'Update failed: ' + _escapeHtmlUpdate(data.error || 'Unknown error');
           if (data.rolled_back_to) {
-            errMsg += ' (rolled back to ' + data.rolled_back_to.substring(0,7) + ')';
+            errHtml += ' (rolled back to ' + _escapeHtmlUpdate(data.rolled_back_to.substring(0,7)) + ')';
           }
-          document.getElementById('update-error-msg').textContent = errMsg;
-          document.getElementById('update-error-msg').style.display = 'block';
+          _showUpdateError(errHtml);
           document.getElementById('update-apply-btn').style.display = 'inline-block';
         }
       })
@@ -13184,6 +13267,7 @@
 
   window.checkForUpdates = checkForUpdates;
   window.applyUpdate = applyUpdate;
+  window.applyForceUpdate = applyForceUpdate;
   window.pollUpdateStatus = pollUpdateStatus;
 
   // Fetch release notes after login
