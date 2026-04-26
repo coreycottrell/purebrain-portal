@@ -8269,6 +8269,7 @@
     if (panel !== 'agents' && agentsInterval) { clearInterval(agentsInterval); agentsInterval = null; }
     if (panel === 'commands') { if (window.loadCommands) window.loadCommands(); }
     if (panel === 'shortcuts') { if (window.loadShortcuts) window.loadShortcuts(); }
+    if (panel === 'files') loadFiles(null);
     if (panel === 'terminal') {
       // Connect active tab's WS if not already connected
       var activeSess = termSessions[activeTermTid];
@@ -11351,14 +11352,7 @@
     navigator.clipboard.writeText(val).then(function() { showToast('Link copied!'); });
   };
 
-  // Load files when panel becomes active
-  document.querySelectorAll('.nav-item, .tab-item').forEach(function(el) {
-    el.addEventListener('click', function() {
-      if (el.getAttribute('data-panel') === 'files' && filesList.children.length <= 1) {
-        loadFiles(null);
-      }
-    });
-  });
+  // Files loading is now handled by switchPanel() directly — no extra listener needed.
 
   // ===== CONTEXT GAUGE (real token data from /api/context) =====
   function updateCtxGauge() {
