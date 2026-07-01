@@ -962,8 +962,9 @@ class TestFailureAlerting:
     """Test Brevo failure alert emails via AgentMail."""
 
     @patch("brevo_sync.urllib.request.urlopen")
+    @patch("brevo_sync.CIV_NAME", "testciv")
     def test_failure_alert_sends_email(self, mock_urlopen):
-        """Brevo API failure should trigger alert email to Lyra + Aether."""
+        """Brevo API failure should trigger alert email to CIV's own inbox."""
         from brevo_sync import _notify_sync_failure
         mock_resp = MagicMock()
         mock_resp.status = 200
@@ -982,10 +983,11 @@ class TestFailureAlerting:
         assert body["subject"] == "[Brevo Sync Failed] alice@example.com"
         assert "portal_login" in body["text"]
         assert "HTTP 500" in body["text"]
-        # Should send to both Lyra and Aether
+        # Should send to CIV's own agentmail address (dynamic, not hardcoded)
         to_emails = [r["email"] for r in body["to"]]
-        assert "lyra-pmg@agentmail.to" in to_emails
-        assert "aethergottaeat@agentmail.to" in to_emails
+        assert "testciv.civ@agentmail.to" in to_emails
+        assert body["from"]["email"] == "testciv.civ@agentmail.to"
+        assert body["from"]["name"] == "testciv Portal"
 
     def test_failure_alert_does_not_fire_on_no_key(self):
         """'No AGENTMAIL_API_KEY' should NOT trigger alert (silently skip)."""
@@ -993,6 +995,14 @@ class TestFailureAlerting:
         with patch.dict(os.environ, {}, clear=True):
             os.environ.pop("AGENTMAIL_API_KEY", None)
             # Should not raise
+            _notify_sync_failure("alice@example.com", "portal_login", "HTTP 500")
+
+    @patch("brevo_sync.CIV_NAME", "")
+    def test_failure_alert_skips_when_no_civ_name(self):
+        """No CIV_NAME configured should silently skip alert (no hardcoded fallback)."""
+        from brevo_sync import _notify_sync_failure
+        with patch.dict(os.environ, {"AGENTMAIL_API_KEY": "test-key-123"}):
+            # Should not raise and should not make any HTTP call
             _notify_sync_failure("alice@example.com", "portal_login", "HTTP 500")
 
     @patch("brevo_sync.urllib.request.urlopen")

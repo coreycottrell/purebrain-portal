@@ -45,14 +45,14 @@ class TestPayoutDBHelpers(unittest.TestCase):
         os.unlink(self.db_path)
 
     def _init_db(self):
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)):
             from portal_server import _init_referral_db
             _run(_init_referral_db())
 
     def test_read_returns_empty_for_fresh_db(self):
         """Fresh DB should return empty list."""
         self._init_db()
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)):
             from portal_server import _read_payout_requests_db
             result = _run(_read_payout_requests_db())
         self.assertEqual(result, [])
@@ -72,7 +72,7 @@ class TestPayoutDBHelpers(unittest.TestCase):
             "created_at_ts": 1776528000.0,
             "paid_at": None,
         }
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)):
             from portal_server import _write_payout_request_db, _read_payout_requests_db
             _run(_write_payout_request_db(entry))
             result = _run(_read_payout_requests_db())
@@ -102,7 +102,7 @@ class TestPayoutDBHelpers(unittest.TestCase):
             "created_at_ts": 1776528000.0,
             "paid_at": None,
         }
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)):
             from portal_server import (
                 _write_payout_request_db,
                 _read_payout_requests_db,
@@ -128,7 +128,7 @@ class TestPayoutDBHelpers(unittest.TestCase):
             "created_at_ts": 1776528000.0,
             "paid_at": None,
         }
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)):
             from portal_server import (
                 _write_payout_request_db,
                 _read_payout_requests_db,
@@ -147,7 +147,7 @@ class TestPayoutDBHelpers(unittest.TestCase):
     def test_update_nonexistent_returns_false(self):
         """Updating a nonexistent request_id returns False."""
         self._init_db()
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)):
             from portal_server import _update_payout_status_db
             ok = _run(_update_payout_status_db("nonexistent-id", "completed"))
         self.assertFalse(ok)
@@ -166,7 +166,7 @@ class TestPayoutDBHelpers(unittest.TestCase):
             "paid_at": None,
         }
 
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)):
             from portal_server import _write_payout_request_db
             _run(_write_payout_request_db(entry))
             with self.assertRaises(aiosqlite.IntegrityError):
@@ -189,7 +189,7 @@ class TestPayoutDBHelpers(unittest.TestCase):
             "created_at_ts": time.time(),
             "paid_at": None,
         }
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)):
             from portal_server import _write_payout_request_db, _read_payout_requests_db
             _run(_write_payout_request_db(entry))
             # Immediately read back - should see the pending request
@@ -237,7 +237,7 @@ class TestPayoutDBHelpers(unittest.TestCase):
                 "paid_at": None,
             },
         ]
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)):
             from portal_server import _write_payout_request_db
             for e in entries:
                 _run(_write_payout_request_db(e))
@@ -270,7 +270,7 @@ class TestPayoutDBUpdateNotes(unittest.TestCase):
         os.unlink(self.db_path)
 
     def _init_db(self):
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)):
             from portal_server import _init_referral_db
             _run(_init_referral_db())
 
@@ -287,7 +287,7 @@ class TestPayoutDBUpdateNotes(unittest.TestCase):
             "created_at_ts": 1776528000.0,
             "paid_at": None,
         }
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)):
             from portal_server import (
                 _write_payout_request_db,
                 _read_payout_requests_db,
@@ -352,8 +352,8 @@ class TestJSONLMigration(unittest.TestCase):
             for e in entries:
                 f.write(json.dumps(e) + "\n")
 
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)), \
-             patch("portal_server.PAYOUT_REQUESTS_FILE", self.jsonl_path):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)), \
+             patch("portal_referrals.PAYOUT_REQUESTS_FILE", self.jsonl_path):
             from portal_server import _init_referral_db
             _run(_init_referral_db())
 
@@ -381,8 +381,8 @@ class TestJSONLMigration(unittest.TestCase):
                 "created_at": "2026-04-16T00:00:00+00:00",
             }) + "\n")
 
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)), \
-             patch("portal_server.PAYOUT_REQUESTS_FILE", self.jsonl_path):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)), \
+             patch("portal_referrals.PAYOUT_REQUESTS_FILE", self.jsonl_path):
             from portal_server import _init_referral_db
             _run(_init_referral_db())
 
@@ -393,8 +393,8 @@ class TestJSONLMigration(unittest.TestCase):
     def test_migration_skips_when_no_jsonl(self):
         """When no JSONL file exists, migration should be a no-op."""
         # Don't create any JSONL file
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)), \
-             patch("portal_server.PAYOUT_REQUESTS_FILE", self.jsonl_path):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)), \
+             patch("portal_referrals.PAYOUT_REQUESTS_FILE", self.jsonl_path):
             from portal_server import _init_referral_db
             _run(_init_referral_db())
 
@@ -422,8 +422,8 @@ class TestJSONLMigration(unittest.TestCase):
         with self.jsonl_path.open("w") as f:
             f.write(entry_json + "\n")
 
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)), \
-             patch("portal_server.PAYOUT_REQUESTS_FILE", self.jsonl_path):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)), \
+             patch("portal_referrals.PAYOUT_REQUESTS_FILE", self.jsonl_path):
             from portal_server import _init_referral_db
             _run(_init_referral_db())
 
@@ -432,8 +432,8 @@ class TestJSONLMigration(unittest.TestCase):
         if migrated.exists():
             migrated.rename(self.jsonl_path)
 
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)), \
-             patch("portal_server.PAYOUT_REQUESTS_FILE", self.jsonl_path):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)), \
+             patch("portal_referrals.PAYOUT_REQUESTS_FILE", self.jsonl_path):
             from portal_server import _init_referral_db
             # Should not raise
             _run(_init_referral_db())

@@ -70,9 +70,9 @@
     var user   = escHtml(s.ssh_user  || 'user');
     var purl   = escHtml(s.portal_url || '');
     var sess   = escHtml(t.primary_session || civ.name + '-primary');
-    var civN   = escHtml(civ.name || 'aether');
+    var civN   = escHtml(civ.name || 'my-civ');
     var home   = escHtml(p.home || '/home/' + (s.ssh_user || 'user'));
-    var croot  = escHtml(p.civ_root || home + '/projects/AI-CIV/aether');
+    var croot  = escHtml(p.civ_root || home);
     var pdir   = escHtml(p.portal_dir || home + '/purebrain_portal');
     var tdir   = escHtml(p.tools_dir || croot + '/tools');
     var ldir   = escHtml(p.logs_dir  || croot + '/logs');
@@ -133,7 +133,7 @@
     html += '<div class="cmd-section-title">&#x1F504; Restarts</div>';
     html += '<div class="cmd-cards-grid">';
     html += '<div class="cmd-card"><div class="cmd-label">Restart Telegram bridge</div>' + cmdBlock('pkill -f telegram_bridge.py; rm -f ' + home + '/.telegram_bridge.pid; nohup python3 ' + tdir + '/telegram_bridge.py >> ' + ldir + '/telegram_bridge.log 2>&1 &') + '</div>';
-    html += '<div class="cmd-card"><div class="cmd-label">Restart portal server</div>' + cmdBlock('cd ' + pdir + ' && kill $(pgrep -f portal_server.py) 2>/dev/null; sleep 1; nohup python3 portal_server.py > portal.log 2>&1 &') + '<div class="cmd-warn">&#x26A0; Warn Jared before restarting — brief 502 during restart</div></div>';
+    html += '<div class="cmd-card"><div class="cmd-label">Restart portal server</div>' + cmdBlock('cd ' + pdir + ' && kill $(pgrep -f portal_server.py) 2>/dev/null; sleep 1; nohup python3 portal_server.py > portal.log 2>&1 &') + '<div class="cmd-warn">&#x26A0; Warn your admin before restarting — brief 502 during restart</div></div>';
     html += '<div class="cmd-card"><div class="cmd-label">Compact context (in Claude)</div>' + cmdBlock('tmux send-keys -t ' + (t.primary_session||sess) + ':0.0 "/compact" Enter') + '</div>';
     html += '<div class="cmd-card"><div class="cmd-label">Kill a stuck process</div>' + cmdBlock('kill PID_NUMBER') + '<div class="cmd-note">Get PID from: ps aux | grep PROCESS_NAME</div></div>';
     html += '</div></div>';
@@ -178,7 +178,7 @@
     html += '<div class="cmd-card danger-card"><div class="cmd-label danger">Portal not loading (502/down)</div>';
     html += '<div class="cmd-step">1. Check portal process:</div>' + cmdBlock('ps aux | grep portal_server | grep -v grep');
     html += '<div class="cmd-step">2. Restart portal:</div>' + cmdBlock('cd ' + pdir + ' && nohup python3 portal_server.py > portal.log 2>&1 &');
-    html += '<div class="cmd-warn">&#x26A0; Warn Jared first — he gets 502 errors during restarts</div>';
+    html += '<div class="cmd-warn">&#x26A0; Warn your admin first — he gets 502 errors during restarts</div>';
     html += '</div>';
     html += '<div class="cmd-card danger-card"><div class="cmd-label danger">Context above 80% (risk of crash)</div>';
     html += cmdBlock('tmux send-keys -t ' + (t.primary_session||sess) + ':0.0 "/compact" Enter');

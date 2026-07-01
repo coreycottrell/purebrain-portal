@@ -1,122 +1,136 @@
 """
-test_update_remote_config.py -- Unit tests for auto-configuring git remote in api_update_check.
+test_update_remote_config.py -- Unit tests for release-server update configuration.
 
-Tests that when `origin` remote is not configured, the endpoint automatically adds it
-before attempting the fetch -- fixing silent failures on fresh (non-git-clone) deployments.
+Tests that api_update_check correctly communicates with the release server,
+handles missing tokens, and returns appropriate error/success responses.
+
+(Replaces old git-remote auto-config tests which tested _ensure_git_repo logic
+that was removed in the release-server migration.)
 """
 
 import asyncio
-import importlib
+import json
 import sys
 import os
 import unittest
-from unittest.mock import AsyncMock, patch, call
+from unittest.mock import AsyncMock, patch
 
 # Ensure portal_server is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-EXPECTED_REMOTE_URL = "https://github.com/coreycottrell/purebrain-portal.git"
+class TestUpdateCheckReleaseServer(unittest.IsolatedAsyncioTestCase):
+    """Unit tests for api_update_check with release server backend."""
 
-
-class TestUpdateCheckAutoConfigRemote(unittest.IsolatedAsyncioTestCase):
-    """Unit tests for auto-remote-configuration logic in api_update_check."""
-
-    async def test_auto_adds_remote_when_missing(self):
-        """When origin is not configured, remote add is called before fetch."""
-        import portal_server
-
-        call_sequence = []
-
-        async def mock_git_cmd(args, timeout=15):
-            call_sequence.append(args)
-            if args == ["remote", "get-url", "origin"]:
-                return (1, "error: No such remote 'origin'")
-            if args[:2] == ["remote", "add"]:
-                return (0, "")
-            if args[:3] == ["fetch", "origin", "main"]:
-                return (0, "")
-            if args == ["rev-parse", "HEAD"]:
-                return (0, "abc123")
-            if args == ["rev-parse", "origin/main"]:
-                return (0, "abc123")
-            return (0, "")
+    async def test_returns_available_when_remote_version_is_newer(self):
+        """When the release server returns a newer version, status is 'available'."""
+        import portal_updates
 
         class FakeRequest:
-            def __init__(self):
-                self.headers = {"Authorization": "Bearer test-token"}
+            headers = {"Authorization": "Bearer test-token"}
 
-        with patch.object(portal_server, "_git_cmd", side_effect=mock_git_cmd), \
-             patch.object(portal_server, "check_auth", return_value=True), \
-             patch.object(portal_server, "_get_current_version", new=AsyncMock(return_value="1.0.0")):
-            resp = await portal_server.api_update_check(FakeRequest())
+        fake_resp_data = json.dumps({
+            "version": "99.0.0",
+            "sha256": "abc123def456",
+            "size_bytes": 2048000,
+        }).encode()
 
-        # remote add must have been called with the correct URL
-        self.assertIn(
-            ["remote", "add", "origin", EXPECTED_REMOTE_URL],
-            call_sequence,
-            "Expected 'git remote add origin <url>' to be called when remote is missing",
-        )
-        # fetch must have happened after remote add
-        add_idx = call_sequence.index(["remote", "add", "origin", EXPECTED_REMOTE_URL])
-        fetch_args = [a for a in call_sequence if a[:3] == ["fetch", "origin", "main"]]
-        self.assertTrue(fetch_args, "Expected fetch to be called after remote add")
-        fetch_idx = call_sequence.index(fetch_args[0])
-        self.assertGreater(fetch_idx, add_idx, "fetch must happen AFTER remote add")
+        class FakeHTTPResponse:
+            def read(self):
+                return fake_resp_data
 
-    async def test_skips_remote_add_when_origin_exists(self):
-        """When origin is already configured, remote add is NOT called."""
-        import portal_server
+        with patch.object(portal_updates, "check_auth", return_value=True), \
+             patch.object(portal_updates, "_get_current_version", new=AsyncMock(return_value="1.0.0")), \
+             patch.object(portal_updates, "PORTAL_UPDATE_TOKEN", "test-token-123"), \
+             patch("urllib.request.urlopen", return_value=FakeHTTPResponse()):
+            resp = await portal_updates.api_update_check(FakeRequest())
 
-        call_sequence = []
+        body = json.loads(resp.body)
+        self.assertEqual(body["status"], "available")
+        self.assertEqual(body["remote_version"], "99.0.0")
+        self.assertEqual(body["current_version"], "1.0.0")
 
-        async def mock_git_cmd(args, timeout=15):
-            call_sequence.append(args)
-            if args == ["remote", "get-url", "origin"]:
-                return (0, EXPECTED_REMOTE_URL)
-            if args[:3] == ["fetch", "origin", "main"]:
-                return (0, "")
-            if args == ["rev-parse", "HEAD"]:
-                return (0, "abc123")
-            if args == ["rev-parse", "origin/main"]:
-                return (0, "abc123")
-            return (0, "")
+    async def test_returns_up_to_date_when_versions_match(self):
+        """When the release server returns the same version, status is 'up_to_date'."""
+        import portal_updates
 
         class FakeRequest:
-            def __init__(self):
-                self.headers = {"Authorization": "Bearer test-token"}
+            headers = {"Authorization": "Bearer test-token"}
 
-        with patch.object(portal_server, "_git_cmd", side_effect=mock_git_cmd), \
-             patch.object(portal_server, "check_auth", return_value=True), \
-             patch.object(portal_server, "_get_current_version", new=AsyncMock(return_value="1.0.0")):
-            resp = await portal_server.api_update_check(FakeRequest())
+        fake_resp_data = json.dumps({
+            "version": "2.0.0",
+            "sha256": "abc123",
+            "size_bytes": 1024000,
+        }).encode()
 
-        remote_adds = [a for a in call_sequence if a[:2] == ["remote", "add"]]
-        self.assertEqual(remote_adds, [], "remote add must NOT be called when origin already exists")
+        class FakeHTTPResponse:
+            def read(self):
+                return fake_resp_data
 
-    async def test_returns_error_when_fetch_fails_even_after_remote_add(self):
-        """If fetch fails even after auto-adding remote, error response is returned."""
-        import portal_server
+        with patch.object(portal_updates, "check_auth", return_value=True), \
+             patch.object(portal_updates, "_get_current_version", new=AsyncMock(return_value="2.0.0")), \
+             patch.object(portal_updates, "PORTAL_UPDATE_TOKEN", "test-token-123"), \
+             patch("urllib.request.urlopen", return_value=FakeHTTPResponse()):
+            resp = await portal_updates.api_update_check(FakeRequest())
 
-        async def mock_git_cmd(args, timeout=15):
-            if args == ["remote", "get-url", "origin"]:
-                return (1, "")
-            if args[:2] == ["remote", "add"]:
-                return (0, "")
-            if args[:3] == ["fetch", "origin", "main"]:
-                return (1, "fatal: repository not found")
-            return (0, "")
+        body = json.loads(resp.body)
+        self.assertEqual(body["status"], "up_to_date")
+
+    async def test_returns_error_when_token_is_missing(self):
+        """When PORTAL_UPDATE_TOKEN is empty, error response is returned."""
+        import portal_updates
 
         class FakeRequest:
-            def __init__(self):
-                self.headers = {"Authorization": "Bearer test-token"}
+            headers = {"Authorization": "Bearer test-token"}
 
-        with patch.object(portal_server, "_git_cmd", side_effect=mock_git_cmd), \
-             patch.object(portal_server, "check_auth", return_value=True):
-            resp = await portal_server.api_update_check(FakeRequest())
+        with patch.object(portal_updates, "check_auth", return_value=True), \
+             patch.object(portal_updates, "_get_current_version", new=AsyncMock(return_value="1.0.0")), \
+             patch.object(portal_updates, "PORTAL_UPDATE_TOKEN", ""):
+            resp = await portal_updates.api_update_check(FakeRequest())
 
-        data = resp.body if hasattr(resp, "body") else None
-        import json
+        body = json.loads(resp.body)
+        self.assertEqual(body["status"], "error")
+        self.assertIn("PORTAL_UPDATE_TOKEN", body.get("error", ""))
+
+    async def test_returns_error_when_server_unreachable(self):
+        """If release server is unreachable, error response is returned."""
+        import portal_updates
+
+        class FakeRequest:
+            headers = {"Authorization": "Bearer test-token"}
+
+        with patch.object(portal_updates, "check_auth", return_value=True), \
+             patch.object(portal_updates, "_get_current_version", new=AsyncMock(return_value="1.0.0")), \
+             patch.object(portal_updates, "PORTAL_UPDATE_TOKEN", "test-token-123"), \
+             patch("urllib.request.urlopen", side_effect=ConnectionError("Connection refused")):
+            resp = await portal_updates.api_update_check(FakeRequest())
+
+        body = json.loads(resp.body)
+        self.assertEqual(body["status"], "error")
+
+    async def test_returns_error_when_server_returns_no_version(self):
+        """If release server returns empty version, error response is returned."""
+        import portal_updates
+
+        class FakeRequest:
+            headers = {"Authorization": "Bearer test-token"}
+
+        fake_resp_data = json.dumps({
+            "version": "",
+            "sha256": "",
+            "size_bytes": 0,
+        }).encode()
+
+        class FakeHTTPResponse:
+            def read(self):
+                return fake_resp_data
+
+        with patch.object(portal_updates, "check_auth", return_value=True), \
+             patch.object(portal_updates, "_get_current_version", new=AsyncMock(return_value="1.0.0")), \
+             patch.object(portal_updates, "PORTAL_UPDATE_TOKEN", "test-token-123"), \
+             patch("urllib.request.urlopen", return_value=FakeHTTPResponse()):
+            resp = await portal_updates.api_update_check(FakeRequest())
+
         body = json.loads(resp.body)
         self.assertEqual(body["status"], "error")
 

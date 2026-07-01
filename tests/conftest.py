@@ -31,3 +31,23 @@ def load_token():
         return ""
     with open(TOKEN_FILE) as f:
         return f.read().strip()
+
+
+import pytest
+
+@pytest.fixture(autouse=True)
+def _clear_msg_cache():
+    """Clear _parse_all_messages cache before each test to prevent cross-test leakage."""
+    try:
+        import portal_server
+        if hasattr(portal_server, '_invalidate_msg_cache'):
+            portal_server._invalidate_msg_cache()
+    except (ImportError, Exception):
+        pass
+    yield
+    try:
+        import portal_server
+        if hasattr(portal_server, '_invalidate_msg_cache'):
+            portal_server._invalidate_msg_cache()
+    except (ImportError, Exception):
+        pass

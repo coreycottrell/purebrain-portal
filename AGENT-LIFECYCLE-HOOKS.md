@@ -2,10 +2,10 @@
 
 ## What This Does
 
-When Aether spawns a subagent (via the `Task` tool), the portal's Agent Roster panel updates in real-time to show:
+When the primary AI spawns a subagent (via the `Task` tool), the portal's Agent Roster panel updates in real-time to show:
 
 - Green pulse dot + "ACTIVE" badge on active agents
-- The task description Aether gave the agent
+- The task description the primary AI gave the agent
 - Last run timestamp when the agent goes idle
 - Active agents sorted to the top of the roster
 
@@ -64,7 +64,7 @@ When status is set to `idle`, the `task` field is cleared automatically and `las
 
 From anywhere on the server:
 ```bash
-/home/jared/purebrain_portal/update_agent_status.sh <agent-id> <status> [task]
+~/purebrain_portal/update_agent_status.sh <agent-id> <status> [task]
 ```
 
 ---
@@ -75,7 +75,7 @@ Claude Code supports lifecycle hooks via `.claude/settings.json`. Add hooks to f
 
 ### Hook File Location
 
-Create or edit: `/home/jared/projects/AI-CIV/aether/.claude/settings.json`
+Create or edit: `~/.claude/settings.json`
 
 ### Hook Configuration
 
@@ -88,7 +88,7 @@ Create or edit: `/home/jared/projects/AI-CIV/aether/.claude/settings.json`
         "hooks": [
           {
             "type": "command",
-            "command": "/home/jared/purebrain_portal/hooks/pre_task_hook.sh"
+            "command": "~/purebrain_portal/hooks/pre_task_hook.sh"
           }
         ]
       }
@@ -99,7 +99,7 @@ Create or edit: `/home/jared/projects/AI-CIV/aether/.claude/settings.json`
         "hooks": [
           {
             "type": "command",
-            "command": "/home/jared/purebrain_portal/hooks/post_task_hook.sh"
+            "command": "~/purebrain_portal/hooks/post_task_hook.sh"
           }
         ]
       }
@@ -110,7 +110,7 @@ Create or edit: `/home/jared/projects/AI-CIV/aether/.claude/settings.json`
 
 ### Hook Scripts
 
-**`/home/jared/purebrain_portal/hooks/pre_task_hook.sh`** — fires before a Task tool call:
+**`~/purebrain_portal/hooks/pre_task_hook.sh`** — fires before a Task tool call:
 
 ```bash
 #!/bin/bash
@@ -133,27 +133,27 @@ except:
 " 2>/dev/null || echo "Running task...")
 
 # Mark a generic "active-subagent" entry so the portal shows activity
-/home/jared/purebrain_portal/update_agent_status.sh "active-subagent" active "$DESCRIPTION"
+~/purebrain_portal/update_agent_status.sh "active-subagent" active "$DESCRIPTION"
 ```
 
-**`/home/jared/purebrain_portal/hooks/post_task_hook.sh`** — fires after a Task tool call:
+**`~/purebrain_portal/hooks/post_task_hook.sh`** — fires after a Task tool call:
 
 ```bash
 #!/bin/bash
 # Post-task hook: marks the subagent idle when the Task tool completes.
-/home/jared/purebrain_portal/update_agent_status.sh "active-subagent" idle
+~/purebrain_portal/update_agent_status.sh "active-subagent" idle
 ```
 
 ### Named Agent Hooks (Better Approach)
 
-For named agents (e.g., `dept-systems-technology`), Aether can call the script directly:
+For named agents (e.g., `dept-systems-technology`), the primary AI can call the script directly:
 
 ```bash
 # At the start of an agent invocation (inside the agent's first action):
-/home/jared/purebrain_portal/update_agent_status.sh dept-systems-technology active "Wiring agent lifecycle hooks"
+~/purebrain_portal/update_agent_status.sh dept-systems-technology active "Wiring agent lifecycle hooks"
 
 # At the end of the agent's work:
-/home/jared/purebrain_portal/update_agent_status.sh dept-systems-technology idle
+~/purebrain_portal/update_agent_status.sh dept-systems-technology idle
 ```
 
 Or call the API directly via curl:
@@ -175,7 +175,7 @@ curl -X POST http://localhost:8097/api/agents/status \
 
 # Verify it appears in the agent list
 curl -s http://localhost:8097/api/agents \
-  -H "Authorization: Bearer $(grep PORTAL_BEARER /home/jared/purebrain_portal/.env 2>/dev/null | cut -d= -f2)" \
+  -H "Authorization: Bearer $(grep PORTAL_BEARER ~/purebrain_portal/.env 2>/dev/null | cut -d= -f2)" \
   | python3 -c "import sys,json; agents=json.load(sys.stdin)['agents']; [print(a['id'],a['status'],a.get('current_task','')) for a in agents if a['status']!='idle']"
 
 # Mark it idle

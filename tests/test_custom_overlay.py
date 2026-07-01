@@ -10,6 +10,8 @@ Tests cover:
 - Config override allowlist blocks unauthorized keys
 - HTML escaping of panel metadata (XSS prevention)
 - Custom panel handler registration in JS
+- Panel replacement via panel-replace metadata
+- Endpoint extension wrapper (_make_extended_endpoint)
 """
 
 import os
@@ -17,6 +19,7 @@ import re
 import sys
 import json
 import tempfile
+import textwrap
 from html import escape as html_escape
 from pathlib import Path
 from unittest import mock
@@ -101,6 +104,64 @@ def minimal_portal_html():
 
 
 @pytest.fixture
+def portal_html_with_mobile_menu_items():
+    """Portal HTML that includes tab-menu-item divs in the mobile more-menu.
+
+    This extends minimal_portal_html to also have built-in mobile menu items
+    (class=tab-menu-item) for panels like 'status', which the panel-replace
+    code hides and replaces.
+    """
+    return (
+        '<div class="main">\n'
+        '  <nav class="sidebar">\n'
+        '    <div class="nav-item active" data-panel="chat">\n'
+        '      <span class="nav-icon">&#x25C8;</span>Chat\n'
+        '    </div>\n'
+        '    <div class="nav-item" data-panel="status">\n'
+        '      <span class="nav-icon">&#x2605;</span>Status\n'
+        '    </div>\n'
+        '    <div class="nav-item" data-panel="agents">\n'
+        '      <span class="nav-icon">&#x2726;</span>Agent Roster\n'
+        '    </div>\n'
+        '    <!-- /nav-panels -->\n'
+        '\n'
+        '    <!-- Quick Fire pills -->\n'
+        '    <div class="sidebar-footer" id="sidebar-quickfire">\n'
+        '      <span class="quick-cmd-label">Quick Fire</span>\n'
+        '    </div>\n'
+        '  </nav>\n'
+        '\n'
+        '  <div class="content">\n'
+        '    <div class="panel active" id="panel-chat">Chat content</div>\n'
+        '    <div class="panel" id="panel-status">Status content</div>\n'
+        '    <div class="panel" id="panel-agents">Agents content</div>\n'
+        '\n'
+        '  <!-- /panels -->\n'
+        '  </div>\n'
+        '\n'
+        '</div>\n'
+        '\n'
+        '<!-- Mobile bottom tabs -->\n'
+        '<div class="mobile-tabs">\n'
+        '  <div class="tab-bar">\n'
+        '    <div class="tab-item active" data-panel="chat">Chat</div>\n'
+        '  </div>\n'
+        '</div>\n'
+        '\n'
+        '<div id="mobile-more-menu">\n'
+        '    <div class="tab-menu-item" data-panel="status" onclick="selectMobileMenuItem(\'status\')">'
+        '<span style="margin-right:10px;">&#x2605;</span>Status</div>\n'
+        '    <div class="tab-menu-item" data-panel="agents" onclick="selectMobileMenuItem(\'agents\')">'
+        '<span style="margin-right:10px;">&#x2726;</span>Agent Roster</div>\n'
+        '    <!-- /mobile-menu-items -->\n'
+        '</div>\n'
+        '\n'
+        '<!-- Toast -->\n'
+        '<div id="toast"></div>\n'
+    )
+
+
+@pytest.fixture
 def custom_panels_dir(tmp_path, sample_panel_html):
     """Create a temporary custom/panels/ directory with a sample panel file."""
     panels_dir = tmp_path / "custom" / "panels"
@@ -150,6 +211,44 @@ def _extract_function(source: str, func_name: str) -> str:
     return '\n'.join(lines[start:end])
 
 
+def _extract_indented_function(source: str, func_name: str) -> str:
+    """Extract a possibly-indented function from Python source and dedent it.
+
+    Unlike _extract_function which only matches top-level defs, this finds
+    'def func_name(' at any indentation level, captures the full body, and
+    returns it dedented so it can be exec'd as a top-level function.
+    """
+    lines = source.split('\n')
+    start = None
+    indent = 0
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith(f'def {func_name}(') or stripped.startswith(f'async def {func_name}('):
+            start = i
+            indent = len(line) - len(stripped)
+            break
+    if start is None:
+        return ""
+
+    # Collect lines: the function body is everything indented deeper than `indent`,
+    # plus blank lines, until we hit a line at the same or lesser indentation that
+    # starts a new statement (def/class/assignment/comment at indent level or less).
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if not line.strip():
+            # blank line -- could be inside function, keep going
+            continue
+        line_indent = len(line) - len(line.lstrip())
+        if line_indent <= indent:
+            # Back to same or lesser indentation -- function ended
+            end = i
+            break
+
+    func_lines = lines[start:end]
+    return textwrap.dedent('\n'.join(func_lines))
+
+
 def _get_parse_panel_meta():
     """Import _parse_panel_meta from portal_server."""
     server_path = os.path.join(PORTAL_DIR, "portal_server.py")
@@ -185,6 +284,40 @@ def _get_inject_custom_panels():
     exec(parse_src, ns)
     exec(inject_src, ns)
     return ns["_inject_custom_panels"], ns["_parse_panel_meta"]
+
+
+def _get_make_extended_endpoint():
+    """Import _make_extended_endpoint from portal_server using the exec/compile extraction pattern.
+
+    This avoids importing portal_server.py directly (which has module-level side effects)
+    while testing the REAL function, not a re-implementation.
+
+    The function is defined inside an ``if _endpoint_extensions:`` block (indented),
+    so we use _extract_indented_function + dedent to get a top-level version.
+    """
+    import functools as _functools
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse, Response
+
+    server_path = os.path.join(PORTAL_DIR, "portal_server.py")
+    with open(server_path) as f:
+        source = f.read()
+
+    func_src = _extract_indented_function(source, "_make_extended_endpoint")
+    if not func_src:
+        pytest.skip("Could not extract _make_extended_endpoint from portal_server.py")
+
+    ns = {
+        "json": __import__("json"),
+        "functools": _functools,
+        "_functools": _functools,
+        "Request": Request,
+        "Response": Response,
+        "JSONResponse": JSONResponse,
+        "print": print,
+    }
+    exec(func_src, ns)
+    return ns["_make_extended_endpoint"]
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +488,194 @@ class TestInjectCustomPanels:
         beta_pos = result.find('data-panel="beta"')
         assert alpha_pos != -1 and beta_pos != -1, "Both panels should be injected"
         assert alpha_pos < beta_pos, "Alpha should come before Beta (sorted order)"
+
+
+# ---------------------------------------------------------------------------
+# Tests: Panel replacement (panel-replace metadata)
+# ---------------------------------------------------------------------------
+
+class TestPanelReplacement:
+    """Tests for panel-replace mode in _inject_custom_panels.
+
+    When a custom panel HTML file contains ``<!-- panel-replace: <target-id> -->``,
+    the function should hide the original nav item, inject a replacement nav item,
+    swap the original panel div's content, and handle the mobile menu similarly.
+    """
+
+    def _make_replace_panel_html(self, target_id, panel_id="custom-status",
+                                  label="Custom Status", icon="&#x1F4CA;",
+                                  tooltip="Replacement panel", content="<p>Replaced!</p>"):
+        """Build a panel HTML file with panel-replace metadata."""
+        return (
+            f'<!-- panel-id: {panel_id} -->\n'
+            f'<!-- panel-label: {label} -->\n'
+            f'<!-- panel-icon: {icon} -->\n'
+            f'<!-- panel-tooltip: {tooltip} -->\n'
+            f'<!-- panel-replace: {target_id} -->\n'
+            f'\n'
+            f'{content}\n'
+        )
+
+    def test_basic_panel_replacement(self, portal_html_with_mobile_menu_items, tmp_path):
+        """Panel with panel-replace metadata should replace the target panel."""
+        panels_dir = tmp_path / "custom" / "panels"
+        panels_dir.mkdir(parents=True)
+        (panels_dir / "replace-status.html").write_text(
+            self._make_replace_panel_html("status")
+        )
+        result = _run_injection(portal_html_with_mobile_menu_items, panels_dir)
+
+        # The replacement nav item should exist and point to the original panel ID
+        assert 'data-panel="status"' in result, "Replacement nav item must target original panel ID"
+        # The custom content should appear inside the panel div
+        assert "<p>Replaced!</p>" in result, "Custom replacement content not found in output"
+
+    def test_original_nav_item_hidden(self, portal_html_with_mobile_menu_items, tmp_path):
+        """Original nav item for the replaced panel gets display:none."""
+        panels_dir = tmp_path / "custom" / "panels"
+        panels_dir.mkdir(parents=True)
+        (panels_dir / "replace-status.html").write_text(
+            self._make_replace_panel_html("status")
+        )
+        result = _run_injection(portal_html_with_mobile_menu_items, panels_dir)
+
+        # Find a nav-item with display:none that targets 'status'
+        hidden_nav = re.search(
+            r'<div\s+class="nav-item"\s+style="display:none"\s+data-panel="status"',
+            result
+        )
+        assert hidden_nav is not None, (
+            "Original nav item for 'status' should have style='display:none'"
+        )
+
+    def test_content_swap_in_panel_div(self, portal_html_with_mobile_menu_items, tmp_path):
+        """Original panel div innerHTML is replaced with custom content."""
+        panels_dir = tmp_path / "custom" / "panels"
+        panels_dir.mkdir(parents=True)
+        custom_content = "<h2>All New Status</h2><p>Dynamic content here</p>"
+        (panels_dir / "replace-status.html").write_text(
+            self._make_replace_panel_html("status", content=custom_content)
+        )
+        result = _run_injection(portal_html_with_mobile_menu_items, panels_dir)
+
+        # The original "Status content" text should be gone
+        assert "Status content" not in result, (
+            "Original panel content should be replaced"
+        )
+        # The custom content should be present inside the panel-status div
+        assert "All New Status" in result, "Replacement content not found"
+        assert "Dynamic content here" in result, "Replacement content not fully injected"
+
+        # Verify the panel div retains its original id (for CSS/JS compatibility)
+        assert 'id="panel-status"' in result, (
+            "Panel div must retain original id='panel-status'"
+        )
+
+    def test_mobile_menu_replacement(self, portal_html_with_mobile_menu_items, tmp_path):
+        """Original mobile menu item is hidden and a replacement is injected."""
+        panels_dir = tmp_path / "custom" / "panels"
+        panels_dir.mkdir(parents=True)
+        (panels_dir / "replace-status.html").write_text(
+            self._make_replace_panel_html("status", label="New Status", icon="&#x1F4CA;")
+        )
+        result = _run_injection(portal_html_with_mobile_menu_items, panels_dir)
+
+        # The original mobile menu item for 'status' should be hidden
+        hidden_mobile = re.search(
+            r'<div\s+class="tab-menu-item"\s+style="display:none"\s+data-panel="status"',
+            result
+        )
+        assert hidden_mobile is not None, (
+            "Original mobile menu item for 'status' should have style='display:none'"
+        )
+
+        # A replacement mobile menu item should be injected
+        # It should appear before the /mobile-menu-items marker
+        mobile_marker_pos = result.find("<!-- /mobile-menu-items -->")
+        assert mobile_marker_pos != -1, "Mobile menu items marker not found"
+
+        # Find the replacement mobile item with "New Status" label
+        replacement_mobile = re.search(
+            r'<div\s+class="tab-menu-item"\s+data-panel="status"\s+'
+            r'onclick="selectMobileMenuItem\(\'status\'\)">'
+            r'.*?New Status',
+            result, re.DOTALL
+        )
+        assert replacement_mobile is not None, (
+            "Replacement mobile menu item with custom label 'New Status' not found"
+        )
+        assert replacement_mobile.start() < mobile_marker_pos, (
+            "Replacement mobile item must appear before /mobile-menu-items marker"
+        )
+
+    def test_nonexistent_target_gracefully_skipped(self, minimal_portal_html, tmp_path):
+        """panel-replace targeting a non-existent panel ID should skip gracefully."""
+        panels_dir = tmp_path / "custom" / "panels"
+        panels_dir.mkdir(parents=True)
+        (panels_dir / "replace-ghost.html").write_text(
+            self._make_replace_panel_html("nonexistent-panel-xyz")
+        )
+        # Should not raise an error
+        result = _run_injection(minimal_portal_html, panels_dir)
+
+        # The HTML should not have any hidden nav items for a nonexistent panel
+        assert 'style="display:none"' not in result, (
+            "No elements should be hidden when target panel does not exist"
+        )
+        # The original HTML structure should remain intact
+        assert 'data-panel="chat"' in result, "Existing panels should remain untouched"
+        assert 'data-panel="agents"' in result, "Existing panels should remain untouched"
+
+    def test_additive_panels_still_work_alongside_replacement(
+        self, portal_html_with_mobile_menu_items, tmp_path
+    ):
+        """Panels without panel-replace continue to work in additive mode."""
+        panels_dir = tmp_path / "custom" / "panels"
+        panels_dir.mkdir(parents=True)
+
+        # One additive panel
+        (panels_dir / "a-additive.html").write_text(
+            '<!-- panel-id: skills-shop -->\n'
+            '<!-- panel-label: Skills Shop -->\n'
+            '<!-- panel-icon: &#x1F6D2; -->\n'
+            '<div>Skills content</div>\n'
+        )
+        # One replacement panel
+        (panels_dir / "b-replace.html").write_text(
+            self._make_replace_panel_html("status")
+        )
+
+        result = _run_injection(portal_html_with_mobile_menu_items, panels_dir)
+
+        # Additive panel should be injected as a new panel div
+        assert 'id="panel-skills-shop"' in result, "Additive panel div not found"
+        assert 'data-panel="skills-shop"' in result, "Additive nav item not found"
+
+        # Replacement panel should have swapped the status content
+        assert "<p>Replaced!</p>" in result, "Replacement content not found"
+
+        # Original status nav item should be hidden
+        hidden_nav = re.search(
+            r'<div\s+class="nav-item"\s+style="display:none"\s+data-panel="status"',
+            result
+        )
+        assert hidden_nav is not None, "Original status nav item should be hidden"
+
+    def test_parse_panel_meta_extracts_replace_field(self):
+        """_parse_panel_meta correctly extracts panel-replace from first 10 lines."""
+        parse_meta = _get_parse_panel_meta()
+        html = (
+            '<!-- panel-id: custom-dash -->\n'
+            '<!-- panel-label: Custom Dashboard -->\n'
+            '<!-- panel-replace: status -->\n'
+            '<div>content</div>\n'
+        )
+        meta = parse_meta(html)
+        assert meta.get("id") == "custom-dash", "panel-id not extracted"
+        assert meta.get("label") == "Custom Dashboard", "panel-label not extracted"
+        assert meta.get("replace") == "status", (
+            "panel-replace metadata not extracted correctly"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -620,4 +941,194 @@ class TestPanelMetadataEscaping:
 
         assert "from html import escape" in source, (
             "portal_server.py must have 'from html import escape'"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Endpoint extensions (Gap 3) -- uses REAL _make_extended_endpoint
+# ---------------------------------------------------------------------------
+
+import asyncio
+import functools
+
+
+class TestEndpointExtensions:
+    """Tests for the endpoint extension mechanism (custom/routes.py endpoint_extensions dict).
+
+    All behavioral tests use the REAL _make_extended_endpoint function extracted
+    from portal_server.py (via the exec/compile pattern), not a local reimplementation.
+    """
+
+    def test_extension_loading_block_exists_in_source(self):
+        """portal_server.py must contain the endpoint_extensions loading block."""
+        server_path = os.path.join(PORTAL_DIR, "portal_server.py")
+        with open(server_path) as f:
+            source = f.read()
+
+        assert "endpoint_extensions" in source, (
+            "portal_server.py must reference endpoint_extensions"
+        )
+        assert "# 2b. Endpoint extensions" in source, (
+            "portal_server.py must have the 2b endpoint extensions section"
+        )
+
+    def test_extension_wrapping_block_exists_in_source(self):
+        """portal_server.py must contain the route-wrapping logic for extensions."""
+        server_path = os.path.join(PORTAL_DIR, "portal_server.py")
+        with open(server_path) as f:
+            source = f.read()
+
+        assert "_make_extended_endpoint" in source, (
+            "portal_server.py must define _make_extended_endpoint wrapper factory"
+        )
+        assert "Apply endpoint extensions" in source, (
+            "portal_server.py must have the endpoint extension application block"
+        )
+
+    def test_make_extended_endpoint_merges_data(self):
+        """Wrapper should merge extension data into original JSON response."""
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+
+        make_extended = _get_make_extended_endpoint()
+
+        async def original_handler(request):
+            return JSONResponse({"status": "ok", "version": "1.0"})
+
+        async def extend_fn(original_data):
+            return {"extra_field": 42, "another": "value"}
+
+        wrapped = make_extended(original_handler, extend_fn)
+
+        scope = {"type": "http", "method": "GET", "path": "/test", "query_string": b"", "headers": []}
+        request = Request(scope)
+        response = asyncio.run(wrapped(request))
+
+        body = json.loads(response.body.decode("utf-8"))
+        assert body["status"] == "ok"
+        assert body["version"] == "1.0"
+        assert body["extra_field"] == 42
+        assert body["another"] == "value"
+
+    def test_make_extended_endpoint_preserves_status_code(self):
+        """Wrapper should preserve the original response status code."""
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+
+        make_extended = _get_make_extended_endpoint()
+
+        async def original_handler(request):
+            return JSONResponse({"error": "not found"}, status_code=404)
+
+        async def extend_fn(original_data):
+            return {"debug": True}
+
+        wrapped = make_extended(original_handler, extend_fn)
+
+        scope = {"type": "http", "method": "GET", "path": "/test", "query_string": b"", "headers": []}
+        request = Request(scope)
+        response = asyncio.run(wrapped(request))
+
+        assert response.status_code == 404
+        body = json.loads(response.body.decode("utf-8"))
+        assert body["error"] == "not found"
+        assert body["debug"] is True
+
+    def test_make_extended_endpoint_handles_extension_error(self):
+        """If extension function raises, wrapper returns original response."""
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+
+        make_extended = _get_make_extended_endpoint()
+
+        async def original_handler(request):
+            return JSONResponse({"status": "ok"})
+
+        async def broken_extend_fn(original_data):
+            raise RuntimeError("extension broke")
+
+        wrapped = make_extended(original_handler, broken_extend_fn)
+
+        scope = {"type": "http", "method": "GET", "path": "/test", "query_string": b"", "headers": []}
+        request = Request(scope)
+        response = asyncio.run(wrapped(request))
+
+        body = json.loads(response.body.decode("utf-8"))
+        assert body == {"status": "ok"}, "Original response should be returned when extension fails"
+
+    def test_make_extended_endpoint_skips_non_json_response(self):
+        """Wrapper should pass through non-JSON responses unchanged."""
+        from starlette.requests import Request
+        from starlette.responses import Response
+
+        make_extended = _get_make_extended_endpoint()
+
+        async def original_handler(request):
+            return Response("plain text", media_type="text/plain")
+
+        async def extend_fn(original_data):
+            return {"should_not": "appear"}
+
+        wrapped = make_extended(original_handler, extend_fn)
+
+        scope = {"type": "http", "method": "GET", "path": "/test", "query_string": b"", "headers": []}
+        request = Request(scope)
+        response = asyncio.run(wrapped(request))
+
+        assert response.body == b"plain text"
+
+    def test_make_extended_endpoint_handles_none_return(self):
+        """If extension returns None, original data should be returned unchanged."""
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+
+        make_extended = _get_make_extended_endpoint()
+
+        async def original_handler(request):
+            return JSONResponse({"status": "ok"})
+
+        async def extend_fn(original_data):
+            return None
+
+        wrapped = make_extended(original_handler, extend_fn)
+
+        scope = {"type": "http", "method": "GET", "path": "/test", "query_string": b"", "headers": []}
+        request = Request(scope)
+        response = asyncio.run(wrapped(request))
+
+        body = json.loads(response.body.decode("utf-8"))
+        assert body == {"status": "ok"}
+
+    def test_make_extended_endpoint_handles_empty_dict_return(self):
+        """If extension returns empty dict, original data should be returned unchanged."""
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+
+        make_extended = _get_make_extended_endpoint()
+
+        async def original_handler(request):
+            return JSONResponse({"status": "ok"})
+
+        async def extend_fn(original_data):
+            return {}
+
+        wrapped = make_extended(original_handler, extend_fn)
+
+        scope = {"type": "http", "method": "GET", "path": "/test", "query_string": b"", "headers": []}
+        request = Request(scope)
+        response = asyncio.run(wrapped(request))
+
+        body = json.loads(response.body.decode("utf-8"))
+        assert body == {"status": "ok"}
+
+    def test_backward_compat_no_endpoint_extensions(self):
+        """If custom/routes.py does not export endpoint_extensions, no error should occur."""
+        server_path = os.path.join(PORTAL_DIR, "portal_server.py")
+        with open(server_path) as f:
+            source = f.read()
+
+        # The loading block must handle missing endpoint_extensions gracefully
+        # Check that NameError is caught (for when _mod doesn't exist)
+        assert "except NameError:" in source, (
+            "Must catch NameError for when _mod is not defined"
         )

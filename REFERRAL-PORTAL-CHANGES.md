@@ -154,6 +154,6 @@ The new endpoints do NOT require the portal Bearer token. They are public-facing
 
 ## Files Changed
 
-- `/home/jared/purebrain_portal/portal_server.py` — 6 new SQLite endpoints replacing 3 dead proxies
-- `/home/jared/purebrain_portal/referrals.db` — auto-created on server startup
-- `/home/jared/projects/AI-CIV/aether/exports/cf-pages-deploy/refer/index.html` — endpoints updated
+- `portal_server.py` — 6 new SQLite endpoints replacing 3 dead proxies
+- `referrals.db` — auto-created on server startup
+- Referral frontend `index.html` — endpoints updated

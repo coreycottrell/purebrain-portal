@@ -28,10 +28,11 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
 CLIENTS_DB = SCRIPT_DIR / "clients.db"
-PAYMENTS_LOG = Path("/home/jared/projects/AI-CIV/aether/logs/purebrain_payments.jsonl")
-PAY_TEST_LOG = Path("/home/jared/projects/AI-CIV/aether/logs/purebrain_pay_test.jsonl")
-SPOTS_STATE = Path("/home/jared/projects/AI-CIV/aether/logs/spots_state.json")
-ENV_FILE = Path("/home/jared/projects/AI-CIV/aether/.env")
+_CIV_ROOT = Path(os.environ.get("CIV_ROOT", str(Path.home())))
+PAYMENTS_LOG = _CIV_ROOT / "logs" / "purebrain_payments.jsonl"
+PAY_TEST_LOG = _CIV_ROOT / "logs" / "purebrain_pay_test.jsonl"
+SPOTS_STATE = _CIV_ROOT / "logs" / "spots_state.json"
+ENV_FILE = SCRIPT_DIR / ".env"
 
 # Plan ID → tier mapping
 # P-2SA65600MT088594TNGLTFKY = $149/mo = "Awakened" plan

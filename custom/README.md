@@ -7,8 +7,9 @@ auto-loaded by the portal's customization shim and survive upstream updates.
 
 1. `cp config.json.template config.json` -- override portal globals
 2. `cp routes.py.template routes.py` -- add custom API endpoints
-3. Copy `panels/SAMPLE-PANEL.html.template` to `panels/my-panel.html` -- add a sidebar panel
-4. Restart the portal
+3. `cp startup.py.template startup.py` -- CC Chat Bridge (auto-detects CIV identity)
+4. Copy `panels/SAMPLE-PANEL.html.template` to `panels/my-panel.html` -- add a sidebar panel
+5. Restart the portal
 
 ## What goes where
 
@@ -16,6 +17,7 @@ auto-loaded by the portal's customization shim and survive upstream updates.
 |------|---------|
 | `config.json` | Override MAX_TOKENS, PORTAL_VERSION, etc. |
 | `routes.py` | Custom `/api/custom/*` endpoints |
+| `startup.py` | CC Chat Bridge (auto-detects CIV from `~/.aiciv-identity.json`) |
 | `panels/*.html` | Custom sidebar panels (one file per panel) |
 
 ## Full documentation

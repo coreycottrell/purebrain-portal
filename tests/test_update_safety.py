@@ -1,18 +1,21 @@
 """
-test_update_safety.py -- Tests for update mechanism safety improvements.
+test_update_safety.py -- Tests for the release-server update mechanism.
 
 Tests cover:
-  - Lock race condition safety (concurrent update rejection)
-  - Shim survival verification after git pull
-  - Panel injection validation (missing marker warnings)
-  - Watchdog detection before self-restart
-  - Missing tests/ directory handling
-  - Backup identity step ordering
+  A. Release Server Configuration (URL default, token reading, auth)
+  B. Update Check (version fetching, comparison, response statuses)
+  C. Update Apply Safety (download, SHA256 verify, backup/restore, background thread)
+  D. Update State Management (status tracking, step tracking, failure handling, lock)
+  E. Update Status Endpoint (state return)
+  F. Functional Tests (mocked HTTP calls to update check/apply)
+  G. Panel Injection Validation (missing marker warnings) -- unchanged from v1
+  H. Panel Injection Warnings -- unchanged from v1
 
-These are UNIT tests that mock subprocess/git calls -- no running server needed.
+These are UNIT tests that use static source analysis and mocks -- no running server needed.
 """
 
 import asyncio
+import json
 import os
 import re
 import signal
@@ -45,6 +48,13 @@ def _read_portal_source() -> str:
         return f.read()
 
 
+def _read_updates_source() -> str:
+    """Read portal_updates.py source for update-related static analysis tests."""
+    updates_path = os.path.join(PORTAL_DIR, "portal_updates.py")
+    with open(updates_path) as f:
+        return f.read()
+
+
 def _extract_function(source: str, func_name: str) -> str:
     """Extract a top-level function from Python source by name.
 
@@ -71,53 +81,357 @@ def _extract_function(source: str, func_name: str) -> str:
     return '\n'.join(lines[start:end])
 
 
-# ---------------------------------------------------------------------------
-# 1. Lock Race Condition Tests
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# A. Release Server Configuration Tests
+# ===========================================================================
 
-class TestUpdateLockSafety:
-    """Tests that concurrent update requests are safely rejected."""
+class TestReleaseServerConfiguration:
+    """Tests for release server config variables."""
+
+    def test_release_server_url_has_default(self):
+        """RELEASE_SERVER_URL must default to cc.purebrain.ai."""
+        source = _read_updates_source()
+        # Should have a line like: RELEASE_SERVER_URL = os.getenv("RELEASE_SERVER_URL", "https://cc.purebrain.ai")
+        assert 'RELEASE_SERVER_URL' in source, "RELEASE_SERVER_URL not found in portal_updates.py"
+        match = re.search(
+            r'RELEASE_SERVER_URL\s*=\s*os\.getenv\([^)]*"(https://[^"]+)"',
+            source
+        )
+        assert match, "RELEASE_SERVER_URL must use os.getenv with a default URL"
+        assert "cc.purebrain.ai" in match.group(1), (
+            f"RELEASE_SERVER_URL default must point to cc.purebrain.ai, got: {match.group(1)}"
+        )
+
+    def test_portal_update_token_built_in(self):
+        """PORTAL_UPDATE_TOKEN must have a built-in shared key for zero-config updates."""
+        source = _read_updates_source()
+        assert 'PORTAL_UPDATE_TOKEN' in source, "PORTAL_UPDATE_TOKEN not found"
+        # Must have a hardcoded built-in key so all portals work without .env config
+        assert 'Hq-Of6ktPmQ' in source, (
+            "PORTAL_UPDATE_TOKEN must have built-in shared key for zero-config updates"
+        )
+
+    def test_update_check_requires_auth(self):
+        """api_update_check must call check_auth to verify the request."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "api_update_check")
+        assert func_src, "api_update_check function not found"
+        assert "check_auth" in func_src, (
+            "api_update_check must call check_auth for authorization"
+        )
+
+    def test_update_apply_requires_auth(self):
+        """api_update_apply must call check_auth to verify the request."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "api_update_apply")
+        assert func_src, "api_update_apply function not found"
+        assert "check_auth" in func_src, (
+            "api_update_apply must call check_auth for authorization"
+        )
+
+    def test_update_status_requires_auth(self):
+        """api_update_status must call check_auth to verify the request."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "api_update_status")
+        assert func_src, "api_update_status function not found"
+        assert "check_auth" in func_src, (
+            "api_update_status must call check_auth for authorization"
+        )
+
+
+# ===========================================================================
+# B. Update Check Tests (source analysis)
+# ===========================================================================
+
+class TestUpdateCheck:
+    """Tests that api_update_check correctly fetches and compares versions."""
+
+    def test_update_check_fetches_remote_version(self):
+        """api_update_check must fetch from the release server /api/releases/portal/version."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "api_update_check")
+        assert func_src, "api_update_check function not found"
+        assert "/api/releases/portal/version" in func_src, (
+            "api_update_check must fetch from /api/releases/portal/version"
+        )
+
+    def test_update_check_sends_portal_token_header(self):
+        """api_update_check must send X-Portal-Token header for auth."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "api_update_check")
+        assert func_src, "api_update_check function not found"
+        assert "X-Portal-Token" in func_src, (
+            "api_update_check must send X-Portal-Token header"
+        )
+
+    def test_update_check_compares_versions(self):
+        """api_update_check must compare current_version against remote_version."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "api_update_check")
+        assert func_src, "api_update_check function not found"
+        assert "current_version" in func_src, "Must reference current_version"
+        assert "remote_version" in func_src, "Must reference remote_version"
+        # Must have a comparison between the two
+        assert "==" in func_src, "Must compare versions with =="
+
+    def test_update_check_returns_available_or_up_to_date(self):
+        """api_update_check must return 'available' or 'up_to_date' status."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "api_update_check")
+        assert func_src, "api_update_check function not found"
+        assert '"available"' in func_src, "Must return 'available' when update exists"
+        assert '"up_to_date"' in func_src, "Must return 'up_to_date' when version matches"
+
+    def test_update_check_handles_missing_token(self):
+        """api_update_check must return error when PORTAL_UPDATE_TOKEN is empty."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "api_update_check")
+        assert func_src, "api_update_check function not found"
+        assert "PORTAL_UPDATE_TOKEN" in func_src, (
+            "api_update_check must check for PORTAL_UPDATE_TOKEN"
+        )
+        assert '"error"' in func_src, "Must return error status when token is missing"
+
+    def test_update_check_handles_server_error(self):
+        """api_update_check must catch exceptions from the release server."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "api_update_check")
+        assert func_src, "api_update_check function not found"
+        assert "except" in func_src, (
+            "api_update_check must have exception handling for server errors"
+        )
+
+
+# ===========================================================================
+# C. Update Apply Safety Tests (source analysis)
+# ===========================================================================
+
+class TestUpdateApplySafety:
+    """Tests that the update apply mechanism is safe."""
+
+    def test_update_apply_downloads_tarball(self):
+        """_run_release_update must download from /api/releases/portal/latest."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
+        assert "/api/releases/portal/latest" in func_src, (
+            "_run_release_update must download from /api/releases/portal/latest"
+        )
+
+    def test_update_apply_verifies_sha256(self):
+        """_run_release_update must verify SHA256 checksum of downloaded tarball."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
+        assert "sha256" in func_src.lower(), "Must reference SHA256"
+        assert "hashlib.sha256" in func_src, (
+            "_run_release_update must use hashlib.sha256 for checksum verification"
+        )
+
+    def test_update_apply_compares_sha256_hashes(self):
+        """_run_release_update must compare actual vs expected SHA256."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
+        assert "expected_sha256" in func_src, "Must have expected_sha256 from server"
+        assert "actual_sha256" in func_src, "Must compute actual_sha256 from file"
+        assert "actual_sha256 != expected_sha256" in func_src, (
+            "Must compare actual vs expected SHA256"
+        )
+
+    def test_update_apply_backs_up_preserved_files(self):
+        """_run_release_update must back up preserved files before extraction."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
+        assert "_PRESERVED_FILES" in func_src, (
+            "_run_release_update must reference _PRESERVED_FILES for backup"
+        )
+        assert "backup" in func_src.lower(), "Must have backup logic"
+        assert "shutil.copy2" in func_src, (
+            "_run_release_update must use shutil.copy2 to backup preserved files"
+        )
+
+    def test_update_apply_restores_preserved_files(self):
+        """_run_release_update must restore preserved files after extraction."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
+
+        # Must have a restore step AFTER extract step
+        extract_pos = func_src.find('"extract"')
+        restore_pos = func_src.find('"restore_preserved"')
+        assert extract_pos != -1, "extract step not found"
+        assert restore_pos != -1, "restore_preserved step not found"
+        assert extract_pos < restore_pos, (
+            "restore_preserved must come AFTER extract"
+        )
+
+    def test_update_apply_uses_background_task(self):
+        """api_update_apply must launch _run_release_update as a background task."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "api_update_apply")
+        assert func_src, "api_update_apply function not found"
+        assert "asyncio.create_task" in func_src, (
+            "api_update_apply must use asyncio.create_task for background execution"
+        )
+        assert "_run_release_update" in func_src, (
+            "api_update_apply must launch _run_release_update"
+        )
+
+    def test_preserved_files_list_includes_env(self):
+        """_PRESERVED_FILES must include .env."""
+        source = _read_updates_source()
+        # Find the _PRESERVED_FILES list
+        match = re.search(r'_PRESERVED_FILES\s*=\s*\[([^\]]+)\]', source, re.DOTALL)
+        assert match, "_PRESERVED_FILES list not found"
+        files_str = match.group(1)
+        assert '".env"' in files_str, ".env must be in _PRESERVED_FILES"
+
+    def test_preserved_files_list_includes_portal_token(self):
+        """_PRESERVED_FILES must include .portal-token."""
+        source = _read_updates_source()
+        match = re.search(r'_PRESERVED_FILES\s*=\s*\[([^\]]+)\]', source, re.DOTALL)
+        assert match, "_PRESERVED_FILES list not found"
+        files_str = match.group(1)
+        assert '".portal-token"' in files_str, ".portal-token must be in _PRESERVED_FILES"
+
+    def test_preserved_files_list_includes_chat_log(self):
+        """_PRESERVED_FILES must include portal-chat.jsonl."""
+        source = _read_updates_source()
+        match = re.search(r'_PRESERVED_FILES\s*=\s*\[([^\]]+)\]', source, re.DOTALL)
+        assert match, "_PRESERVED_FILES list not found"
+        files_str = match.group(1)
+        assert '"portal-chat.jsonl"' in files_str, "portal-chat.jsonl must be in _PRESERVED_FILES"
+
+    def test_preserved_files_list_includes_databases(self):
+        """_PRESERVED_FILES must include agents.db, referrals.db, clients.db."""
+        source = _read_updates_source()
+        match = re.search(r'_PRESERVED_FILES\s*=\s*\[([^\]]+)\]', source, re.DOTALL)
+        assert match, "_PRESERVED_FILES list not found"
+        files_str = match.group(1)
+        for db in ["agents.db", "referrals.db", "clients.db"]:
+            assert f'"{db}"' in files_str, f"{db} must be in _PRESERVED_FILES"
+
+    def test_preserved_dirs_exist(self):
+        """_PRESERVED_DIRS must be defined with key directories."""
+        source = _read_updates_source()
+        match = re.search(r'_PRESERVED_DIRS\s*=\s*\[([^\]]+)\]', source, re.DOTALL)
+        assert match, "_PRESERVED_DIRS list not found"
+        dirs_str = match.group(1)
+        for d in ["memories", ".claude", "custom", "logs"]:
+            assert f'"{d}"' in dirs_str, f"{d} must be in _PRESERVED_DIRS"
+
+    def test_tarball_extraction_has_path_traversal_protection(self):
+        """_run_release_update must check for path traversal in tarball members."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
+        # Must check for ".." or "/" in member names
+        assert '".."' in func_src, "Must check for '..' in tarball member names"
+        assert 'startswith("/")' in func_src, "Must check for absolute paths in tarball members"
+
+    def test_sha256_mismatch_raises_error(self):
+        """_run_release_update must raise RuntimeError on SHA256 mismatch."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
+
+        # Find the verify_checksum section
+        checksum_start = func_src.find('"verify_checksum"')
+        # Find the next step
+        next_step = func_src.find('"backup"', checksum_start)
+        assert checksum_start != -1, "verify_checksum step not found"
+        assert next_step != -1, "backup step not found after verify_checksum"
+        checksum_section = func_src[checksum_start:next_step]
+        assert "raise RuntimeError" in checksum_section, (
+            "SHA256 mismatch must raise RuntimeError"
+        )
+
+
+# ===========================================================================
+# D. Update State Management Tests (source analysis)
+# ===========================================================================
+
+class TestUpdateStateManagement:
+    """Tests for proper state management during updates."""
+
+    def test_update_state_has_status_field(self):
+        """_update_state dict must have 'status' key."""
+        source = _read_updates_source()
+        assert '"status"' in source, "_update_state must have 'status' field"
+        # Check the initial value is 'idle'
+        assert '"status": "idle"' in source, "Initial status must be 'idle'"
+
+    def test_update_state_tracks_step(self):
+        """_update_state must track current step during update."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_update_step")
+        assert func_src, "_update_step function not found"
+        assert '"step"' in func_src, "_update_step must update 'step' field"
+        assert '"steps_remaining"' in func_src, "_update_step must update steps_remaining"
+        assert '"steps_completed"' in func_src, "_update_step must update steps_completed"
+
+    def test_update_state_set_to_failed_on_error(self):
+        """On error, _run_release_update must set status to 'failed'."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
+
+        except_block = func_src[func_src.find("except Exception"):]
+        assert '"failed"' in except_block, (
+            "except block must set status to 'failed'"
+        )
+
+    def test_update_state_records_step_failed_on_error(self):
+        """On error, _run_release_update must record which step failed."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
+
+        except_block = func_src[func_src.find("except Exception"):]
+        assert '"step_failed"' in except_block, (
+            "except block must record step_failed"
+        )
+
+    def test_update_lock_prevents_concurrent_updates(self):
+        """api_update_apply must check lock.locked() to reject concurrent updates."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "api_update_apply")
+        assert func_src, "api_update_apply function not found"
+        assert "lock.locked()" in func_src, (
+            "api_update_apply must check lock.locked() to reject concurrent requests"
+        )
+        assert "Update already in progress" in func_src, (
+            "api_update_apply must return 'Update already in progress' when lock is held"
+        )
+
+    def test_lock_is_asyncio_lock(self):
+        """The update lock must be asyncio.Lock for async-safe concurrency."""
+        source = _read_updates_source()
+        assert "asyncio.Lock" in source, (
+            "Update lock must be asyncio.Lock for async-safe concurrency"
+        )
 
     def test_lock_acquired_before_background_task(self):
-        """The asyncio.Lock must be acquired BEFORE _run_update launches.
-
-        In api_update_apply, lock.acquire() must happen before asyncio.create_task.
-        We verify this by checking the source order.
-        """
-        source = _read_portal_source()
+        """lock.acquire() must happen BEFORE asyncio.create_task in api_update_apply."""
+        source = _read_updates_source()
         func_src = _extract_function(source, "api_update_apply")
-        assert func_src, "api_update_apply function not found in portal_server.py"
-
+        assert func_src, "api_update_apply function not found"
         acquire_pos = func_src.find("lock.acquire()")
         create_task_pos = func_src.find("asyncio.create_task")
-
         assert acquire_pos != -1, "lock.acquire() not found in api_update_apply"
         assert create_task_pos != -1, "asyncio.create_task not found in api_update_apply"
         assert acquire_pos < create_task_pos, (
-            "lock.acquire() must come BEFORE asyncio.create_task(_run_update)"
+            "lock.acquire() must come BEFORE asyncio.create_task"
         )
 
-    def test_lock_released_on_success(self):
-        """Lock must be released after _run_update completes successfully.
-
-        The _run_update function must have a finally block that releases the lock.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found in portal_server.py"
-
-        # Must contain finally block with lock.release()
-        assert "finally:" in func_src, "_run_update must have a finally block"
-        assert "lock.release()" in func_src, "_run_update finally must release the lock"
-
-    def test_lock_released_on_failure(self):
-        """Lock must be released even if _run_update raises an exception.
-
-        We verify the release is in a finally block, not just in the success path.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
+    def test_lock_released_in_finally_block(self):
+        """_run_release_update must release the lock in a finally block."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
+        assert "finally:" in func_src, "_run_release_update must have a finally block"
 
         # Find the finally block and ensure lock.release() is inside it
         lines = func_src.split('\n')
@@ -130,126 +444,422 @@ class TestUpdateLockSafety:
             elif in_finally and "lock.release()" in stripped:
                 found_release_in_finally = True
                 break
-            elif in_finally and stripped and not stripped.startswith('#') and not stripped.startswith('if') and not stripped.startswith('lock'):
-                # Still inside finally (indented)
-                pass
 
         assert found_release_in_finally, (
-            "lock.release() must be inside the finally block of _run_update"
+            "lock.release() must be inside the finally block of _run_release_update"
         )
 
-    def test_concurrent_apply_rejected_via_lock(self):
-        """Second apply request returns error when lock is held.
-
-        api_update_apply checks lock.locked() before proceeding.
-        """
-        source = _read_portal_source()
+    def test_state_reset_before_new_update(self):
+        """_update_state must be fully reset before starting a new update."""
+        source = _read_updates_source()
         func_src = _extract_function(source, "api_update_apply")
-        assert func_src, "api_update_apply function not found"
-
-        assert "lock.locked()" in func_src, (
-            "api_update_apply must check lock.locked() to reject concurrent requests"
-        )
-        assert "Update already in progress" in func_src, (
-            "api_update_apply must return 'Update already in progress' when lock is held"
+        assert func_src, "api_update_apply not found"
+        assert "_update_state.update(" in func_src, (
+            "api_update_apply must reset _update_state before starting update"
         )
 
-    def test_lock_is_asyncio_lock(self):
-        """The update lock must be an asyncio.Lock (not threading.Lock).
+    def test_initial_state_has_required_fields(self):
+        """The _update_state dict must have all required tracking fields."""
+        source = _read_updates_source()
+        required_fields = [
+            "status", "job_id", "step", "steps_completed", "steps_remaining",
+            "started_at", "completed_at", "error", "step_failed", "message",
+        ]
+        for field in required_fields:
+            assert f'"{field}"' in source, (
+                f"_update_state must have '{field}' field"
+            )
 
-        asyncio.Lock is required because the update runs in an async context.
-        """
-        source = _read_portal_source()
-        assert "asyncio.Lock" in source, (
-            "Update lock must be asyncio.Lock for async-safe concurrency"
+
+# ===========================================================================
+# E. Update Status Endpoint Tests (source analysis)
+# ===========================================================================
+
+class TestUpdateStatusEndpoint:
+    """Tests for api_update_status endpoint."""
+
+    def test_update_status_returns_current_state(self):
+        """api_update_status must read and return _update_state."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "api_update_status")
+        assert func_src, "api_update_status function not found"
+        assert "_update_state" in func_src, (
+            "api_update_status must reference _update_state"
         )
 
+    def test_update_status_handles_in_progress(self):
+        """api_update_status must return step info for in_progress status."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "api_update_status")
+        assert func_src, "api_update_status function not found"
+        assert '"in_progress"' in func_src, "Must handle in_progress status"
+        assert '"step"' in func_src, "Must return current step"
 
-# ---------------------------------------------------------------------------
-# 2. Shim Survival Tests
-# ---------------------------------------------------------------------------
+    def test_update_status_handles_success(self):
+        """api_update_status must return version info for success status."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "api_update_status")
+        assert func_src, "api_update_status function not found"
+        assert '"success"' in func_src, "Must handle success status"
 
-class TestShimSurvival:
-    """Tests that the customization shim is verified after git pull."""
+    def test_update_status_handles_failed(self):
+        """api_update_status must return error info for failed status."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "api_update_status")
+        assert func_src, "api_update_status function not found"
+        assert '"failed"' in func_src, "Must handle failed status"
+        assert '"step_failed"' in func_src, "Must return step_failed on failure"
 
-    def test_verify_shim_step_exists_in_steps_list(self):
-        """'verify_shim' must be in the steps_remaining list.
+    def test_update_status_handles_idle(self):
+        """api_update_status must return idle when no update is running."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "api_update_status")
+        assert func_src, "api_update_status function not found"
+        assert '"idle"' in func_src, "Must handle idle status"
 
-        This ensures the UI shows the shim verification step in the progress bar.
-        """
-        source = _read_portal_source()
+
+# ===========================================================================
+# F. Update Pipeline Steps Ordering (source analysis)
+# ===========================================================================
+
+class TestUpdatePipelineSteps:
+    """Tests that verify the update pipeline step ordering."""
+
+    def test_steps_remaining_list_is_complete(self):
+        """api_update_apply must define all 7 steps in steps_remaining."""
+        source = _read_updates_source()
         func_src = _extract_function(source, "api_update_apply")
-        assert func_src, "api_update_apply function not found"
+        assert func_src, "api_update_apply not found"
 
-        assert '"verify_shim"' in func_src, (
-            "'verify_shim' must be listed in steps_remaining in api_update_apply"
+        expected_steps = [
+            "download", "verify_checksum", "backup",
+            "extract", "restore_preserved", "update_version", "restart",
+        ]
+        for step in expected_steps:
+            assert f'"{step}"' in func_src, (
+                f"Step '{step}' must be in steps_remaining list"
+            )
+
+    def test_verify_checksum_before_extract(self):
+        """verify_checksum step must execute BEFORE extract in _run_release_update."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
+
+        checksum_pos = func_src.find('"verify_checksum"')
+        extract_pos = func_src.find('"extract"')
+        assert checksum_pos != -1, "verify_checksum step not found"
+        assert extract_pos != -1, "extract step not found"
+        assert checksum_pos < extract_pos, (
+            "verify_checksum must execute BEFORE extract"
         )
 
-    def test_verify_shim_step_runs_after_pull(self):
-        """The verify_shim step must execute AFTER the pull step in _run_update."""
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
+    def test_backup_before_extract(self):
+        """backup step must execute BEFORE extract in _run_release_update."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
 
-        pull_pos = func_src.find('_update_step("pull")')
-        shim_pos = func_src.find('_update_step("verify_shim")')
-
-        assert pull_pos != -1, "pull step not found in _run_update"
-        assert shim_pos != -1, "verify_shim step not found in _run_update"
-        assert pull_pos < shim_pos, (
-            "verify_shim must execute AFTER the pull step"
+        backup_pos = func_src.find('"backup"')
+        extract_pos = func_src.find('"extract"')
+        assert backup_pos != -1, "backup step not found"
+        assert extract_pos != -1, "extract step not found"
+        assert backup_pos < extract_pos, (
+            "backup must execute BEFORE extract to save preserved files"
         )
 
-    def test_update_aborts_if_shim_missing_after_pull(self):
-        """If CUSTOMIZATION LAYER marker is gone after pull, update must abort.
+    def test_restore_after_extract(self):
+        """restore_preserved step must execute AFTER extract in _run_release_update."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
 
-        The _run_update function checks for the marker and raises RuntimeError.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        # Must check for CUSTOMIZATION LAYER marker
-        assert '"CUSTOMIZATION LAYER"' in func_src, (
-            "_run_update must check for CUSTOMIZATION LAYER marker in portal_server.py"
+        extract_pos = func_src.find('"extract"')
+        restore_pos = func_src.find('"restore_preserved"')
+        assert extract_pos != -1, "extract step not found"
+        assert restore_pos != -1, "restore_preserved step not found"
+        assert extract_pos < restore_pos, (
+            "restore_preserved must execute AFTER extract"
         )
 
-        # Must raise/abort if marker is missing
-        assert "ABORT" in func_src, (
-            "_run_update must abort if customization shim marker is missing"
+    def test_update_version_before_restart(self):
+        """update_version step must execute BEFORE restart in _run_release_update."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
+
+        version_pos = func_src.find('"update_version"')
+        restart_pos = func_src.find('"restart"')
+        assert version_pos != -1, "update_version step not found"
+        assert restart_pos != -1, "restart step not found"
+        assert version_pos < restart_pos, (
+            "update_version must execute BEFORE restart"
         )
 
-    def test_update_continues_if_shim_present(self):
-        """If CUSTOMIZATION LAYER marker is present, update proceeds.
+    def test_success_status_set_before_restart(self):
+        """Status must be set to 'success' before SIGTERM/restart."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
 
-        The check only triggers failure when the marker is NOT found.
-        The pattern: if 'CUSTOMIZATION LAYER' not in content: raise.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        # The condition should be 'not in' (abort on absence, not presence)
-        assert '"CUSTOMIZATION LAYER" not in' in func_src, (
-            "Shim check should abort when marker is NOT found (not when found)"
+        success_pos = func_src.find('"success"')
+        sigterm_pos = func_src.find("signal.SIGTERM")
+        assert success_pos != -1, "success status assignment not found"
+        assert sigterm_pos != -1, "SIGTERM not found"
+        assert success_pos < sigterm_pos, (
+            "Status must be set to 'success' BEFORE sending SIGTERM"
         )
 
-    def test_shim_marker_exists_in_current_source(self):
-        """Verify the CUSTOMIZATION LAYER marker exists in the current portal_server.py.
+    def test_sleep_before_sigterm(self):
+        """There must be a delay before SIGTERM so success status can be polled."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
 
-        This protects against accidentally removing the marker during development.
-        """
-        source = _read_portal_source()
-        # The actual marker line (not the check code)
-        assert "CUSTOMIZATION LAYER (do not remove" in source, (
-            "portal_server.py must contain the 'CUSTOMIZATION LAYER (do not remove' marker. "
-            "This marker enables the shim survival check during updates."
+        sleep_pos = func_src.find("asyncio.sleep")
+        sigterm_pos = func_src.find("signal.SIGTERM")
+        assert sleep_pos != -1, "asyncio.sleep not found before SIGTERM"
+        assert sigterm_pos != -1, "SIGTERM not found"
+        assert sleep_pos < sigterm_pos, (
+            "asyncio.sleep must come before SIGTERM to allow status polling"
         )
 
 
-# ---------------------------------------------------------------------------
-# 3. Panel Injection Validation Tests
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# G. Watchdog Detection Tests
+# ===========================================================================
+
+class TestWatchdogDetection:
+    """Tests for process manager detection before self-restart."""
+
+    def test_sigterm_sent_for_watchdog_restart(self):
+        """_run_release_update must send SIGTERM when a process manager is detected."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
+        assert "signal.SIGTERM" in func_src, (
+            "_run_release_update must send SIGTERM for clean restart"
+        )
+        assert "os.kill(os.getpid()" in func_src, (
+            "_run_release_update must use os.kill(os.getpid(), signal.SIGTERM)"
+        )
+
+    def test_exec_restart_fallback(self):
+        """_run_release_update must have os.execv fallback when no watchdog detected."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
+        assert "os.execv" in func_src, (
+            "_run_release_update must have os.execv fallback for restart without watchdog"
+        )
+
+    def test_message_field_set_on_restart(self):
+        """_run_release_update must set a 'message' field for user feedback."""
+        source = _read_updates_source()
+        func_src = _extract_function(source, "_run_release_update")
+        assert func_src, "_run_release_update function not found"
+        assert '"message"' in func_src, (
+            "_run_release_update must set a 'message' field in _update_state"
+        )
+
+
+# ===========================================================================
+# H. Functional Tests (with mocks)
+# ===========================================================================
+
+class TestUpdateCheckFunctional:
+    """Functional tests that actually call api_update_check with mocked HTTP."""
+
+    def test_update_check_returns_available_when_newer(self):
+        """Mock server returns newer version -- api_update_check returns 'available'."""
+        import portal_updates
+
+        class FakeRequest:
+            headers = {"Authorization": "Bearer test-token"}
+
+        fake_resp_data = json.dumps({
+            "version": "99.0.0",
+            "sha256": "abc123",
+            "size_bytes": 1024000,
+        }).encode()
+
+        class FakeHTTPResponse:
+            def read(self):
+                return fake_resp_data
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        with patch.object(portal_updates, "check_auth", return_value=True), \
+             patch.object(portal_updates, "_get_current_version", new=AsyncMock(return_value="1.0.0")), \
+             patch.object(portal_updates, "PORTAL_UPDATE_TOKEN", "test-token"), \
+             patch("urllib.request.urlopen", return_value=FakeHTTPResponse()):
+            resp = run_async(portal_updates.api_update_check(FakeRequest()))
+
+        body = json.loads(resp.body)
+        assert body["status"] == "available", f"Expected 'available', got: {body}"
+        assert body["remote_version"] == "99.0.0"
+
+    def test_update_check_returns_up_to_date_when_same(self):
+        """Mock server returns same version -- api_update_check returns 'up_to_date'."""
+        import portal_updates
+
+        class FakeRequest:
+            headers = {"Authorization": "Bearer test-token"}
+
+        fake_resp_data = json.dumps({
+            "version": "1.0.0",
+            "sha256": "abc123",
+            "size_bytes": 1024000,
+        }).encode()
+
+        class FakeHTTPResponse:
+            def read(self):
+                return fake_resp_data
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        with patch.object(portal_updates, "check_auth", return_value=True), \
+             patch.object(portal_updates, "_get_current_version", new=AsyncMock(return_value="1.0.0")), \
+             patch.object(portal_updates, "PORTAL_UPDATE_TOKEN", "test-token"), \
+             patch("urllib.request.urlopen", return_value=FakeHTTPResponse()):
+            resp = run_async(portal_updates.api_update_check(FakeRequest()))
+
+        body = json.loads(resp.body)
+        assert body["status"] == "up_to_date", f"Expected 'up_to_date', got: {body}"
+
+    def test_update_check_returns_error_when_no_token(self):
+        """When PORTAL_UPDATE_TOKEN is empty, api_update_check returns error."""
+        import portal_updates
+
+        class FakeRequest:
+            headers = {"Authorization": "Bearer test-token"}
+
+        with patch.object(portal_updates, "check_auth", return_value=True), \
+             patch.object(portal_updates, "_get_current_version", new=AsyncMock(return_value="1.0.0")), \
+             patch.object(portal_updates, "PORTAL_UPDATE_TOKEN", ""):
+            resp = run_async(portal_updates.api_update_check(FakeRequest()))
+
+        body = json.loads(resp.body)
+        assert body["status"] == "error", f"Expected 'error', got: {body}"
+        assert "PORTAL_UPDATE_TOKEN" in body.get("error", ""), (
+            "Error message must mention PORTAL_UPDATE_TOKEN"
+        )
+
+    def test_update_check_returns_error_when_server_unreachable(self):
+        """When release server is unreachable, api_update_check returns error."""
+        import portal_updates
+
+        class FakeRequest:
+            headers = {"Authorization": "Bearer test-token"}
+
+        with patch.object(portal_updates, "check_auth", return_value=True), \
+             patch.object(portal_updates, "_get_current_version", new=AsyncMock(return_value="1.0.0")), \
+             patch.object(portal_updates, "PORTAL_UPDATE_TOKEN", "test-token"), \
+             patch("urllib.request.urlopen", side_effect=ConnectionError("Connection refused")):
+            resp = run_async(portal_updates.api_update_check(FakeRequest()))
+
+        body = json.loads(resp.body)
+        assert body["status"] == "error", f"Expected 'error', got: {body}"
+
+
+class TestUpdateApplyFunctional:
+    """Functional tests for api_update_apply with mocks."""
+
+    def test_apply_rejects_concurrent_updates(self):
+        """When lock is already held, api_update_apply returns error."""
+        import portal_updates
+
+        class FakeRequest:
+            headers = {"Authorization": "Bearer test-token"}
+            query_params = {}
+
+        fake_lock = asyncio.Lock()
+
+        async def run():
+            await fake_lock.acquire()  # Lock is held
+            with patch.object(portal_updates, "check_auth", return_value=True), \
+                 patch.object(portal_updates, "_get_update_lock", new=AsyncMock(return_value=fake_lock)), \
+                 patch.object(portal_updates, "PORTAL_UPDATE_TOKEN", "test-token"), \
+                 patch.object(portal_updates, "_LAST_UPDATE_STATUS_FILE", Path("/nonexistent")):
+                resp = await portal_updates.api_update_apply(FakeRequest())
+            return resp
+
+        resp = run_async(run())
+        body = json.loads(resp.body)
+        assert body["status"] == "error"
+        assert "already in progress" in body.get("error", "").lower()
+
+    def test_apply_rejects_when_no_token(self):
+        """When PORTAL_UPDATE_TOKEN is empty, api_update_apply returns error."""
+        import portal_updates
+
+        class FakeRequest:
+            headers = {"Authorization": "Bearer test-token"}
+            query_params = {}
+
+        fake_lock = asyncio.Lock()
+
+        async def run():
+            with patch.object(portal_updates, "check_auth", return_value=True), \
+                 patch.object(portal_updates, "_get_update_lock", new=AsyncMock(return_value=fake_lock)), \
+                 patch.object(portal_updates, "PORTAL_UPDATE_TOKEN", ""), \
+                 patch.object(portal_updates, "_update_state", {"status": "idle"}):
+                resp = await portal_updates.api_update_apply(FakeRequest())
+            return resp
+
+        resp = run_async(run())
+        body = json.loads(resp.body)
+        assert body["status"] == "error"
+        assert "PORTAL_UPDATE_TOKEN" in body.get("error", "")
+
+
+# ===========================================================================
+# I. Lock Behavioral Tests
+# ===========================================================================
+
+class TestLockBehavioral:
+    """Behavioral tests verifying asyncio.Lock works as expected for our use case."""
+
+    def test_lock_released_after_successful_operation(self):
+        """Lock must be released in finally block regardless of outcome."""
+        async def check_lock_release():
+            lock = asyncio.Lock()
+            await lock.acquire()
+            assert lock.locked(), "Lock should be locked after acquire"
+            try:
+                pass  # Simulate successful update
+            finally:
+                if lock.locked():
+                    lock.release()
+            assert not lock.locked(), "Lock should be released after finally"
+
+        run_async(check_lock_release())
+
+    def test_lock_released_after_failed_operation(self):
+        """Lock must be released even when an exception occurs."""
+        async def check_lock_release_on_error():
+            lock = asyncio.Lock()
+            await lock.acquire()
+            assert lock.locked()
+            try:
+                raise RuntimeError("Download failed: simulated")
+            except Exception:
+                pass
+            finally:
+                if lock.locked():
+                    lock.release()
+            assert not lock.locked(), "Lock must NOT be locked after exception + finally"
+
+        run_async(check_lock_release_on_error())
+
+
+# ===========================================================================
+# J. Panel Injection Validation Tests (unchanged -- not update-related)
+# ===========================================================================
 
 class TestPanelInjectionValidation:
     """Tests that missing injection markers produce warnings, not silent failures."""
@@ -319,9 +929,7 @@ class TestPanelInjectionValidation:
             '    <!-- /mobile-menu-items -->\n'
             '</div>\n'
         )
-        # Should not raise even though <!-- /nav-panels --> is missing
         result, printed = self._run_injection_with_html(html_no_nav_marker, sample_panel)
-        # The nav marker replacement simply won't find a match -- str.replace is safe
         assert isinstance(result, str)
 
     def test_missing_panels_marker_no_crash(self, sample_panel):
@@ -361,11 +969,7 @@ class TestPanelInjectionValidation:
         assert isinstance(result, str)
 
     def test_partial_markers_still_injects_available(self, sample_panel):
-        """If only some markers exist, inject into those that are found.
-
-        With only <!-- /panels --> present, the panel div should still be injected
-        even if nav and mobile markers are missing.
-        """
+        """If only some markers exist, inject into those that are found."""
         html_panels_only = (
             '<div class="content">\n'
             '    <div class="panel active" id="panel-chat">Chat</div>\n'
@@ -373,7 +977,6 @@ class TestPanelInjectionValidation:
             '</div>\n'
         )
         result, printed = self._run_injection_with_html(html_panels_only, sample_panel)
-        # The panels marker IS present, so the panel div should be injected
         assert 'id="panel-test"' in result, (
             "Panel div should be injected when <!-- /panels --> marker is present"
         )
@@ -412,558 +1015,17 @@ class TestPanelInjectionValidation:
         assert "<!-- /mobile-menu-items -->" in func_src, "Must handle mobile-menu-items marker"
 
 
-# ---------------------------------------------------------------------------
-# 4. Watchdog Detection Tests
-# ---------------------------------------------------------------------------
-
-class TestWatchdogDetection:
-    """Tests for process manager detection before self-restart."""
-
-    def test_sigterm_sent_in_run_update(self):
-        """SIGTERM should be sent at the end of a successful update.
-
-        _run_update sends os.kill(os.getpid(), signal.SIGTERM) so that
-        systemd/supervisor can restart the process cleanly.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        assert "signal.SIGTERM" in func_src, (
-            "_run_update must send SIGTERM for clean restart by process manager"
-        )
-        assert "os.kill(os.getpid()" in func_src, (
-            "_run_update must use os.kill(os.getpid(), signal.SIGTERM) for self-restart"
-        )
-
-    def test_sigterm_sent_after_success_state(self):
-        """SIGTERM must be sent only AFTER status is set to 'success'.
-
-        This ensures the status endpoint can return success before the process dies.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        success_pos = func_src.find('"success"')
-        sigterm_pos = func_src.find("signal.SIGTERM")
-
-        assert success_pos != -1, "Success state assignment not found"
-        assert sigterm_pos != -1, "SIGTERM not found"
-        assert success_pos < sigterm_pos, (
-            "Status must be set to 'success' BEFORE sending SIGTERM"
-        )
-
-    def test_restart_has_sleep_before_sigterm(self):
-        """There should be a delay before SIGTERM so the success status can be polled.
-
-        Clients need time to poll /api/update/status and see 'success' before
-        the process terminates.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        # There should be an asyncio.sleep before SIGTERM
-        sleep_pos = func_src.find("asyncio.sleep")
-        sigterm_pos = func_src.find("signal.SIGTERM")
-
-        assert sleep_pos != -1, "asyncio.sleep not found before SIGTERM"
-        assert sleep_pos < sigterm_pos, (
-            "asyncio.sleep must come before SIGTERM to allow status polling"
-        )
-
-    def test_update_state_has_message_field(self):
-        """On restart failure, update_state should have a message for the user."""
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        assert '"message"' in func_src, (
-            "_run_update must set a 'message' field in _update_state for user feedback"
-        )
-
-
-# ---------------------------------------------------------------------------
-# 5. Tests Directory Handling
-# ---------------------------------------------------------------------------
-
-class TestMissingTestsDirectory:
-    """Tests that missing tests/ directory ABORTS the update (tests are mandatory)."""
-
-    def test_update_checks_for_tests_dir_existence(self):
-        """_run_update must check if tests/ directory exists before running tests."""
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        assert "tests_dir" in func_src or "tests" in func_src, (
-            "_run_update must reference tests directory"
-        )
-        assert ".exists()" in func_src, (
-            "_run_update must check if tests directory exists"
-        )
-
-    def test_update_checks_for_test_files(self):
-        """_run_update must check for test_*.py files, not just the directory."""
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        assert "test_*.py" in func_src, (
-            "_run_update must glob for test_*.py files to verify tests exist"
-        )
-
-    def test_missing_tests_aborts_update(self):
-        """When no tests exist, the update must ABORT — not skip.
-
-        Tests are mandatory for safe updates. An update without tests
-        is an update without a safety net.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        # The missing-tests path must raise RuntimeError, not skip
-        test_section = func_src[func_src.find("running_tests"):func_src.find("read_version")]
-        assert "RuntimeError" in test_section, (
-            "Missing tests must raise RuntimeError to abort the update"
-        )
-        assert "mandatory" in test_section.lower() or "ABORT" in test_section, (
-            "Error message must indicate tests are mandatory"
-        )
-
-    def test_no_skip_logic_for_tests(self):
-        """There must be no path that sets tests_passed = None (skip).
-
-        Tests either pass (True) or the update fails. No skipping allowed.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        assert 'tests_passed"] = None' not in func_src, (
-            "tests_passed must never be set to None — tests are mandatory, not skippable"
-        )
-
-    def test_running_tests_step_in_steps_list(self):
-        """'running_tests' must be in the steps_remaining list."""
-        source = _read_portal_source()
-        func_src = _extract_function(source, "api_update_apply")
-        assert func_src, "api_update_apply not found"
-
-        assert '"running_tests"' in func_src, (
-            "'running_tests' must be in steps_remaining"
-        )
-
-
-# ---------------------------------------------------------------------------
-# 6. Backup Script Tests
-# ---------------------------------------------------------------------------
-
-class TestBackupIdentity:
-    """Tests for the identity backup step."""
-
-    def test_backup_runs_before_pull(self):
-        """backup_identity step must execute before the pull step.
-
-        The steps_remaining list order in api_update_apply defines the UI order,
-        but we check actual execution order in _run_update.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        backup_pos = func_src.find("backup_identity")
-        pull_pos = func_src.find('_update_step("pull")')
-
-        assert backup_pos != -1, "backup_identity step not found in _run_update"
-        assert pull_pos != -1, "pull step not found in _run_update"
-        assert backup_pos < pull_pos, (
-            "backup_identity must execute BEFORE the pull step"
-        )
-
-    def test_backup_failure_does_not_block_update(self):
-        """If backup script fails, update should continue with a warning.
-
-        The backup step must be wrapped in try/except and only log a warning,
-        not raise a RuntimeError that would abort the update.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        # Find the backup section
-        backup_start = func_src.find("backup_identity")
-        assert backup_start != -1, "backup_identity not found"
-
-        # The backup section should have a try/except or check returncode
-        # but NOT raise RuntimeError
-        # Find the section between backup_identity and the next step
-        next_step = func_src.find('_update_step("ensure_git")', backup_start)
-        if next_step == -1:
-            next_step = func_src.find('_update_step("fetch")', backup_start)
-        assert next_step != -1, "Could not find next step after backup"
-
-        backup_section = func_src[backup_start:next_step]
-
-        # Backup failures should be warnings, not raises
-        assert "WARNING" in backup_section, (
-            "Backup failure should log a WARNING, not crash the update"
-        )
-
-    def test_backup_checks_script_exists(self):
-        """The backup step should check if backup_identity.sh exists before running."""
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        assert "backup_identity" in func_src, "backup_identity reference not found"
-        assert ".exists()" in func_src, (
-            "_run_update must check if backup script exists before running it"
-        )
-
-
-# ---------------------------------------------------------------------------
-# 7. Update Steps Ordering (Cross-cutting)
-# ---------------------------------------------------------------------------
-
-class TestUpdateStepsOrdering:
-    """Tests that verify the overall step ordering in the update pipeline."""
-
-    def test_steps_remaining_matches_execution_order(self):
-        """The steps_remaining list in api_update_apply should match _run_update execution order.
-
-        This ensures the UI progress bar accurately reflects the actual update flow.
-        """
-        source = _read_portal_source()
-
-        # Extract steps_remaining list from api_update_apply
-        apply_func = _extract_function(source, "api_update_apply")
-        assert apply_func, "api_update_apply not found"
-
-        steps_match = re.search(
-            r'steps_remaining.*?\[([^\]]+)\]',
-            apply_func, re.DOTALL
-        )
-        assert steps_match, "steps_remaining list not found in api_update_apply"
-
-        # Parse the step names
-        steps_str = steps_match.group(1)
-        declared_steps = [
-            s.strip().strip('"').strip("'")
-            for s in steps_str.split(',')
-            if s.strip().strip('"').strip("'")
-        ]
-
-        # Verify key safety steps are present
-        safety_steps = {"verify_shim", "running_tests", "verify_custom", "verify_preserved"}
-        declared_set = set(declared_steps)
-        missing = safety_steps - declared_set
-        assert not missing, (
-            f"Safety steps missing from steps_remaining: {missing}"
-        )
-
-    def test_verify_shim_after_pull_in_steps(self):
-        """verify_shim must come after pull in the declared steps list."""
-        source = _read_portal_source()
-        apply_func = _extract_function(source, "api_update_apply")
-        assert apply_func, "api_update_apply not found"
-
-        pull_pos = apply_func.find('"pull"')
-        shim_pos = apply_func.find('"verify_shim"')
-
-        assert pull_pos != -1, "pull not in steps_remaining"
-        assert shim_pos != -1, "verify_shim not in steps_remaining"
-        assert pull_pos < shim_pos, (
-            "verify_shim must come after pull in steps_remaining list"
-        )
-
-    def test_rollback_logic_covers_post_pull_failures(self):
-        """If a step fails after pull, rollback to previous_sha must be attempted.
-
-        The except block in _run_update should check if we're past the pull step.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        # Must have rollback logic
-        assert "reset --hard" in func_src, (
-            "_run_update must use 'git reset --hard' for rollback"
-        )
-        assert "rolled_back_to" in func_src, (
-            "_run_update must track rolled_back_to SHA"
-        )
-
-    def test_rollback_only_when_previous_sha_exists(self):
-        """Rollback should only happen when previous_sha is set (not fresh install)."""
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        # The rollback condition should check previous_sha
-        except_block = func_src[func_src.find("except Exception"):]
-        assert "previous_sha" in except_block, (
-            "Rollback logic must check previous_sha before attempting reset"
-        )
-
-
-# ---------------------------------------------------------------------------
-# 8. State Management Safety
-# ---------------------------------------------------------------------------
-
-class TestUpdateStateManagement:
-    """Tests for proper state management during updates."""
-
-    def test_state_reset_before_new_update(self):
-        """_update_state must be fully reset before starting a new update.
-
-        All fields should be cleared so stale data from a previous run
-        doesn't leak into the new update.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "api_update_apply")
-        assert func_src, "api_update_apply not found"
-
-        assert "_update_state.update(" in func_src, (
-            "api_update_apply must reset _update_state before starting update"
-        )
-
-    def test_initial_state_has_required_fields(self):
-        """The _update_state dict must have all required tracking fields."""
-        source = _read_portal_source()
-
-        required_fields = [
-            "status", "job_id", "step", "steps_completed", "steps_remaining",
-            "started_at", "completed_at", "error", "previous_sha", "new_sha",
-            "new_version", "rolled_back_to", "step_failed", "tests_passed", "message"
-        ]
-        for field in required_fields:
-            assert f'"{field}"' in source, (
-                f"_update_state must have '{field}' field"
-            )
-
-    def test_error_state_preserves_step_info(self):
-        """On failure, the error state must include which step failed."""
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        assert '"step_failed"' in func_src, (
-            "_run_update must record step_failed on error"
-        )
-
-
-# ---------------------------------------------------------------------------
-# 9. Behavioral Tests (_run_update with mocks)
-# ---------------------------------------------------------------------------
-
-class TestRunUpdateBehavioral:
-    """Behavioral tests that exercise _run_update logic with mocked dependencies.
-
-    Since portal_server.py has heavy module-level side effects, we test by
-    extracting the function source and verifying its structural properties,
-    combined with integration-style tests that simulate the function's I/O.
-    """
-
-    def test_shim_check_triggers_rollback(self):
-        """When CUSTOMIZATION LAYER marker is missing after pull, rollback must occur.
-
-        The _run_update function reads portal_server.py after pull and checks
-        for the marker. If absent, it raises RuntimeError which triggers the
-        rollback path (because verify_shim is a post-pull step).
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        # 1. verify_shim step raises RuntimeError when marker is missing
-        shim_section_start = func_src.find('_update_step("verify_shim")')
-        shim_section_end = func_src.find('_update_step("running_tests")')
-        assert shim_section_start != -1, "verify_shim step not found"
-        assert shim_section_end != -1, "running_tests step not found"
-        shim_section = func_src[shim_section_start:shim_section_end]
-        assert "raise RuntimeError" in shim_section, (
-            "verify_shim section must raise RuntimeError when marker is missing"
-        )
-
-        # 2. except block includes verify_shim in the rollback condition
-        except_block = func_src[func_src.find("except Exception"):]
-        assert "verify_shim" in except_block, (
-            "Rollback condition must include verify_shim as a post-pull failure step"
-        )
-
-        # 3. Rollback calls git reset --hard with previous_sha
-        assert "reset", "--hard" in except_block
-        assert "rolled_back_to" in except_block
-
-        # 4. Status is set to "failed" in the except block
-        assert '"failed"' in except_block, (
-            "Status must be set to 'failed' in rollback path"
-        )
-
-    def test_shim_check_passes_when_marker_present(self):
-        """When CUSTOMIZATION LAYER marker is present after pull, update continues.
-
-        Simulate the shim check logic: read file, check for marker, continue.
-        """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            server_file = Path(tmpdir) / "portal_server.py"
-            server_file.write_text(
-                "# --- CUSTOMIZATION LAYER (do not remove on upstream update) ---\n"
-                "print('overlay code')\n"
-            )
-            content = server_file.read_text()
-            assert "CUSTOMIZATION LAYER" in content, (
-                "Test setup: marker should be present in simulated file"
-            )
-            # The _run_update code does: if "CUSTOMIZATION LAYER" not in content: raise
-            # With marker present, no exception → update continues
-            should_abort = "CUSTOMIZATION LAYER" not in content
-            assert not should_abort, "Update should NOT abort when marker is present"
-
-    def test_lock_released_after_successful_update(self):
-        """Lock must be released in the finally block regardless of outcome.
-
-        We verify structurally: the finally block calls lock.release().
-        Also verify with a real asyncio.Lock that release works correctly.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-
-        # Structural check
-        finally_idx = func_src.rfind("finally:")
-        assert finally_idx > 0
-        finally_block = func_src[finally_idx:]
-        assert "lock.release()" in finally_block
-
-        # Behavioral check: a locked asyncio.Lock can be released
-        async def check_lock_release():
-            lock = asyncio.Lock()
-            await lock.acquire()
-            assert lock.locked(), "Lock should be locked after acquire"
-            # Simulate what finally block does
-            if lock.locked():
-                lock.release()
-            assert not lock.locked(), "Lock should be released after release"
-
-        run_async(check_lock_release())
-
-    def test_lock_released_after_failed_update(self):
-        """Lock must be released even when _run_update raises an exception.
-
-        The finally block must unconditionally release the lock.
-        """
-        async def check_lock_release_on_error():
-            lock = asyncio.Lock()
-            await lock.acquire()
-            assert lock.locked()
-            try:
-                # Simulate an early failure (e.g., git fetch fails)
-                raise RuntimeError("git fetch failed: simulated")
-            except Exception:
-                pass
-            finally:
-                # This mirrors _run_update's finally block
-                if lock.locked():
-                    lock.release()
-            assert not lock.locked(), "Lock must NOT be locked after exception + finally"
-
-        run_async(check_lock_release_on_error())
-
-    def test_test_failure_triggers_rollback(self):
-        """When pytest returns non-zero exit code, rollback must be triggered.
-
-        running_tests is listed in the rollback condition in the except block.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-        assert func_src, "_run_update function not found"
-
-        # 1. Test failure raises RuntimeError
-        test_section_start = func_src.find('_update_step("running_tests")')
-        test_section_end = func_src.find('_update_step("read_version")')
-        assert test_section_start != -1
-        assert test_section_end != -1
-        test_section = func_src[test_section_start:test_section_end]
-        assert "raise RuntimeError" in test_section, (
-            "Test failure must raise RuntimeError"
-        )
-        assert "returncode != 0" in test_section, (
-            "Test section must check returncode != 0 for test failure"
-        )
-
-        # 2. running_tests is in the rollback condition
-        except_block = func_src[func_src.find("except Exception"):]
-        assert "running_tests" in except_block, (
-            "Rollback condition must include running_tests as a post-pull failure step"
-        )
-
-    def test_rollback_condition_is_exhaustive_for_post_pull_steps(self):
-        """All steps that execute after pull must be covered by the rollback condition.
-
-        If a new post-pull step is added but not included in the rollback
-        condition, we could leave the repo in a broken state.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-
-        # Extract the rollback condition tuple/set
-        except_block = func_src[func_src.find("except Exception"):]
-
-        # All post-pull steps that modify state must trigger rollback
-        post_pull_steps = ["verify_shim", "running_tests", "read_version", "restart"]
-        for step in post_pull_steps:
-            assert step in except_block, (
-                f"Post-pull step '{step}' must be in the rollback condition"
-            )
-
-    def test_previous_sha_recorded_before_pull(self):
-        """previous_sha must be captured before the pull step.
-
-        Without it, rollback has no target SHA to reset to.
-        """
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-
-        record_pos = func_src.find("record_rollback")
-        pull_pos = func_src.find('_update_step("pull")')
-        assert record_pos != -1, "record_rollback step not found"
-        assert pull_pos != -1, "pull step not found"
-        assert record_pos < pull_pos, (
-            "record_rollback must execute BEFORE pull so we have a rollback target"
-        )
-
-    def test_update_state_set_to_failed_on_exception(self):
-        """_update_state['status'] must be set to 'failed' in the except block."""
-        source = _read_portal_source()
-        func_src = _extract_function(source, "_run_update")
-
-        except_block = func_src[func_src.find("except Exception"):]
-        assert '"status": "failed"' in except_block or "'status': 'failed'" in except_block or \
-               '"status"' in except_block and '"failed"' in except_block, (
-            "except block must set status to 'failed'"
-        )
-
-
-# ---------------------------------------------------------------------------
-# 10. Panel Injection Warning Assertions
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# K. Panel Injection Warning Tests (unchanged -- not update-related)
+# ===========================================================================
 
 class TestPanelInjectionWarnings:
-    """Tests that missing injection markers produce appropriate WARNING messages.
-
-    These tests use the same _run_injection_with_html helper from
-    TestPanelInjectionValidation to capture print() output and verify
-    that warnings are emitted for missing markers.
-    """
+    """Tests that missing injection markers produce appropriate WARNING messages."""
 
     def _run_injection_with_html(self, html: str, panel_html: str) -> tuple:
         """Run _inject_custom_panels with custom HTML and capture prints.
 
         Returns (result_html, printed_lines).
-        Reuses the same pattern as TestPanelInjectionValidation.
         """
         source = _read_portal_source()
         parse_src = _extract_function(source, "_parse_panel_meta")
@@ -1086,7 +1148,6 @@ class TestPanelInjectionWarnings:
             '</div>\n'
         )
         result, printed = self._run_injection_with_html(html, sample_panel)
-        # Should have the "Only X/3 injection markers found" warning
         count_warnings = [p for p in printed if 'WARNING' in p and '/3' in p]
         assert len(count_warnings) > 0, (
             "When all markers are missing, a WARNING with '0/3' or similar count must be printed"

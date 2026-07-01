@@ -55,6 +55,55 @@ bookmarks.json
 release_notes.json.local
 run_portal_patch.sh
 
+# Module backup (per-portal runtime data)
+.module-backup/
+
+# Google Drive tokens (per-user OAuth)
+.gdrive-tokens.json
+
+# Runtime data files
+boop_config.json
+kanban_tasks.json
+todo_tasks.json
+hub_tasks.json
+bookmarks.json
+reaction-sentiment.jsonl
+telegram_config.json
+installed-skills.json
+.skills-registry-cache.json
+debug-report-latest.txt
+
+# Local utility/fix scripts (not for distribution)
+cleanup_*.py
+fix_*.py
+extract_*.py
+puresurf_*.py
+constitution_sync.py
+
+# Wrangler cache
+cloudflare/.wrangler/
+
+# CIV-specific bridge state
+custom/cc-bridge-state*.json
+
+# Migrated data files
+*.jsonl.migrated
+
+# Old swap script (Portal 1.0 artifact)
+swap-portal.sh
+
+# Pre-update backup copies
+*.main-backup
+*.pre-*-backup
+
+# Duplicate test directories
+tests-repo/
+
+# Runtime cache/state files
+cc-cache.json
+last-update-status.json
+constitution/redact-terms.json
+
 # CIV identity and memory (NEVER track -- overwrite = amnesia)
 memories/
 .claude/
@@ -72,3 +121,9 @@ custom/__pycache__/
 !custom/*.template
 !custom/panels/.gitkeep
 !custom/panels/*.template
+
+# Fleet hygiene -- never distribute these to other CIVs (secrets, admin tooling, cross-CIV infra)
+tg_send.sh
+cc-gateway-staging/
+migrate_agents_departments.py
+aether-infrastructure/

@@ -15,6 +15,12 @@
     panel-label:   Display name shown in sidebar navigation
     panel-icon:    HTML entity for the icon (e.g., &#x1F6D2; for shopping cart)
     panel-tooltip: Hover text for the nav item
+    panel-replace: (OPTIONAL) ID of a built-in panel to replace instead of adding a new one.
+                   Example: <!-- panel-replace: status --> replaces the built-in Status panel.
+                   When used, the original nav item is hidden and the original panel div's
+                   content is swapped with this file's content. The div keeps its original ID
+                   (e.g. id="panel-status") so existing CSS/JS targeting that ID still works.
+                   Scope your CSS to #panel-{replace-id} when using this mode.
 
   STRUCTURE:
     - HTML content goes directly in the file (no <html>/<body> wrapper)

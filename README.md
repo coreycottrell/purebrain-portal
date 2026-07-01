@@ -203,37 +203,104 @@ Portal referral panel mirrors the website dashboard and adds payout request UI.
 
 ---
 
-## Quick Start (Single Instance)
+## Quick Start — Fresh Install
+
+No GitHub access needed. The portal is distributed via the CC release server.
 
 ```bash
-# 1. Clone this repo
-# 2. Install Python deps
-pip install starlette uvicorn python-dotenv aiofiles
+# 1. Create portal directory
+mkdir -p ~/purebrain_portal
 
-# 3. Create config
-cp portal-server/portal_owner.example.json ~/purebrain_portal/portal_owner.json
-# Edit with customer details
+# 2. Download the latest portal release
+curl -sH 'X-Portal-Token: YOUR_TOKEN_HERE' \
+  https://cc.purebrain.ai/api/releases/portal/latest | tar xz -C ~/purebrain_portal/
 
-# 4. Generate token
+# 3. Install Python dependencies
+pip install -r ~/purebrain_portal/requirements.txt
+
+# 4. Generate your portal auth token
 python3 -c "import secrets; print(secrets.token_urlsafe(32))" > ~/purebrain_portal/.portal-token
 
-# 5. Copy portal files
-cp portal-server/portal_server.py ~/purebrain_portal/
-cp portal-server/portal-pb-styled.html ~/purebrain_portal/
-cp portal-server/portal_send_file.sh ~/purebrain_portal/
-chmod +x ~/purebrain_portal/portal_send_file.sh
+# 5. (Optional) Create .env for local config
+cat > ~/purebrain_portal/.env << 'EOF'
+PORTAL_TOKEN=YOUR_TOKEN_HERE
+EOF
 
-# 6. Start
+# 6. Start the portal server
 cd ~/purebrain_portal && python3 portal_server.py
-# Runs on port 8097
+# Runs on port 8097 — access at http://localhost:8097/pb
+```
 
-# 7. Install systemd (optional, for auto-restart)
-sudo cp systemd/aether-portal.service.template /etc/systemd/system/customer-portal.service
-# Edit paths, then:
-sudo systemctl enable --now customer-portal
+### Getting a Portal Token
+
+Contact Flux (flux.civ@agentmail.to) or your PureBrain admin for the shared portal download token. This token is used to download releases — it is NOT the same as your portal auth token (.portal-token).
+
+---
+
+## Updating an Existing Portal
+
+```bash
+# Check what version is available
+curl -sH 'X-Portal-Token: YOUR_TOKEN_HERE' \
+  https://cc.purebrain.ai/api/releases/portal/version
+
+# Download and extract (overwrites code files, preserves .env and .portal-token)
+curl -sH 'X-Portal-Token: YOUR_TOKEN_HERE' \
+  https://cc.purebrain.ai/api/releases/portal/latest | tar xz -C ~/purebrain_portal/
+
+# Restart your portal server to apply changes
+```
+
+Or use the update script (included in the portal):
+```bash
+PORTAL_TOKEN=YOUR_TOKEN_HERE bash ~/purebrain_portal/tools/update-portal.sh
+```
+
+The update script checks the version, verifies the checksum, backs up your config, and extracts.
+
+### What gets preserved on update
+- `.env` — excluded from tarball, never overwritten
+- `.portal-token` — excluded from tarball
+- `.gdrive-tokens.json` — excluded from tarball
+- `portal-chat.jsonl` — your chat history stays intact
+
+### What gets updated
+- `portal_server.py` — server code
+- `portal-pb-styled.html` — UI
+- `static/` — CSS, JS, assets
+- `tools/` — utility scripts
+
+---
+
+## Release Distribution Architecture
+
+```
+Developer merges PR
+  -> bash tools/deploy-release.sh       (builds tarball, SCP to VPS)
+  -> cc.purebrain.ai serves the release  (FastAPI endpoint, token auth)
+  -> CIVs run curl or update-portal.sh   (download + extract)
+```
+
+**Endpoints** (on cc.purebrain.ai):
+| Path | Method | Auth | Purpose |
+|------|--------|------|---------|
+| `/api/releases/portal/version` | GET | X-Portal-Token | Check latest version |
+| `/api/releases/portal/latest` | GET | X-Portal-Token | Download tarball |
+
+---
+
+## Quick Start — Legacy (GitHub Clone)
+
+If you have GitHub access to the puretechnyc/purebrain-portal-2 repo:
+
+```bash
+git clone https://github.com/puretechnyc/purebrain-portal-2.git ~/purebrain_portal
+pip install -r ~/purebrain_portal/requirements.txt
+python3 -c "import secrets; print(secrets.token_urlsafe(32))" > ~/purebrain_portal/.portal-token
+cd ~/purebrain_portal && python3 portal_server.py
 ```
 
 ---
 
-*Built by Aether — AI Collective, Pure Technology*
-*Last updated: 2026-03-06*
+*Built by Aether + Flux — AI Collective, Pure Technology*
+*Last updated: 2026-06-01*

@@ -24,6 +24,7 @@ PORTAL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PORTAL_DIR)
 
 import aiosqlite
+import portal_referrals
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +238,7 @@ class TestC2_CompleteEndpointAuth(unittest.TestCase):
         )
 
         with patch.dict(os.environ, {"REFERRAL_COMPLETE_SECRET": secret}):
-            with patch.object(portal_server, 'REFERRALS_DB', Path(self.db_path)):
+            with patch.object(portal_referrals, 'REFERRALS_DB', Path(self.db_path)):
                 resp = _run(portal_server.api_referral_complete(req))
                 self.assertEqual(resp.status_code, 403,
                                  "Complete with wrong secret should return 403")
@@ -260,7 +261,7 @@ class TestC2_CompleteEndpointAuth(unittest.TestCase):
         )
 
         with patch.dict(os.environ, {"REFERRAL_COMPLETE_SECRET": secret}):
-            with patch.object(portal_server, 'REFERRALS_DB', Path(self.db_path)):
+            with patch.object(portal_referrals, 'REFERRALS_DB', Path(self.db_path)):
                 resp = _run(portal_server.api_referral_complete(req))
                 # Should NOT be 403 (secret matched)
                 self.assertNotEqual(resp.status_code, 403,
@@ -281,7 +282,7 @@ class TestC2_CompleteEndpointAuth(unittest.TestCase):
         )
 
         with patch.dict(os.environ, {"REFERRAL_COMPLETE_SECRET": ""}, clear=False):
-            with patch.object(portal_server, 'REFERRALS_DB', Path(self.db_path)):
+            with patch.object(portal_referrals, 'REFERRALS_DB', Path(self.db_path)):
                 resp = _run(portal_server.api_referral_complete(req))
                 # Should NOT be 403 (no secret configured = open)
                 self.assertNotEqual(resp.status_code, 403,
@@ -311,12 +312,12 @@ class TestC3_PayoutDeniedOnDBError(unittest.TestCase):
 
         # Mock _read_payout_requests_db to return empty (no cooldown conflict)
         # Mock _referral_db to raise an exception (simulating DB error)
-        with patch.object(portal_server, '_read_payout_requests_db', new_callable=AsyncMock, return_value=[]):
+        with patch.object(portal_referrals, '_read_payout_requests_db', new_callable=AsyncMock, return_value=[]):
             # Create a context manager mock that raises on execute
             mock_db = AsyncMock()
             mock_db.__aenter__ = AsyncMock(side_effect=Exception("DB connection failed"))
 
-            with patch.object(portal_server, '_referral_db', return_value=mock_db):
+            with patch.object(portal_referrals, '_referral_db', return_value=mock_db):
                 resp = _run(portal_server.api_referral_payout_request(req))
                 # Must NOT succeed -- should return 503 (service unavailable)
                 self.assertEqual(resp.status_code, 503,
@@ -381,8 +382,8 @@ class TestC4_PreviouslyPaidDeduction(unittest.TestCase):
             }
         ]
 
-        with patch.object(portal_server, '_read_payout_requests_db', new_callable=AsyncMock, return_value=existing_payouts):
-            with patch.object(portal_server, 'REFERRALS_DB', Path(self.db_path)):
+        with patch.object(portal_referrals, '_read_payout_requests_db', new_callable=AsyncMock, return_value=existing_payouts):
+            with patch.object(portal_referrals, 'REFERRALS_DB', Path(self.db_path)):
                 resp = _run(portal_server.api_referral_payout_request(req))
                 # $500 earned - $500 already paid = $0 available. Request for $500 must fail.
                 self.assertEqual(resp.status_code, 400,
@@ -431,8 +432,8 @@ class TestC4_PreviouslyPaidDeduction(unittest.TestCase):
             }
         ]
 
-        with patch.object(portal_server, '_read_payout_requests_db', new_callable=AsyncMock, return_value=existing_payouts):
-            with patch.object(portal_server, 'REFERRALS_DB', Path(self.db_path)):
+        with patch.object(portal_referrals, '_read_payout_requests_db', new_callable=AsyncMock, return_value=existing_payouts):
+            with patch.object(portal_referrals, 'REFERRALS_DB', Path(self.db_path)):
                 with patch.object(portal_server, '_write_payout_request_db', new_callable=AsyncMock):
                     with patch.object(portal_server, '_execute_paypal_payout',
                                       new_callable=AsyncMock, return_value={"ok": True, "batch_id": "test"}):

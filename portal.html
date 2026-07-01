@@ -287,7 +287,7 @@
 <!-- Auth overlay -->
 <div id="auth-overlay">
   <div class="auth-box">
-    <h2>Witness</h2>
+    <h2>PureBrain</h2>
     <p>AI Civilization Portal</p>
     <input type="password" id="token-input" placeholder="Bearer token..." autocomplete="off">
     <button id="auth-btn">Connect</button>
@@ -297,7 +297,7 @@
 
 <header>
   <div class="header-left">
-    <span class="logo">Witness</span>
+    <span class="logo">PureBrain</span>
     <span class="subtitle">AI Civilization</span>
   </div>
   <div class="status-badge">
@@ -321,7 +321,7 @@
         <span class="dot dot-red"></span>
         <span class="dot dot-yellow"></span>
         <span class="dot dot-green"></span>
-        <span style="margin-left:8px; font-size:0.7rem;">witness-primary</span>
+        <span style="margin-left:8px; font-size:0.7rem;">primary</span>
         <span class="ws-indicator disconnected" id="ws-status">disconnected</span>
       </div>
       <div id="terminal-output">Connecting to terminal stream...</div>
@@ -335,7 +335,7 @@
     <div class="panel" id="panel-chat">
       <div id="chat-messages"><div class="chat-loading">Loading chat history...</div></div>
       <div class="chat-input-bar">
-        <input type="text" id="chat-input" placeholder="Message Witness..." autocomplete="off">
+        <input type="text" id="chat-input" placeholder="Message your AI..." autocomplete="off">
         <button id="send-btn">Send</button>
       </div>
     </div>
@@ -574,7 +574,7 @@
 
     var meta = document.createElement('div');
     meta.className = 'msg-meta';
-    meta.textContent = (role === 'user' ? 'Corey' : 'Witness') + ' - ' + timeStr;
+    meta.textContent = (role === 'user' ? 'You' : 'AI') + ' - ' + timeStr;
 
     div.appendChild(bubble);
     div.appendChild(meta);

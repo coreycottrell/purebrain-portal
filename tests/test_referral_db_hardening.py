@@ -22,7 +22,11 @@ import aiosqlite
 
 def _run(coro):
     """Helper to run async code in sync tests."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 class TestIndexesExistAfterInit(unittest.TestCase):
@@ -40,7 +44,7 @@ class TestIndexesExistAfterInit(unittest.TestCase):
         """_init_referral_db should create all performance indexes."""
         from pathlib import Path
 
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)):
             from portal_server import _init_referral_db
             _run(_init_referral_db())
 
@@ -80,7 +84,7 @@ class TestPayoutRequestsTable(unittest.TestCase):
 
     def _init_db(self):
         from pathlib import Path
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)):
             from portal_server import _init_referral_db
             _run(_init_referral_db())
 
@@ -149,7 +153,7 @@ class TestFinancialAuditLogTable(unittest.TestCase):
 
     def _init_db(self):
         from pathlib import Path
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)):
             from portal_server import _init_referral_db
             _run(_init_referral_db())
 
@@ -208,7 +212,7 @@ class TestLogFinancialEvent(unittest.TestCase):
         """_log_financial_event should insert a row into financial_audit_log."""
         from pathlib import Path
 
-        with patch("portal_server.REFERRALS_DB", Path(self.db_path)):
+        with patch("portal_referrals.REFERRALS_DB", Path(self.db_path)):
             from portal_server import _init_referral_db, _log_financial_event
             _run(_init_referral_db())
             _run(_log_financial_event(
@@ -242,7 +246,7 @@ class TestLogFinancialEvent(unittest.TestCase):
 
         # Point to a non-existent directory so DB creation fails
         bad_path = Path("/nonexistent/dir/bad.db")
-        with patch("portal_server.REFERRALS_DB", bad_path):
+        with patch("portal_referrals.REFERRALS_DB", bad_path):
             from portal_server import _log_financial_event
             # Should NOT raise - just prints error
             _run(_log_financial_event(

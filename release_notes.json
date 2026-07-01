@@ -1,16 +1,497 @@
 {
-  "current_version": "1.4.1",
+  "current_version": "2.3.71",
   "releases": [
+    {
+      "version": "2.3.71",
+      "date": "2026-06-28",
+      "title": "Referral Security + Restart Hardening",
+      "highlights": [
+        "SECURITY (IDOR): PayPal payout-email handler no longer lets an affiliate session set another affiliate's payout address — writes are now bound to the session's own referral code",
+        "SECURITY (passwordless bypass): a referrer with no password set can no longer have their payout email hijacked via the password path — absence of a password now fails closed (session or portal auth required), not open",
+        "FIX (restart cascade): portal update/restart prefers in-place os.execv over tmux dispatch, eliminating the restart-cascade countdown loop",
+        "TOOLING: deploy-release.sh accepts an explicit VERSION override (env var or positional arg) so releases can target a specific edition instead of always +1",
+        "Catch credit: Aether/Chy (referral IDOR + passwordless), Prodigy (restart cascade)"
+      ]
+    },
+    {
+      "version": "2.3.7",
+      "date": "2026-06-23",
+      "title": "Task Scheduler Date Picker",
+      "highlights": [
+        "FIX: Schedule Task modal now has a DATE picker for one-time (\"Run Once\") tasks — previously you could only pick a time, so a one-time task could only ever fire TODAY, never on a future date",
+        "Date field shows only for \"Run Once\" (daily/weekly/custom unaffected), defaults to today, and rejects empty or past dates",
+        "Edit mode prefills the date from the existing task's fire_at",
+        "Catch credit: Jared/Aether (2026-06-23)"
+      ]
+    },
+    {
+      "version": "2.3.6",
+      "date": "2026-06-22",
+      "title": "Portal File-Card Renderer Restored",
+      "highlights": [
+        "NEW: [PORTAL_FILE:...] file-card renderer restored to portal core \u2014 delivered files now render as styled cards with inline preview (image/pdf/md/text) and a token-authed download button, instead of dead raw text",
+        "Ships as stock functionality for every fleet CIV's portal (CIV-agnostic)",
+        "Catch credit: Aether/Jared (spec 2026-06-18) \u2014 renderer was silently dropped in a prior rebuild"
+      ]
+    },
+    {
+      "version": "2.3.5",
+      "date": "2026-06-22",
+      "title": "Ops/Tooling Hygiene",
+      "highlights": [
+        "FIX: deploy-release version-detection \u2014 fail-loud, no mislabeled releases",
+        "FIX: upgrade-portal model-floor \u2014 preserves model pins, defaults to claude-opus-4-8, never downgrades to 4.6",
+        "No portal runtime changes (deploy/upgrade tooling only)"
+      ]
+    },
+    {
+      "version": "2.3.4",
+      "date": "2026-06-22",
+      "title": "Terminal Copy/Paste Fix",
+      "highlights": [
+        "FIX: Terminal text selection now survives live refresh (live re-render no longer clobbers your selection)",
+        "FIX: Native Ctrl+C copy, Ctrl+V paste\u2014>inject; removed copy/paste buttons (keyboard-only)",
+        "FIX: AI Team Monitor pane text is now selectable (real root cause)"
+      ]
+    },
+    {
+      "version": "2.3.3",
+      "date": "2026-06-22",
+      "title": "CC Bridge Privacy Fix + Security Hygiene + Terminal Copy/Paste",
+      "highlights": [
+        "FIX: CC bridge privacy \u2014 correlation-token scoping stops cross-context message leakage to CC channels",
+        "SECURITY: Removed admin tooling + hardcoded secrets from fleet distribution (tg_send.sh, cloudflare, infra notes)",
+        "NEW: Terminal pane copy/paste support (fixes Claude-login paste)"
+      ]
+    },
+    {
+      "version": "2.3.2",
+      "date": "2026-06-18",
+      "title": "Drag-Drop Fix + CC Bridge Gap-Jump + Throttle Update",
+      "highlights": [
+        "FIX: Drag-and-drop file upload now works (selector was targeting wrong class)",
+        "FIX: CC bridge gap-jump \u2014 no longer gets stuck at old message IDs",
+        "FIX: Upload injection logging + fallback on failure",
+        "FIX: Update throttle reduced to 30 min / 3 updates per window"
+      ]
+    },
+    {
+      "version": "2.3.1",
+      "date": "2026-06-17",
+      "title": "Upload Fixes + Drag-and-Drop + Paste Support",
+      "highlights": [
+        "NEW: Drag-and-drop file upload to chat area",
+        "NEW: Paste images from clipboard (Ctrl+V / Cmd+V)",
+        "NEW: Send button pulses blue when files are pending",
+        "FIX: File uploads without text now reliably inject into tmux",
+        "FIX: Upload injection failures now logged (no more silent failures)",
+        "FIX: Fallback persistence when tmux injection fails",
+        "FIX: Thinking tags no longer spam on page refresh (TDD fix, 3 tests)",
+        "FIX: Update throttle reduced from 24h to 4h",
+        "FIX: Deploy script points to Hetzner release server"
+      ]
+    },
+    {
+      "version": "2.3.0",
+      "date": "2026-06-17",
+      "title": "Chat UX + Performance + Thinking Pipeline Overhaul",
+      "highlights": [
+        "NEW: Copy, Pin, Reply buttons on message hover",
+        "NEW: Thinking bubble expand/collapse (themed dark/light/girly)",
+        "NEW: Code block copy button",
+        "NEW: Ctrl+F / Cmd+F opens portal search",
+        "NEW: Gmail notification endpoints (task-assigned, meeting-invite)",
+        "NEW: BOOP system integration in Agent Hub",
+        "FIX: Thinking pipeline \u2014 content now streams in real-time (ephemeral, not persisted)",
+        "FIX: 3D brain animation pauses when hidden (major CPU savings)",
+        "FIX: Auto-scroll dead zone \u2014 new messages no longer missed",
+        "FIX: Scheduled tasks executor fires tasks from Settings panel",
+        "FIX: Upgrade script URL works (/latest/upgrade-portal.sh)",
+        "FIX: Update throttle reduced from 24h to 4h",
+        "PERF: Animations throttled to 30fps, topics debounced, WS memory pruned",
+        "PERF: Message parse cache, agent avatar CSS classes, clock visibility-aware"
+      ]
+    },
+    {
+      "version": "2.2.99",
+      "date": "2026-06-17",
+      "title": "Hotfix: Thinking Tags + Deploy Script",
+      "highlights": [
+        "FIX: Thinking tags no longer spam on page refresh (5-min history cutoff)",
+        "FIX: Deploy script now points to Hetzner release server",
+        "FIX: Deploy script reads version from portal_config.py instead of git describe",
+        "FIX: v2.2.98 release notes now visible in Version Info panel"
+      ]
+    },
+    {
+      "version": "2.2.98",
+      "date": "2026-06-17",
+      "title": "Chat UX Overhaul + Performance Fixes + Thinking Pipeline",
+      "highlights": [
+        "NEW: Copy, Pin, Reply buttons on message hover",
+        "NEW: Thinking bubble expand/collapse (themed for dark/light/girly)",
+        "NEW: Code block copy button on hover",
+        "NEW: Ctrl+F / Cmd+F opens portal search instead of browser find",
+        "FIX: Thinking content now visible (monitor watches top 3 JSONL files)",
+        "FIX: Thinking content survives page refresh (included in history)",
+        "FIX: 3D brain animation pauses when hidden (major CPU savings)",
+        "FIX: Auto-scroll dead zone \u2014 new messages no longer missed",
+        "FIX: Scheduled tasks executor now fires tasks from Settings panel",
+        "FIX: Upgrade script URL (/latest/upgrade-portal.sh) now works",
+        "PERF: Binary rain + rose bloom throttled to 30fps",
+        "PERF: Topics reload debounced to 10 seconds",
+        "PERF: Server WS connection memory pruned periodically",
+        "PERF: Message parse cache with 2s TTL",
+        "NEW: Gmail notification endpoints (send-email, task-assigned, meeting-invite)",
+        "NEW: BOOP system integration in Agent Hub"
+      ]
+    },
+    {
+      "version": "2.2.97",
+      "date": "2026-06-12",
+      "title": "Hardened Restart: os.execv + 24-hour Update Throttle",
+      "highlights": [
+        "HARDENED: Restart now uses os.execv as primary non-supervisor method (works in Docker containers, bare metal, everywhere).",
+        "HARDENED: 24-hour update throttle prevents excessive restarts (force override with ?force=true).",
+        "Restart priority: tmux \u2192 systemd \u2192 watchdog \u2192 os.execv \u2192 restart.sh"
+      ]
+    },
+    {
+      "version": "2.2.96",
+      "date": "2026-06-11",
+      "title": "HOTFIX: Fixed broken pre-flight check",
+      "highlights": [
+        "HOTFIX: Fixed broken pre-flight check that prevented portal startup in v2.2.95."
+      ]
+    },
+    {
+      "version": "2.2.95",
+      "date": "2026-06-11",
+      "title": "Hardened Update Pipeline",
+      "highlights": [
+        "HARDENED: Update pipeline \u2014 code files backed up before extraction (full rollback on failure).",
+        "HARDENED: pip install runs automatically after extraction (with PEP 668 fallback).",
+        "HARDENED: Restart detects supervisor (tmux/systemd) \u2014 no more orphan processes.",
+        "HARDENED: Post-restart health check verifies new version is running.",
+        "HARDENED: Pre-flight dependency check on startup (fails fast with clear error).",
+        "HARDENED: pip failure triggers rollback (not silent).",
+        "FIX: Optional module imports won't crash portal if file missing."
+      ]
+    },
+    {
+      "version": "2.2.94",
+      "date": "2026-06-11",
+      "title": "Bookmarks Server-Side, Update Badge Clickable",
+      "highlights": [
+        "FIX: Bookmarks are now server-side only \u2014 syncs across browsers and devices, localStorage removed.",
+        "FIX: Update badge (green dot) is now clickable and opens the update panel."
+      ]
+    },
+    {
+      "version": "2.2.93",
+      "date": "2026-06-11",
+      "title": "Reply Linking, Bookmarks Fix, Auto-Scroll Fix",
+      "highlights": [
+        "NEW: Clickable reply linking \u2014 reply messages show a compact quoted header (author + truncated text) that smooth-scrolls to the parent message with a highlight flash.",
+        "NEW: Reply headers are keyboard-accessible (Enter/Space) with proper aria-labels. Missing parents show 'Original message unavailable'.",
+        "FIX: Bookmarks now display correctly \u2014 unified localStorage key (was split across two keys causing bookmarks to disappear).",
+        "NEW: URL bookmarks auto-fetch site title and favicon from the bookmarked page \u2014 no more generic 'Bookmark' labels.",
+        "FIX: Chat auto-scroll no longer forces scroll to bottom when user has scrolled up to read history (150px threshold)."
+      ]
+    },
+    {
+      "version": "2.2.92",
+      "date": "2026-06-10",
+      "title": "Email/Inbox Tab Now Supports Light Mode and Rose Theme",
+      "highlights": [
+        "FIX: Email/inbox tab now adapts correctly when switching to light mode or rose/girly theme.",
+        "FIX: Root cause was .docked-promoted-panel having a hardcoded dark background (rgba(10,14,26,0.92)) \u2014 now uses CSS variable that adapts to theme.",
+        "FIX: Added explicit light/girly background overrides for #inboxView to ensure correct bg regardless of DOM position.",
+        "FIX: Added missing girly theme overrides for inbox item separators, toolbar border, and email detail header border.",
+        "FIX: Email wizard labels (.ew-label) and progress dots (.ew-dot) now visible in light and rose themes (were hardcoded white)."
+      ]
+    },
+    {
+      "version": "2.2.91",
+      "date": "2026-06-10",
+      "title": "Auto-Detect Live Model \u2014 No More Hardcoding",
+      "highlights": [
+        "FIX: Session resume auto-detects live model from session transcript instead of hardcoding. No more silent downgrades on resume.",
+        "Detection priority: fresh model file (<7 days) \u2192 session JSONL transcript \u2192 stale model file \u2192 fallback default.",
+        "Upgrade script also detects from session transcript before writing the model file."
+      ]
+    },
+    {
+      "version": "2.2.9",
+      "date": "2026-06-10",
+      "title": "Model Fallback Changed to Opus + Upgrade Script Refreshes Stale Model File",
+      "highlights": [
+        "FIX: Model fallback changed from claude-sonnet-4-6 to claude-opus-4-6[1m] \u2014 if ~/.claude_session_model is missing, sessions now start on Opus not Sonnet.",
+        "FIX: Upgrade script now refreshes ~/.claude_session_model if missing or older than 7 days \u2014 writes claude-opus-4-6[1m] to prevent silent downgrade after upgrade."
+      ]
+    },
+    {
+      "version": "2.2.8",
+      "date": "2026-06-10",
+      "title": "Fix Session Resume Model Hardcode",
+      "highlights": [
+        "FIX: Session resume no longer hardcodes model \u2014 reads from ~/.claude_session_model (prevents silent downgrade to Sonnet)"
+      ]
+    },
+    {
+      "version": "2.2.7",
+      "date": "2026-06-10",
+      "title": "Fleet Heartbeat + Admin Fleet Dashboard",
+      "highlights": [
+        "NEW: Fleet heartbeat \u2014 portal reports version + uptime to release server every 5 min (enables fleet monitoring dashboard).",
+        "NEW: Admin-only fleet dashboard at cc.purebrain.ai."
+      ]
+    },
+    {
+      "version": "2.2.6",
+      "date": "2026-06-10",
+      "title": "Settings Security Hardening + CC Cache Split",
+      "highlights": [
+        "SECURITY: API keys masked in GET /api/settings responses (defense-in-depth).",
+        "CC message cache split to separate file (reduces settings bloat from 241KB to ~15KB).",
+        "cc-cache.json added to preserved files list for upgrade safety."
+      ]
+    },
+    {
+      "version": "2.2.5",
+      "date": "2026-06-10",
+      "title": "CC Bridge Key Fix + Update Status Persistence + Notification Dedup",
+      "highlights": [
+        "FIX: CC bridge key double-prefix bug fixed -- was causing 401s for CIVs with name:key format in env vars.",
+        "FIX: Update status now persists across restarts -- no more stuck-on-idle after successful update.",
+        "FIX: Update notification dedup -- one notification per version, server-side check."
+      ]
+    },
+    {
+      "version": "2.2.4",
+      "date": "2026-06-10",
+      "title": "CC Bridge Graceful Silence + Real Activity Feed + Auto-Scroll Fix",
+      "highlights": [
+        "FIX: CC bridge now gracefully silent when no key configured -- no more 401 spam in logs.",
+        "FIX: Standalone CC bridge removed, consolidated into embedded bridge (configure CC key in Settings).",
+        "FIX: CC chat auto-scroll now works correctly for live incoming messages.",
+        "FIX: restart.sh is now supervisor-aware -- detects tmux vs systemd and restarts correctly.",
+        "NEW: Sidebar agent badges now show real live counts.",
+        "NEW: Agent Hub activity feed shows real AI events (not CC messages) via activity logger.",
+        "NEW: Activity log preserved across portal updates."
+      ]
+    },
+    {
+      "version": "2.2.3",
+      "date": "2026-06-10",
+      "title": "CC Bridge Graceful Disable + Agent Hub Live Data + File Preview",
+      "highlights": [
+        "NEW: File preview popup \u2014 double-click opens full modal for file content viewing.",
+        "NEW: Agent Hub now shows all live data (system stats, integrations status, uptime, CIV name).",
+        "NEW: Clock 12/24hr toggle in settings.",
+        "NEW: /health endpoint now includes portal version.",
+        "FIX: NaN 'last run' column in tasks view.",
+        "FIX: Upgrade script PEP 668 pip compatibility + smart restart detection."
+      ]
+    },
+    {
+      "version": "2.2.2",
+      "date": "2026-06-09",
+      "title": "Constitution Preservation + Chat Reply Fix + Default Agents",
+      "highlights": [
+        "FIX: Constitution rules.json and redact-terms.json now preserved during portal updates -- deploy tarball no longer overwrites CIV-specific rules.",
+        "FIX: Chat reply feature now includes quoted reply context in the sent message -- was showing the reply bar visually but not including the text.",
+        "NEW: 7 default agents added to the agent registry for fresh installs."
+      ]
+    },
+    {
+      "version": "2.2.1",
+      "date": "2026-06-08",
+      "title": "Zero-Config Updates + Clock Fix + Audit Fixes + Data Safety",
+      "highlights": [
+        "FIX: Update system now works out of the box \u2014 built-in shared key, no .env token configuration needed.",
+        "FIX: Update error messages now show specific diagnostics (auth failed, DNS, timeout) instead of generic errors.",
+        "FIX: Live clock widget no longer disappears when switching Chat\u2192Inbox\u2192Chat tabs.",
+        "FIX: Update badge hidden by default \u2014 only shown when a real update is available.",
+        "FIX: CC health endpoint path corrected (/api/health \u2192 /health) \u2014 CIV name now displays in CC chat.",
+        "FIX: Commands palette activated (script tag was missing).",
+        "FIX: Hardcoded renewal date removed \u2014 now dynamic placeholder.",
+        "FIX: Audit log CSV export limit raised from 500 to 5000 to match frontend.",
+        "FIX: Constitution Memory endpoint now redacts IPs, SSH keys, and sensitive terms before API response.",
+        "FIX: Configurable redact-terms.json for per-CIV sensitive data filtering.",
+        "TEST: 930 unit tests passing."
+      ]
+    },
+    {
+      "version": "2.2.0",
+      "date": "2026-06-08",
+      "title": "Constitution Tab Complete + Notification Fix + Stale Tests Fixed",
+      "highlights": [
+        "NEW: Constitution Tab \u2014 all 7 subtabs fully functional (Global Rules, Agent Rules, Governance, Dashboard, Action Log, Memory, Overrides).",
+        "NEW: Dashboard subtab with 6 stat cards, time range filter, live data from rules + governance + audit APIs.",
+        "NEW: Action Log subtab with color-coded entries, type filter, and CSV export.",
+        "NEW: Memory subtab with 5 category pill filters (Identity, Feedback, Projects, References, Processes).",
+        "NEW: Overrides subtab showing human-vs-AI decision history.",
+        "NEW: Background inbox polling every 2 minutes for email notifications (was only checking on tab open).",
+        "FIX: Constitution update endpoint now validates enum fields (priority, status, enforcement) \u2014 was accepting arbitrary values.",
+        "FIX: Audit log query params no longer crash on malformed input (safe defaults).",
+        "FIX: CSV export blob URL leak fixed (revokeObjectURL after download).",
+        "FIX: CSV export uses proper CSV escaping instead of HTML entities.",
+        "FIX: Constitution auto-sync errors now logged instead of silently swallowed.",
+        "FIX: Audit log rotation \u2014 truncates to 5000 entries when exceeding 10000.",
+        "FIX: Tab callback detects active subtab instead of always loading rules.",
+        "FIX: 3 stale test assertions updated (version checks, Let's Talk visibility).",
+        "TEST: 49 functional tests hitting live Constitution API + 886 unit tests passing."
+      ]
+    },
+    {
+      "version": "2.1.9",
+      "date": "2026-06-07",
+      "title": "Skills Shop Registry + Task Edit + Theme Support",
+      "highlights": [
+        "NEW: Skills Shop now has All/Installed/Available filter buttons to browse by install status.",
+        "NEW: 45-skill curated registry from 3 sources (Superpowers, Everything Claude Code, Awesome Toolkit) with one-click install.",
+        "NEW: Data & AI category added (prompt engineering, cost-aware LLM, agent architecture audit, eval harness).",
+        "NEW: Task Edit button \u2014 pencil icon opens schedule modal pre-filled with task data, saves via PUT.",
+        "NEW: Skills Shop light theme and rose/girly theme support \u2014 full CSS overrides for all 3 themes.",
+        "NEW: Category-specific accent colors (Development=blue, Architecture=purple, Security=red, etc.) on cards and section headers.",
+        "FIX: Skills Shop premium redesign \u2014 gradient cards, glassmorphism detail overlay, hover animations, refined typography."
+      ]
+    },
+    {
+      "version": "2.1.8",
+      "date": "2026-06-07",
+      "title": "Skills Shop + Search Highlights + Hardcoded Path Cleanup",
+      "highlights": [
+        "NEW: Skills Shop \u2014 core built-in panel for browsing, searching, installing, and managing Claude Code skills. Categorized view (Development, Architecture, Security, Social, Infrastructure, Communication, Ceremonies). Install/uninstall from curated registry.",
+        "NEW: Skills Shop backend (portal_skills.py) \u2014 5 API endpoints for skill listing, detail, registry, install, uninstall. Auto-categorization, 5-min cache, YAML frontmatter parsing.",
+        "NEW: Chat search now highlights matching text in yellow within message bubbles.",
+        "FIX: Chat search password autofill dropdown \u2014 all password inputs now use autocomplete=new-password, search input uses type=search with readonly trick.",
+        "FIX: Chat search auto-closes when switching to Inbox/CC tabs.",
+        "FIX: Search button shows active state (blue highlight) when search bar is open.",
+        "FIX: Removed all hardcoded /home/jared/ and /home/aiciv/ paths from runtime code (8 files cleaned).",
+        "TEST: 29 Skills Shop TDD tests + 9 chat search tests."
+      ]
+    },
+    {
+      "version": "2.1.7",
+      "date": "2026-06-05",
+      "title": "Chat Search Fix + Tests",
+      "highlights": [
+        "FIX: Chat search button now works after switching between Chat/Inbox/CC views \u2014 was broken because switchChatView recreated the button HTML without the onclick handler.",
+        "FIX: Search function converted from IIFE to global toggleChatSearch() so dynamically created buttons can reach it.",
+        "TEST: 7 new tests ensure all search buttons (static and dynamic) have onclick handlers and the search function is globally accessible."
+      ]
+    },
+    {
+      "version": "2.1.6",
+      "date": "2026-06-04",
+      "title": "Release Server Version Archive",
+      "highlights": [
+        "NEW: Release server now keeps all past versions as portal-{version}.tar.gz alongside latest.tar.gz.",
+        "NEW: versions.json manifest on the release server tracks all deployed versions with SHA256, size, and timestamp.",
+        "NEW: Deploy output now shows version history (last 5 releases).",
+        "INFRA: Update check still returns only the latest version \u2014 version archive is for rollback/audit only."
+      ]
+    },
+    {
+      "version": "2.1.5",
+      "date": "2026-06-04",
+      "title": "Panel Switch Stability Fix",
+      "highlights": [
+        "FIX: Switching tabs while docked no longer leaves ghost panels visible \u2014 promoted inbox/cc panels are cleaned up before every tab switch.",
+        "FIX: Let's Talk now works correctly when docked with inbox or CC active.",
+        "FIX: Sidebar highlighting stays correct when inbox/cc sub-views are promoted above the dock."
+      ]
+    },
+    {
+      "version": "2.1.4",
+      "date": "2026-06-04",
+      "title": "Dock + Inbox/CC Fix, CC Bridge Age Filter",
+      "highlights": [
+        "FIX: Docking from Inbox or CC subtab no longer breaks the layout \u2014 sub-views are properly promoted above the dock.",
+        "FIX: Undocking now restores the active sub-view (inbox/cc) instead of resetting to chat.",
+        "FIX: CC Bridge no longer silently drops @mentions and DMs due to the 15-minute max-age filter \u2014 important messages always deliver regardless of age.",
+        "FIX: PureSurf navigate() decorator placement bug \u2014 was routing to _recover_linkedin_auth() instead of navigate(), returning bare false."
+      ]
+    },
+    {
+      "version": "2.1.3",
+      "date": "2026-06-03",
+      "title": "Update System Polish",
+      "highlights": [
+        "NEW: Periodic background update check every 24h with notification badge.",
+        "NEW: Post-update health check \u2014 portal waits for restart and verifies new version before reloading.",
+        "NEW: Version mismatch auto-fix \u2014 if PORTAL_VERSION and release_notes.json disagree, auto-corrects on startup.",
+        "NEW: Single source of truth \u2014 PORTAL_VERSION in portal_config.py is canonical, release_notes.json syncs to it.",
+        "FIX: Improved restart flow \u2014 tries restart.sh before exec fallback for cleaner process handoff.",
+        "FIX: Update status now shows rollback info on failure.",
+        "FIX: Poll status no longer stops on network error during restart window."
+      ]
+    },
+    {
+      "version": "2.1.2",
+      "date": "2026-06-03",
+      "title": "Data Safety Hardening + User-Agnostic Distribution",
+      "highlights": [
+        "SECURITY: Tarball extraction now filters preserved files, dirs, and symlinks instead of extracting everything.",
+        "SECURITY: Fixed critical lstrip bug that would strip leading dots from .env, .portal-token, .claude during extraction.",
+        "SAFETY: Added 9 missing user-data files to _PRESERVED_FILES (kanban, todo, portal_owner, gdrive tokens, etc.).",
+        "SAFETY: New _SKIP_EXTRACT_DIRS prevents overwrite of backups, uploads, and module-backup directories.",
+        "SAFETY: Rollback logic added to error handler \u2014 user data restored from backup on failed updates.",
+        "SAFETY: deploy-release.sh now excludes 20+ user-data patterns (memories, custom, *.jsonl, databases, etc.).",
+        "FIX: Removed all hardcoded CIV names, emails, and paths from distributable code.",
+        "FIX: Generic fallbacks replace user-specific defaults (witness, Flux, Aether, Jared references removed).",
+        "FIX: deploy-release.sh VPS host and path now configurable via env vars.",
+        "TEST: 99 new data safety tests covering tarball exclusions, preserve lists, extraction, rollback, and genericization."
+      ]
+    },
+    {
+      "version": "2.1.1",
+      "date": "2026-06-03",
+      "title": "Update System UX + Bug Fixes",
+      "highlights": [
+        "NEW: 'Check for Updates' button in the update dropdown \u2014 no more guessing, click to check.",
+        "NEW: Release notes now display in the update dropdown \u2014 see what changed before installing.",
+        "FIX: Update backup recursion bug \u2014 backups directory was backing up itself infinitely, causing update failure.",
+        "FIX: Update server connection \u2014 added User-Agent header to fix 403 errors from release server.",
+        "FIX: Correct PORTAL_UPDATE_TOKEN handling \u2014 env var takes precedence over .env file."
+      ]
+    },
+    {
+      "version": "2.1.0",
+      "date": "2026-06-03",
+      "title": "Module Extraction, Notifications, Inbox, Voice/TTS",
+      "highlights": [
+        "ARCHITECTURE: Split portal_server.py into 7 focused modules \u2014 portal_config, portal_updates, portal_referrals, portal_constitution, portal_gdrive, portal_investor, portal_tgim.",
+        "NEW: Inbox 'Mark All Read' button \u2014 marks all unread threads as read via AgentMail labels API.",
+        "NEW: Notification 'Clear All' button \u2014 wipe all notifications in one click.",
+        "NEW: Notifications auto-prune after 24 hours \u2014 list self-cleans.",
+        "NEW: Chat TTS toggle \u2014 speaker button reads all AI responses aloud (browser TTS or ElevenLabs).",
+        "NEW: Chat voice input \u2014 mic button does speech-to-text directly into the composer.",
+        "NEW: Let's Talk panel restored to sidebar.",
+        "FIX: Notification clicks now navigate to correct panel (inbox, CC) via panel:subtab routing.",
+        "FIX: Notification panel no longer appears behind docked chat.",
+        "FIX: 'Unknown' sender names in notifications \u2014 now parses AgentMail senders array.",
+        "FIX: False '30 new emails' notification on every page refresh eliminated.",
+        "FIX: Notification dedup \u2014 identical alerts suppressed within 5-minute window.",
+        "FIX: ToDo timestamps showing 'NaNd ago' \u2014 timezone offset parsing fixed.",
+        "FIX: ToDo panels disappearing on tab switch \u2014 MutationObserver re-renders correctly.",
+        "FIX: ToDo column alignment \u2014 equal flex distribution instead of fixed width.",
+        "FIX: Voice/TTS no longer bleeds from Let's Talk into regular chat.",
+        "FIX: Missing imports in extracted modules that broke chat system and PayPal payouts."
+      ]
+    },
     {
       "version": "1.4.1",
       "date": "2026-04-23",
       "title": "Update UX + Backup-and-Update Option",
       "highlights": [
-        "NEW: 'Update Anyway' button — when blocked by tracked file changes, backs up modified files to backups/pre-update/ then proceeds with update. Changes are recoverable.",
-        "UX: Error messages are now persistent — stay visible until user clicks Check for Updates again.",
+        "NEW: 'Update Anyway' button \u2014 when blocked by tracked file changes, backs up modified files to backups/pre-update/ then proceeds with update. Changes are recoverable.",
+        "UX: Error messages are now persistent \u2014 stay visible until user clicks Check for Updates again.",
         "UX: Error messages styled with red background/border for better visibility.",
         "UX: When blocked by uncommitted changes, shows exact file list and migration guidance.",
-        "FIX: Version display now shows actual version (was showing 1.2.0-flux2 due to config override)."
+        "FIX: Version display now shows actual version (was showing stale version due to config override)."
       ]
     },
     {
@@ -18,16 +499,16 @@
       "date": "2026-04-22",
       "title": "Update Safety & Portal Mod Protocol",
       "highlights": [
-        "NEW: Portal Mod Protocol — mandatory skill teaching AiCIVs the proper way to modify their portal so customizations survive updates (skills/core/portal-mod-protocol/SKILL.md).",
-        "NEW: Startup health check — detects tracked file modifications on boot and warns with specific migration guidance.",
-        "NEW: GET /api/health/mods — API endpoint showing which files have local modifications and how to migrate them to the custom/ overlay system.",
-        "NEW: Skills directory with core/local split — core/ ships with updates, everything else is gitignored and protected.",
-        "SECURITY: Fixed critical lock race condition in update mechanism — concurrent update requests can no longer corrupt git state.",
-        "SAFETY: Shim survival check — update now verifies the custom overlay system marker survives git pull, rolls back if missing.",
-        "SAFETY: Mandatory tests — updates abort if test files are missing (no skip path).",
-        "SAFETY: Panel injection validation — missing HTML markers now produce specific warnings instead of silent failures.",
-        "SAFETY: Watchdog detection — portal detects process manager before self-restart, falls back to exec restart if none found.",
-        "SAFETY: Smarter update blocker — shows specific modified files and migration guidance instead of generic error.",
+        "NEW: Portal Mod Protocol \u2014 mandatory skill teaching AiCIVs the proper way to modify their portal so customizations survive updates (skills/core/portal-mod-protocol/SKILL.md).",
+        "NEW: Startup health check \u2014 detects tracked file modifications on boot and warns with specific migration guidance.",
+        "NEW: GET /api/health/mods \u2014 API endpoint showing which files have local modifications and how to migrate them to the custom/ overlay system.",
+        "NEW: Skills directory with core/local split \u2014 core/ ships with updates, everything else is gitignored and protected.",
+        "SECURITY: Fixed critical lock race condition in update mechanism \u2014 concurrent update requests can no longer corrupt git state.",
+        "SAFETY: Shim survival check \u2014 update now verifies the custom overlay system marker survives git pull, rolls back if missing.",
+        "SAFETY: Mandatory tests \u2014 updates abort if test files are missing (no skip path).",
+        "SAFETY: Panel injection validation \u2014 missing HTML markers now produce specific warnings instead of silent failures.",
+        "SAFETY: Watchdog detection \u2014 portal detects process manager before self-restart, falls back to exec restart if none found.",
+        "SAFETY: Smarter update blocker \u2014 shows specific modified files and migration guidance instead of generic error.",
         "INFRA: Update logs now persist to logs/update.log instead of /tmp (survives reboots).",
         "TEST: 49 new safety tests covering lock discipline, shim survival, panel injection, watchdog detection, and behavioral scenarios (88 total update-related tests)."
       ]
@@ -37,17 +518,17 @@
       "date": "2026-04-16",
       "title": "Referral System Security Hardening",
       "highlights": [
-        "SECURITY: Bearer token no longer accepted as URL query parameter on referral endpoints — prevents token leakage to logs and browser history.",
+        "SECURITY: Bearer token no longer accepted as URL query parameter on referral endpoints \u2014 prevents token leakage to logs and browser history.",
         "SECURITY: Referral completion endpoint now supports shared secret verification (REFERRAL_COMPLETE_SECRET) to prevent unauthorized referral inflation.",
-        "SECURITY: Payout balance check no longer falls through on database errors — returns 503 instead of allowing unverified payouts.",
-        "SECURITY: Payout balance now correctly deducts previously completed payouts — prevents re-claiming the same earnings.",
+        "SECURITY: Payout balance check no longer falls through on database errors \u2014 returns 503 instead of allowing unverified payouts.",
+        "SECURITY: Payout balance now correctly deducts previously completed payouts \u2014 prevents re-claiming the same earnings.",
         "SECURITY: Rate limiting added to /api/referral/login (was missing, only /session had it).",
         "SECURITY: First-time password claims now logged and notified via Telegram for account takeover detection.",
         "SECURITY: All token and password comparisons now use constant-time hmac.compare_digest to prevent timing attacks.",
-        "SECURITY: /api/referral/code/{email} now requires authentication — prevents email enumeration.",
-        "SECURITY: Password-in-URL query param removed from dashboard endpoint — use session tokens instead.",
+        "SECURITY: /api/referral/code/{email} now requires authentication \u2014 prevents email enumeration.",
+        "SECURITY: Password-in-URL query param removed from dashboard endpoint \u2014 use session tokens instead.",
         "SECURITY: Removed dead _check_admin_auth function that would accept any non-empty token.",
-        "INFRA: Payout tracking migrated from JSONL flat file to SQLite — eliminates race condition on concurrent payout requests.",
+        "INFRA: Payout tracking migrated from JSONL flat file to SQLite \u2014 eliminates race condition on concurrent payout requests.",
         "INFRA: 6 performance indexes added to referral database for leaderboard, rewards, clicks, and commission queries.",
         "INFRA: New financial_audit_log table provides immutable audit trail for all payout and admin operations.",
         "INFRA: New payout_requests table with automatic one-time migration from existing JSONL file.",
@@ -59,22 +540,22 @@
       "date": "2026-04-02",
       "title": "Agent Control Hub + Referral Fix",
       "highlights": [
-        "NEW: Agent Control Hub — collapsible sidebar with real-time agent status, context/usage gauges, live agent list, and quick actions (kill, restart, compact, diagnostics, resume, continue).",
-        "NEW: 6 backend endpoints for hub data — /api/hub/tasks, /api/hub/weekly-usage, /api/hub/live-agents, /api/debug/report, /api/continue, /api/restart.",
-        "NEW: Auto-refresh every 30 seconds — agent status stays live without manual reload.",
+        "NEW: Agent Control Hub \u2014 collapsible sidebar with real-time agent status, context/usage gauges, live agent list, and quick actions (kill, restart, compact, diagnostics, resume, continue).",
+        "NEW: 6 backend endpoints for hub data \u2014 /api/hub/tasks, /api/hub/weekly-usage, /api/hub/live-agents, /api/debug/report, /api/continue, /api/restart.",
+        "NEW: Auto-refresh every 30 seconds \u2014 agent status stays live without manual reload.",
         "NEW: Floating toggle button (bottom-right) to open/close the hub panel.",
-        "FIX: Referral leaderboard SQL bug — cartesian product causing inflated counts (8 referrals showing as 64). Now uses pre-aggregated subqueries.",
+        "FIX: Referral leaderboard SQL bug \u2014 cartesian product causing inflated counts (8 referrals showing as 64). Now uses pre-aggregated subqueries.",
         "SECURITY: XSS protection on all hub dynamic content via HTML escaping.",
-        "All new CSS namespaced (agent-hub-*) — zero risk of style conflicts with existing panels.",
-        "Graceful degradation — hub features show 'Unavailable' if backend endpoints missing on older servers."
+        "All new CSS namespaced (agent-hub-*) \u2014 zero risk of style conflicts with existing panels.",
+        "Graceful degradation \u2014 hub features show 'Unavailable' if backend endpoints missing on older servers."
       ]
     },
     {
       "version": "1.2.4",
       "date": "2026-03-25",
-      "title": "Update Flow QA — User-Initiated Only",
+      "title": "Update Flow QA \u2014 User-Initiated Only",
       "highlights": [
-        "Updates are now fully user-initiated — no auto-check on page load.",
+        "Updates are now fully user-initiated \u2014 no auto-check on page load.",
         "Users must click Check for Updates in settings to detect new versions.",
         "Prevents silent updates that bypass confirmation and progress display."
       ]
@@ -114,11 +595,11 @@
       "date": "2026-03-24",
       "title": "Safe In-Portal Update Mechanism",
       "highlights": [
-        "One-click updates from settings — check for and apply portal updates without leaving the browser.",
-        "11-step safe update with rollback — stash, pull, verify, restart with automatic rollback on failure.",
-        "Auto-check every 24 hours — portal silently checks for new versions and shows a notification badge.",
-        "Fast-forward only pulls — refuses force-pushes and non-linear history to protect local changes.",
-        "Watchdog-aware restart — coordinates with the portal watchdog for zero-downtime restarts."
+        "One-click updates from settings \u2014 check for and apply portal updates without leaving the browser.",
+        "11-step safe update with rollback \u2014 stash, pull, verify, restart with automatic rollback on failure.",
+        "Auto-check every 24 hours \u2014 portal silently checks for new versions and shows a notification badge.",
+        "Fast-forward only pulls \u2014 refuses force-pushes and non-linear history to protect local changes.",
+        "Watchdog-aware restart \u2014 coordinates with the portal watchdog for zero-downtime restarts."
       ]
     },
     {
@@ -126,26 +607,26 @@
       "date": "2026-03-23",
       "title": "Custom Overlay Architecture & Reliability Upgrades",
       "highlights": [
-        "Custom Overlay Architecture — add panels, API routes, and config overrides without editing core portal files. Customizations survive upstream updates.",
-        "Skills Shop Panel Support — new custom panel system with runtime HTML injection. Drop self-contained HTML files into custom/panels/.",
-        "Config Override System — custom/config.json overrides portal globals (e.g., MAX_TOKENS for 1M context window).",
-        "Custom API Routes — custom/routes.py adds endpoints under the /api/custom/ namespace.",
-        "Template Files — .template files included as starting points for all customization types.",
-        "Bidirectional Telegram Bridge — Telegram messages now inject into the Claude session and stream responses back (previously one-way only).",
-        "Portal Watchdog — automatic restart on crash detection with health checks every 30 seconds.",
-        "Context Bar Fix — now correctly shows usage against the 1M token window (was showing against 200K).",
-        "Files Panel Fix — directory listing now works correctly with the backend API format.",
-        "File Download Auth Fix — downloads now properly authenticate via query parameter tokens.",
-        "68-test Suite Merged — comprehensive test coverage for API auth, database integrity, and frontend structure.",
-        "switchPanel Hook — custom panels integrate seamlessly with the existing panel switching system."
+        "Custom Overlay Architecture \u2014 add panels, API routes, and config overrides without editing core portal files. Customizations survive upstream updates.",
+        "Skills Shop Panel Support \u2014 new custom panel system with runtime HTML injection. Drop self-contained HTML files into custom/panels/.",
+        "Config Override System \u2014 custom/config.json overrides portal globals (e.g., MAX_TOKENS for 1M context window).",
+        "Custom API Routes \u2014 custom/routes.py adds endpoints under the /api/custom/ namespace.",
+        "Template Files \u2014 .template files included as starting points for all customization types.",
+        "Bidirectional Telegram Bridge \u2014 Telegram messages now inject into the Claude session and stream responses back (previously one-way only).",
+        "Portal Watchdog \u2014 automatic restart on crash detection with health checks every 30 seconds.",
+        "Context Bar Fix \u2014 now correctly shows usage against the 1M token window (was showing against 200K).",
+        "Files Panel Fix \u2014 directory listing now works correctly with the backend API format.",
+        "File Download Auth Fix \u2014 downloads now properly authenticate via query parameter tokens.",
+        "68-test Suite Merged \u2014 comprehensive test coverage for API auth, database integrity, and frontend structure.",
+        "switchPanel Hook \u2014 custom panels integrate seamlessly with the existing panel switching system."
       ]
     },
     {
       "version": "1.0.1",
       "date": "2026-03-17",
-      "title": "Aether Portal — Full Codebase Drop",
+      "title": "PureBrain Portal \u2014 Full Codebase Drop",
       "highlights": [
-        "Complete portal rewrite by Aether (Jared Sanborn)",
+        "Complete portal architecture and initial release",
         "Admin clients dashboard (admin-clients.html)",
         "Admin referrals management (admin-referrals.html)",
         "Affiliate portal (affiliate-portal.html)",

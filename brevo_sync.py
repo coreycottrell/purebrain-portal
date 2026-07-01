@@ -14,6 +14,11 @@ import urllib.parse
 import urllib.request
 from typing import Optional
 
+try:
+    from portal_config import CIV_NAME
+except Exception:
+    CIV_NAME = os.environ.get("CIV_NAME", "")
+
 
 BREVO_API_URL = "https://api.brevo.com/v3"
 SHARED_CONFIG_URL = "https://cc.purebrain.ai/api/config/shared-keys"
@@ -87,18 +92,21 @@ def _notify_sync_failure(email: str, event_name: str, error: str) -> None:
             f"Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
         )
 
+        civ_email = f"{CIV_NAME}.civ@agentmail.to" if CIV_NAME else ""
+        if not civ_email:
+            return  # No CIV identity configured -- skip notification
+
         payload = {
             "to": [
-                {"email": "lyra-pmg@agentmail.to"},
-                {"email": "aethergottaeat@agentmail.to"},
+                {"email": civ_email},
             ],
-            "from": {"email": "flux.civ@agentmail.to", "name": "Flux2 Portal"},
+            "from": {"email": civ_email, "name": f"{CIV_NAME} Portal"},
             "subject": subject,
             "text": body,
         }
 
         req = urllib.request.Request(
-            "https://api.agentmail.to/v0/inboxes/flux.civ@agentmail.to/messages",
+            f"https://api.agentmail.to/v0/inboxes/{civ_email}/messages",
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Authorization": f"Bearer {agentmail_key}",

@@ -1,5 +1,5 @@
 #!/bin/bash
-# portal_send_file.sh — Send a file into the portal chat as an Aether message
+# portal_send_file.sh — Send a file into the portal chat as an AI message
 # Usage: ./portal_send_file.sh /path/to/file.md "Optional caption message"
 # Usage: ./portal_send_file.sh --text "Just a text message, no file"
 #

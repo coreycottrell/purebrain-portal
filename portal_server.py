@@ -2,12 +2,26 @@
 """PureBrain Portal Server — per-CIV mini server for purebrain.ai
 Auth via Bearer token. JSONL-based chat history (same as TG bot).
 """
+# Pre-flight dependency check — fail fast with clear instructions
+import importlib.util
+_REQUIRED = ["httpx", "aiosqlite", "starlette", "uvicorn"]
+_missing = [p for p in _REQUIRED if not importlib.util.find_spec(p)]
+if _missing:
+    print(f"[portal] FATAL: Missing packages: {', '.join(_missing)}")
+    print(f"[portal] Fix: pip install {' '.join(_missing)}")
+    import sys; sys.exit(1)
+
 import asyncio
 import concurrent.futures
 import hashlib
 import hmac
 import json
 import os
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
 import re
 import secrets
 import shutil
@@ -48,297 +62,94 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-
 # ---------------------------------------------------------------------------
-# Thread-pool safety net + fire-and-forget task tracking (prevents exhaustion)
+# Shared config & helpers — imported from portal_config.py
+# All constants, auth helpers, subprocess wrappers, and tmux session cache
+# are defined there as the single source of truth.
 # ---------------------------------------------------------------------------
-_PORTAL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=32, thread_name_prefix="portal"
+from portal_config import (
+    # Thread pool + background task tracking
+    PORTAL_EXECUTOR as _PORTAL_EXECUTOR,
+    background_tasks as _background_tasks,
+    fire_and_forget as _fire_and_forget,
+    # Config constants
+    SCRIPT_DIR, TOKEN_FILE, PORTAL_HTML, PORTAL_PB_HTML, REACT_DIST,
+    START_TIME, PORTAL_VERSION, RELEASE_NOTES_FILE,
+    CIV_NAME, HUMAN_NAME,
+    _PROJECTS_DIR, LOG_ROOT, HISTORY_FILE, PORTAL_CHAT_LOG,
+    UPLOADS_DIR, UPLOAD_MAX_BYTES,
+    PAYOUT_REQUESTS_FILE, PAYOUT_MIN_AMOUNT, PAYOUT_AUTO_APPROVE_LIMIT,
+    PAYOUT_COOLDOWN_DAYS,
+    REFERRALS_DB, CLIENTS_DB, AGENTS_DB,
+    REFERRAL_CODE_PREFIX, REFERRAL_CODE_CHARS, REFERRAL_CODE_LENGTH,
+    REFERRAL_COMMISSION_RATE,
+    WEB_CONVERSATIONS_LOG, PAYMENTS_LOG, PAY_TEST_LOG,
+    DOWNLOAD_ALLOWED_DIRS,
+    CREDENTIALS_FILE, OAUTH_URL_PATTERN,
+    AUTH_SCREEN_PATTERNS, AUTH_SCREEN_PRIORITY,
+    BEARER_TOKEN,
+    PAYPAL_SANDBOX, PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET,
+    # Helpers
+    sanitize_error as _sanitize_error,
+    run_subprocess_sync as _run_subprocess_sync,
+    run_subprocess_async as _run_subprocess_async,
+    run_subprocess_output as _run_subprocess_output,
+    get_tmux_session,
+    check_auth, check_auth_and_track,
 )
-# Track background tasks so they don't get GC'd and we can monitor accumulation
-_background_tasks: set = set()
 
-def _fire_and_forget(coro):
-    """Schedule a coroutine as a tracked background task that auto-cleans."""
-    task = asyncio.ensure_future(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-    return task
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-SCRIPT_DIR = Path(__file__).parent
-TOKEN_FILE = SCRIPT_DIR / ".portal-token"
-PORTAL_HTML = SCRIPT_DIR / "portal.html"
-PORTAL_PB_HTML = SCRIPT_DIR / "portal-pb-styled.html"
-REACT_DIST = SCRIPT_DIR / "react-portal" / "dist"
-START_TIME = time.time()
-PORTAL_VERSION = "1.4.1"
-RELEASE_NOTES_FILE = SCRIPT_DIR / "release_notes.json"
-# Auto-detect CIV_NAME and HUMAN_NAME from identity file — works in any fleet container.
-# Falls back to generic defaults if identity file not found (local dev).
-_identity_file = Path.home() / ".aiciv-identity.json"
-try:
-    _identity = json.loads(_identity_file.read_text())
-    CIV_NAME = _identity.get("civ_id", "witness")
-    HUMAN_NAME = _identity.get("human_name", "User")
-except Exception:
-    CIV_NAME = "witness"
-    HUMAN_NAME = "User"
-# Auto-derive Claude project JSONL directory.
-# Claude encodes the PROJECT directory (git root) by replacing '/' with '-'.
-# We scan ALL project directories for JSONL files to find the active one.
-_PROJECTS_DIR = Path.home() / ".claude" / "projects"
-# Primary LOG_ROOT: try the most recently modified project directory
-LOG_ROOT = _PROJECTS_DIR  # fallback — _get_all_session_log_paths handles the real search
-HISTORY_FILE = Path.home() / ".claude" / "history.jsonl"
-PORTAL_CHAT_LOG = SCRIPT_DIR / "portal-chat.jsonl"
-UPLOADS_DIR = Path.home() / "portal_uploads"
-UPLOADS_DIR.mkdir(exist_ok=True)
-UPLOAD_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
-PAYOUT_REQUESTS_FILE = SCRIPT_DIR / "payout-requests.jsonl"
-# Paths to Aether log files used for client data import
-_AETHER_LOG_ROOT = Path.home() / "projects" / "AI-CIV" / "aether" / "logs"
-WEB_CONVERSATIONS_LOG = _AETHER_LOG_ROOT / "purebrain_web_conversations.jsonl"
-PAYMENTS_LOG          = _AETHER_LOG_ROOT / "purebrain_payments.jsonl"
-PAY_TEST_LOG          = _AETHER_LOG_ROOT / "purebrain_pay_test.jsonl"
-PAYOUT_MIN_AMOUNT = 25.0   # minimum payout threshold ($)
-PAYOUT_AUTO_APPROVE_LIMIT = 1000.0  # auto-approve payouts up to this amount; above requires manual approval
-PAYOUT_COOLDOWN_DAYS = 30  # days between payout requests
-REFERRALS_DB = SCRIPT_DIR / "referrals.db"
-CLIENTS_DB   = SCRIPT_DIR / "clients.db"
-AGENTS_DB    = SCRIPT_DIR / "agents.db"
-REFERRAL_CODE_PREFIX = "PB-"
-REFERRAL_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no ambiguous chars
-REFERRAL_CODE_LENGTH = 4
-REFERRAL_COMMISSION_RATE = 0.05  # 5% recurring commission on every payment from referred members
-
-# Allowed directories for file downloads (generic — works in any customer container)
-DOWNLOAD_ALLOWED_DIRS = [
-    Path.home() / "exports",
-    Path.home() / "to-human",
-    Path.home() / "purebrain_portal",
-    Path.home() / "from-acg",
-    Path.home() / "portal_uploads",
-]
-
-# OAuth flow state
-CREDENTIALS_FILE = Path.home() / ".claude" / ".credentials.json"
-OAUTH_URL_PATTERN = re.compile(r'https://[^\s\x1b\x07\]]*oauth/authorize\?[^\s\x1b\x07\]]+')
+# ─── Mutable state that stays in portal_server.py (not shared yet) ─────────
 _captured_oauth_url = None
 _auth_prewarm_task = None  # background prewarm task handle
 _auth_flow_running = False  # lock to prevent concurrent auth flows
 
-# Auth flow v2 — screen detection patterns for state machine
-AUTH_SCREEN_PATTERNS = {
-    'oauth_url': OAUTH_URL_PATTERN,
-    'login_menu': re.compile(
-        r'Select login method|Use OAuth|How would you like to authenticate',
-        re.IGNORECASE,
-    ),
-    'csat_survey': re.compile(
-        r'How is Claude doing\?|rate your experience|satisfaction survey|'
-        r'How would you rate|thumbs up|Would you recommend',
-        re.IGNORECASE,
-    ),
-    'update_prompt': re.compile(
-        r'Auto-update|update available|Update now\?|new version|'
-        r'would you like to update|upgrade available',
-        re.IGNORECASE,
-    ),
-    'trust_folder': re.compile(
-        r'Do you trust the authors|trust this (?:project|folder)|'
-        r'Trust this project|Do you want to trust',
-        re.IGNORECASE,
-    ),
-    'theme_picker': re.compile(
-        r'Choose (?:the |your )?(?:text )?style|'
-        r'Select (?:a |your )?theme|'
-        r'Dark mode|Light text on dark background|'
-        r"Let's get started",
-        re.IGNORECASE,
-    ),
-    'logged_in': re.compile(
-        r'Logged in as|Login successful|Successfully authenticated|'
-        r'You are now logged in',
-        re.IGNORECASE,
-    ),
-    'shell_prompt': re.compile(
-        r'(?:aiciv@|[$#])\s*$',
-        re.MULTILINE,
-    ),
-    'error': re.compile(
-        r'(?:Error|ENOENT|crash|fatal|SIGTERM|SIGKILL|panic|'
-        r'Cannot connect|Connection refused)',
-        re.IGNORECASE,
-    ),
-}
-AUTH_SCREEN_PRIORITY = [
-    'oauth_url', 'logged_in', 'csat_survey', 'update_prompt',
-    'trust_folder', 'theme_picker', 'login_menu', 'error', 'shell_prompt',
-]
 
-if TOKEN_FILE.exists():
-    BEARER_TOKEN = TOKEN_FILE.read_text().strip()
-else:
-    BEARER_TOKEN = secrets.token_urlsafe(32)
-    TOKEN_FILE.write_text(BEARER_TOKEN)
-    TOKEN_FILE.chmod(0o600)
-    print(f"[portal] Generated new bearer token (saved to {TOKEN_FILE})")
+def _detect_session_model() -> str:
+    """Detect the live model from ~/.claude_session_model or session transcript."""
+    model_file = Path.home() / ".claude_session_model"
 
-# ─── Affiliate login rate-limiting (in-memory, resets on restart) ───────────
-# { ip_hash: {"count": N, "window_start": epoch_float} }
-_AFFILIATE_LOGIN_ATTEMPTS: dict = {}
-_LOGIN_MAX_ATTEMPTS = 10          # per window
-_LOGIN_WINDOW_SECS  = 900         # 15 minutes
-
-# ─── Affiliate session tokens: { token: {"code": ..., "expires": epoch} } ───
-_AFFILIATE_SESSIONS: dict = {}
-_SESSION_TTL_SECS = 86400 * 7     # 7 days
-
-# ─── Referral track rate-limiting (prevents click-spam abuse) ────────────────
-_TRACK_RATE_LIMITS: dict = {}  # ip_hash -> {"count": N, "window_start": epoch}
-_TRACK_MAX_PER_WINDOW = 30    # max clicks per IP per window
-_TRACK_WINDOW_SECS = 300      # 5-minute window
-
-# ─── PayPal credentials ───────────────────────────────────────────────────────
-PAYPAL_SANDBOX = os.environ.get("PAYPAL_SANDBOX", "true").lower() != "false"
-if PAYPAL_SANDBOX:
-    PAYPAL_CLIENT_ID     = os.environ.get("PAYPAL_SANDBOX_CLIENT_ID", os.environ.get("PAYPAL_CLIENT_ID", ""))
-    PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_SANDBOX_SECRET", os.environ.get("PAYPAL_SECRET", ""))
-else:
-    PAYPAL_CLIENT_ID     = os.environ.get("PAYPAL_CLIENT_ID", "")
-    PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_SECRET", "")
-
-
-def _run_subprocess_sync(cmd, timeout=5, check=False, capture=False, text=False):
-    """Run a subprocess with mandatory timeout. Used by sync callers only."""
-    try:
-        return subprocess.run(
-            cmd, timeout=timeout, check=check,
-            capture_output=capture, text=text,
-            stderr=subprocess.DEVNULL if not capture else None,
-        )
-    except subprocess.TimeoutExpired:
-        return None
-    except subprocess.CalledProcessError:
-        return None
-    except Exception:
-        return None
-
-
-async def _run_subprocess_async(cmd, timeout=5, check=False):
-    """Run a subprocess WITHOUT blocking the asyncio event loop.
-    Uses asyncio.create_subprocess_exec — avoids the thread pool entirely."""
-    try:
-        proc = await asyncio.wait_for(
-            asyncio.create_subprocess_exec(
-                *[str(c) for c in cmd],
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            ),
-            timeout=timeout + 2,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        if check and proc.returncode != 0:
-            print(f"[portal] WARN subprocess error (rc={proc.returncode}): {' '.join(str(c) for c in cmd)} stderr={stderr}")
-            return None
-        # Return a subprocess.CompletedProcess for API compatibility
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=proc.returncode, stdout=stdout, stderr=stderr,
-        )
-    except asyncio.TimeoutError:
-        print(f"[portal] WARN _run_subprocess_async timeout: {' '.join(str(c) for c in cmd)}")
-        return None
-    except Exception as e:
-        print(f"[portal] WARN _run_subprocess_async unexpected {type(e).__name__}: {e} cmd={' '.join(str(c) for c in cmd)}")
-        return None
-
-
-async def _run_subprocess_output(cmd, timeout=5):
-    """Run subprocess and capture output without blocking the event loop.
-    Uses asyncio.create_subprocess_exec — avoids the thread pool entirely."""
-    try:
-        proc = await asyncio.wait_for(
-            asyncio.create_subprocess_exec(
-                *[str(c) for c in cmd],
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            ),
-            timeout=timeout + 2,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        return stdout.decode() if proc.returncode == 0 else ""
-    except (asyncio.TimeoutError, Exception):
-        return ""
-
-
-# Cached tmux session name — refreshed every 30s to avoid repeated subprocess calls
-_tmux_session_cache: tuple = (0.0, "")  # (last_check_time, session_name)
-_TMUX_CACHE_TTL = 30.0
-
-
-def get_tmux_session() -> str:
-    """Find the live primary Claude Code session for this container.
-    Result is cached for 30s to avoid hammering tmux."""
-    global _tmux_session_cache
-    now = time.time()
-    if now - _tmux_session_cache[0] < _TMUX_CACHE_TTL and _tmux_session_cache[1]:
-        return _tmux_session_cache[1]
-
-    def alive(name):
+    # 1. Try the model file first (if fresh — less than 7 days old)
+    if model_file.exists():
         try:
-            subprocess.check_output(["tmux", "has-session", "-t", name],
-                                    stderr=subprocess.DEVNULL, timeout=3)
-            return True
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return False
-
-    result = None
-
-    # FIRST: Find the currently attached session — mirrors telegram_bridge logic.
-    try:
-        out = subprocess.check_output(
-            ["tmux", "list-sessions", "-F", "#{session_name}:#{session_attached}"],
-            stderr=subprocess.DEVNULL, text=True, timeout=3
-        )
-        for line in out.splitlines():
-            parts = line.strip().rsplit(":", 1)
-            if len(parts) == 2 and parts[1].strip().isdigit() and int(parts[1].strip()) > 0:
-                attached = parts[0].strip()
-                if attached:
-                    result = attached
-                    break
-    except Exception:
-        pass
-
-    if not result:
-        marker = Path.home() / ".current_session"
-        if marker.exists():
-            name = marker.read_text().strip()
-            if name and alive(name):
-                result = name
-
-    if not result:
-        try:
-            out = subprocess.check_output(["tmux", "list-sessions", "-F", "#{session_name}"],
-                                          stderr=subprocess.DEVNULL, text=True, timeout=3)
-            sessions = out.strip().splitlines()
-            for line in sessions:
-                if CIV_NAME in line.lower():
-                    result = line.strip()
-                    break
-            if not result and sessions:
-                result = sessions[0].strip()
+            age_days = (time.time() - os.path.getmtime(str(model_file))) / 86400
+            if age_days < 7:
+                val = model_file.read_text().strip()
+                if val:
+                    return val
         except Exception:
             pass
 
-    if not result:
-        result = f"{CIV_NAME}-primary"
+    # 2. Try to detect from the current session JSONL transcript
+    session_ledger = Path.home() / "memories" / "sessions" / "current-session.jsonl"
+    if session_ledger.exists():
+        try:
+            with open(session_ledger, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 10240))
+                tail = f.read().decode("utf-8", errors="replace")
+            models = re.findall(r'"model"\s*:\s*"(claude-[^"]+)"', tail)
+            if models:
+                detected = models[-1]
+                try:
+                    model_file.write_text(detected)
+                except Exception:
+                    pass
+                return detected
+        except Exception:
+            pass
 
-    _tmux_session_cache = (now, result)
-    return result
+    # 3. Try reading the model file even if stale (better than nothing)
+    if model_file.exists():
+        try:
+            val = model_file.read_text().strip()
+            if val:
+                return val
+        except Exception:
+            pass
+
+    # 4. Final fallback
+    return "claude-opus-4-6[1m]"
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +194,10 @@ async def _flush_upload_batch():
 
     if len(batch) == 1:
         item = batch[0]
-        parts = [f"[Portal Upload from {HUMAN_NAME}] File saved to: {item['portal_copy_path']}"]
+        parts = []
+        if item.get("upload_id"):
+            parts.append(f"[upload_id:{item['upload_id']}]")
+        parts.append(f"[Portal Upload from {HUMAN_NAME}] File saved to: {item['portal_copy_path']}")
         if item["caption"]:
             parts.append(f"INSTRUCTIONS from {HUMAN_NAME}: {item['caption']}")
         if item["is_image"]:
@@ -395,7 +209,12 @@ async def _flush_upload_batch():
         image_paths = [str(f["portal_copy_path"]) for f in batch if f["is_image"]]
         non_image_paths = [str(f["portal_copy_path"]) for f in batch if not f["is_image"]]
 
-        parts = [f"[Portal Upload from {HUMAN_NAME}] {file_count} files saved: {file_names}"]
+        # Embed all upload_ids so each can be deduped against its portal log entry
+        upload_ids = [f["upload_id"] for f in batch if f.get("upload_id")]
+        parts = []
+        for uid in upload_ids:
+            parts.append(f"[upload_id:{uid}]")
+        parts.append(f"[Portal Upload from {HUMAN_NAME}] {file_count} files saved: {file_names}")
 
         shared_caption = next((f["caption"] for f in batch if f["caption"]), "")
         if shared_caption:
@@ -412,10 +231,17 @@ async def _flush_upload_batch():
 
         notification = " ".join(parts)
 
-    await _inject_into_tmux_serialized(notification)
+    print(f"[upload-inject] Injecting upload notification ({len(notification)} chars)")
+    result = await _inject_into_tmux_serialized(notification)
+    if not result:
+        print(f"[upload-inject] WARNING: tmux injection returned False — notification may not have been delivered")
+        print(f"[upload-inject] Notification: {notification[:300]}")
+        # Fallback: save to portal log so AI sees it on next history read
+        _save_portal_message(notification, role="user")
+        print(f"[upload-inject] Fallback: saved notification to portal-chat.jsonl")
 
 
-def _schedule_upload_batch_item(original_name, portal_copy_path, is_image, caption):
+def _schedule_upload_batch_item(original_name, portal_copy_path, is_image, caption, upload_id=None):
     """Add one upload to the debounce batch and (re)start the flush timer."""
     global _upload_batch, _upload_batch_task
 
@@ -424,6 +250,7 @@ def _schedule_upload_batch_item(original_name, portal_copy_path, is_image, capti
         "portal_copy_path": portal_copy_path,
         "is_image": is_image,
         "caption": caption,
+        "upload_id": upload_id,
     })
 
     if _upload_batch_task is not None and not _upload_batch_task.done():
@@ -446,7 +273,7 @@ async def _inject_into_tmux_serialized(notification):
     """
     lock = _get_tmux_inject_lock()
     async with lock:
-        session = get_tmux_session()
+        session = await _find_primary_pane_async()
         try:
             # Leading newline clears any partial input already in the tmux buffer
             await _run_subprocess_async(
@@ -473,7 +300,10 @@ async def _inject_into_tmux_serialized(notification):
             # 1.5s is enough for Claude to register the message without being overwhelmed.
             await asyncio.sleep(1.5)
             return True
-        except Exception:
+        except Exception as e:
+            print(f"[upload-inject] tmux injection FAILED: {e}")
+            print(f"[upload-inject] Session target was: {session}")
+            print(f"[upload-inject] Notification (first 200 chars): {notification[:200]}")
             return False
 
 
@@ -616,6 +446,12 @@ def _is_real_user_message(text):
         "Compacted (ctrl+o",           # Compaction messages
         "&& [ -x ", "| cut -d",        # Shell code fragments
         "[portal",                     # Portal messages from session JSONL (already in portal-chat.jsonl)
+        "[Portal Upload",              # Portal upload notifications (case-sensitive variant, already in portal-chat.jsonl)
+        "[upload_id:",                 # Upload dedup tags from tmux injection (internal, not user-facing)
+        "[CC #", "[CC-DM",            # CC bridge messages — belong in CC tab, not main chat
+        "[WAR-ROOM]", "[WAR-ROOM-RESPONSE]", "[WAR-ROOM-PREFLIGHT",
+        "[WAR-ROOM-STAND-DOWN]", "[WAR-ROOM-UPDATE]",
+        "[GENERATE-TASKS]",            # CC forge messages
     ]
     for marker in noise_markers:
         if marker in text[:300]:
@@ -652,12 +488,23 @@ def _is_real_assistant_message(text):
     # Reject short non-alphanumeric noise (pipes, brackets, stray chars)
     if len(stripped) <= 3 and not any(c.isalnum() for c in stripped):
         return False
+    # Filter assistant messages that are just echoing/summarizing CC messages.
+    # These belong in the CC tab, not the main chat.
+    _cc_assistant_markers = [
+        "[CC #", "[CC-DM",                     # Raw CC messages echoed
+        "CC chatter",                           # Assistant CC summaries
+        "[WAR-ROOM]", "[WAR-ROOM-RESPONSE]",
+        "[GENERATE-TASKS]",
+    ]
+    for marker in _cc_assistant_markers:
+        if marker in text[:300]:
+            return False
     return True
 
 
 _jsonl_cache: dict = {}  # path -> (mtime, messages, fsize, last_parse_time)
 _TAIL_BYTES = 500_000   # read last 500KB of large files (reduced from 2MB — stability fix 2026-03-14)
-_CACHE_MIN_INTERVAL = 10.0  # Don't re-parse any file more than once per 10 seconds (was 3s — CPU stability fix)
+_CACHE_MIN_INTERVAL = 3.0  # Don't re-parse any file more than once per 3 seconds (reduced from 10s — 10s blind spot caused message delivery failures; 3s is safe with max_files=3 + 500KB tail-read)
 
 # Cache for portal-chat.jsonl — avoids re-reading 8k-line file on every /api/chat/history request
 # Tuple: (mtime: float, fsize: int, messages: list)
@@ -752,6 +599,7 @@ def _mirror_to_portal_log(msg):
     try:
         with PORTAL_CHAT_LOG.open("a") as f:
             f.write(json.dumps(msg) + "\n")
+        _invalidate_msg_cache()
     except Exception:
         pass
 
@@ -834,6 +682,7 @@ def _parse_jsonl_messages_from_file(log_path):
                 text_parts = []    # For normal text blocks
                 char_parts = []    # For single-character string blocks
                 is_char_stream = False
+                agent_context = None  # Track agent identity from tool_use blocks
                 for block in content_blocks:
                     if isinstance(block, str):
                         # Single char blocks: preserve spaces for word boundaries
@@ -848,6 +697,37 @@ def _parse_jsonl_messages_from_file(log_path):
                         t = (block.get("text") or "").strip()
                         if t:
                             text_parts.append(t)
+                    elif isinstance(block, dict) and block.get("type") == "tool_use":
+                        tool_name = block.get("name", "")
+                        tool_input = block.get("input", {})
+                        if tool_name == "Agent" and tool_input.get("name"):
+                            agent_context = {"agent": tool_input["name"], "tool": "Agent"}
+                        elif tool_name == "SendMessage" and tool_input.get("to"):
+                            if not agent_context:
+                                agent_context = {"agent": tool_input["to"], "tool": "SendMessage"}
+                    elif isinstance(block, dict) and block.get("type") == "thinking":
+                        thinking_text = block.get("thinking", "")
+                        if thinking_text and len(thinking_text.strip()) > 2:
+                            # Only include recent thinking blocks in history (last 5 min)
+                            # Older thinking is ephemeral - shown in real-time but not on refresh
+                            _think_ts = time.time()
+                            try:
+                                _raw_ts = entry.get("timestamp")
+                                if isinstance(_raw_ts, (int, float)):
+                                    _think_ts = _raw_ts / 1000 if _raw_ts > 1e12 else _raw_ts
+                                elif isinstance(_raw_ts, str):
+                                    _think_ts = datetime.fromisoformat(_raw_ts.replace("Z", "+00:00")).timestamp()
+                                if time.time() - _think_ts > 300:
+                                    continue  # Skip thinking blocks older than 5 minutes
+                            except Exception:
+                                pass  # If we can't parse time, include it
+                            _entry_id = entry.get("uuid", f"think-{len(messages)}")
+                            messages.append({
+                                "role": "thinking",
+                                "text": thinking_text,
+                                "timestamp": int(_think_ts),
+                                "id": f"{_entry_id}-thinking-{len(messages)}",
+                            })
 
                 # Build combined text
                 if is_char_stream and len(char_parts) > 10:
@@ -888,12 +768,31 @@ def _parse_jsonl_messages_from_file(log_path):
                 else:
                     ts = time.time()
 
-                messages.append({
+                # Detect and strip [topic:xxx] prefix from message text
+                _topic = None
+                _topic_match = re.match(r'^\[topic:([^\]]+)\]\s*', combined)
+                if _topic_match:
+                    _raw_topic = _topic_match.group(1)
+                    # Normalize to key format (lowercase, hyphens)
+                    _topic = re.sub(r'[^a-z0-9]+', '-', _raw_topic.lower()).strip('-') or None
+                    combined = combined[_topic_match.end():]
+
+                msg_dict = {
                     "role": role,
                     "text": combined,
                     "timestamp": int(ts),
                     "id": entry.get("uuid", f"msg-{log_path.stem[:8]}-{len(messages)}")
-                })
+                }
+                if _topic:
+                    msg_dict["topic"] = _topic
+                # Agent identity: prefer agentName from JSONL entry, fall back to tool_use detection
+                _agent_name = entry.get("agentName", "")
+                _team_name = entry.get("teamName", "")
+                if _agent_name and _agent_name != "main":
+                    msg_dict["agent_context"] = {"agent": _agent_name, "tool": "team-member"}
+                elif agent_context:
+                    msg_dict["agent_context"] = agent_context
+                messages.append(msg_dict)
     except Exception:
         pass
 
@@ -931,6 +830,17 @@ def _load_portal_messages():
                         continue
                     if len(msg_text) <= 2 and not any(c.isalnum() for c in msg_text):
                         continue  # Skip stray pipe/bracket/noise artifacts
+                    # Thinking is ephemeral -- never include in history
+                    if entry.get("role") == "thinking":
+                        continue
+                    # Skip mirrored session upload notifications — these are internal tmux
+                    # injection artifacts that duplicate the portal-saved [Image: ...] entry.
+                    # They have session UUIDs instead of portal IDs, causing duplicate rendering.
+                    if msg_text.startswith("[upload_id:") or "[Portal Upload" in msg_text[:200]:
+                        continue
+                    # Normalize topic to key format (handles legacy display-name topics)
+                    if entry.get("topic"):
+                        entry["topic"] = re.sub(r'[^a-z0-9]+', '-', entry["topic"].lower()).strip('-') or None
                     messages.append(entry)
                 except json.JSONDecodeError:
                     continue
@@ -941,14 +851,28 @@ def _load_portal_messages():
     return messages
 
 
-def _save_portal_message(text, role="user"):
+def _save_portal_message(text, role="user", topic=None, upload_id=None,
+                         reply_to_id=None, reply_to_text=None, reply_to_author=None):
     """Save a message sent via the portal."""
+    # Thinking blocks are ephemeral -- push via WS only, never persist
+    if role == "thinking":
+        return None
     entry = {
         "role": role,
         "text": text,
         "timestamp": int(time.time()),
         "id": f"portal-{int(time.time() * 1000)}-{secrets.token_hex(4)}",
     }
+    if topic:
+        entry["topic"] = topic
+    if upload_id:
+        entry["upload_id"] = upload_id
+    if reply_to_id:
+        entry["reply_to_id"] = reply_to_id
+        if reply_to_text:
+            entry["reply_to_text"] = reply_to_text
+        if reply_to_author:
+            entry["reply_to_author"] = reply_to_author
     try:
         with PORTAL_CHAT_LOG.open("a") as f:
             f.write(json.dumps(entry) + "\n")
@@ -958,8 +882,26 @@ def _save_portal_message(text, role="user"):
     return entry
 
 
+# Simple in-memory cache for _parse_all_messages to avoid re-parsing JSONL within same poll cycle.
+# Uses a short TTL (2s) so consecutive WS polls within the same cycle reuse the result.
+# The WS poll interval is 1.5s, so a 2s TTL means at most 1 redundant parse per cycle.
+_msg_cache: dict = {"result": None, "ts": 0.0, "last_n": 0}
+_MSG_CACHE_TTL = 2.0  # seconds — short enough to always pick up new data promptly
+
+
+def _invalidate_msg_cache():
+    """Invalidate the message parse cache (call after writes to chat logs)."""
+    _msg_cache["result"] = None
+    _msg_cache["ts"] = 0.0
+
+
 def _parse_all_messages(last_n=100):
     """Parse messages across all recent session logs + portal log."""
+    now = time.time()
+    if (_msg_cache["result"] is not None
+            and _msg_cache["last_n"] == last_n
+            and now - _msg_cache["ts"] < _MSG_CACHE_TTL):
+        return _msg_cache["result"]
     session_msgs = []
     portal_msgs = []
 
@@ -995,102 +937,157 @@ def _parse_all_messages(last_n=100):
             seen_idx[m["id"]] = i
     deduped = [all_messages[i] for i in sorted(seen_idx.values())]
 
-    # Secondary dedup: remove portal-log entries whose cleaned text closely matches
-    # a session-JSONL entry within a 30s window. This prevents the double-message
-    # problem where the same user message appears from both sources (different IDs).
+    # Secondary dedup: remove portal-log entries that duplicate a session-JSONL entry.
     # Portal log is always subordinate — prefer session JSONL text.
-    final: list = []
-    session_texts_by_ts: list = []  # list of (ts, text_lower) from session entries
+    #
+    # Strategy:
+    # 1. upload_id match (reliable, no time window needed) — extract from portal JSON
+    #    field and session text [upload_id:xxx] tag
+    # 2. Fallback: text/pattern match within 30s window (legacy, for old messages)
+
+    # Pass 1: pre-collect all session upload_ids and texts (needed before portal dedup)
+    _upload_id_pattern = re.compile(r'\[upload_id:(upload-[^\]]+)\]')
+    session_upload_ids: set = set()
+    session_texts_by_ts: list = []
     for m in deduped:
         if m['_src'] == 'session':
             session_texts_by_ts.append((m['timestamp'], (m.get('text') or '').strip().lower()))
+            for match in _upload_id_pattern.finditer(m.get('text') or ''):
+                session_upload_ids.add(match.group(1))
+
+    # Pass 2: filter portal entries that match a session entry
+    final: list = []
+    for m in deduped:
+        if m['_src'] == 'session':
             final.append(m)
         else:
-            # Portal entry: check if any session entry within 30s has the same text
-            m_ts = m['timestamp']
-            m_text = (m.get('text') or '').strip().lower()
             is_dup = False
-            for s_ts, s_text in session_texts_by_ts:
-                if abs(m_ts - s_ts) <= 30 and s_text == m_text:
-                    is_dup = True
-                    break
+
+            # Primary dedup: match by upload_id (no time window needed)
+            portal_upload_id = m.get('upload_id')
+            if portal_upload_id and portal_upload_id in session_upload_ids:
+                is_dup = True
+            else:
+                # Fallback: text/pattern match within 30s window (legacy)
+                m_ts = m['timestamp']
+                m_text = (m.get('text') or '').strip().lower()
+                is_upload = '[image:' in m_text or '[file:' in m_text
+                for s_ts, s_text in session_texts_by_ts:
+                    if abs(m_ts - s_ts) <= 30:
+                        if s_text == m_text:
+                            is_dup = True
+                            break
+                        if is_upload and ('[image:' in s_text or 'portal upload' in s_text or 'file saved to' in s_text):
+                            is_dup = True
+                            break
             if not is_dup:
                 final.append(m)
 
     # Re-sort after secondary dedup (insertion order is already correct but be safe)
     final.sort(key=lambda m: m['timestamp'])
 
-    return final[-last_n:] if len(final) > last_n else final
+    # Assign topics to ALL messages based on content analysis
+    # Keywords are weighted: longer/more-specific phrases score higher
+    _TOPIC_KEYWORDS = {
+        "channel-partners": [
+            "channel partner", "prm", "partner management", "commission engine",
+            "deal registration", "partner portal", "partner tier", "mdf",
+            "channel-partner-prm", "admin-portal", "pure ledger",
+        ],
+        "portal": [
+            # UI elements
+            "portal", "chat tab", "cc tab", "hard refresh", "topic tag", "topic pill",
+            "chat box", "chat window", "inbox", "brain stream", "prompt section",
+            "leven labs", "chat-messages", "chat-loading",
+            # Portal code/files
+            "portal-server", "portal_server", "portal-pb-styled", "panels.css",
+            "chat.js", "agents.js", "organogram.js", "panel-manager",
+            # Portal features
+            "topic filter", "topic-dimmed", "topicfilter", "applytopicfilter",
+            "addmessage", "msg-bubble", "msg-meta", "data-topic",
+            "subtab", "sidebar", "deployment tab", "my deployments",
+            # Portal tech
+            ".html", ".css", ".js", "frontend", "stylesheet", "css var",
+            "dom ", "innerhtml", "queryselector", "getelementby", "onclick",
+            "addeventlistener", "classlist",
+        ],
+        "war-room": [
+            "war room", "warroom", "mission control", "d3 graph", "force graph",
+            "fleet endpoint", "stats bar", "agent drawer", "peer review",
+            "war-room-response", "acceptance criteria", "ac met",
+            "task_id", "project_id", "executor", "morphe", "chy ",
+        ],
+        "infrastructure": [
+            "vercel", "deploy", "deployment", "git push", "git pull", "git commit",
+            "git add", "git status", "git diff", "git stash",
+            "server", "restart", "tmux", "docker", "cloudflare", "netlify",
+            "google drive", "npm", "pip install", "requirements.txt",
+            "pushed to main", "origin main", "rebase",
+        ],
+        "product": [
+            "prd", "requirement", "prototype", "roadmap", "backlog", "user story",
+            "vp product", "pm lead", "po lead", "sprint", "competitive analysis",
+            "market fit", "market research", "functional requirement",
+            "non-functional", "rice framework", "prioriti",
+        ],
+        "agents": [
+            "organogram", "hierarchy", "reports_to", "conductor", "agent roster",
+            "active agents", "my ai fleet", "agent hub", "graphico", "volt", "mailo",
+            "agent manifest", "agent creation", ".claude/agents",
+        ],
+        "cc-operations": [
+            "cc message", "cc chat", "civ key", "heartbeat", "presence",
+            "cc bridge", "cc proxy", "command center", "cc_bridge",
+            "cc dispatcher", "cc-dispatch", "war room channel",
+        ],
+    }
+
+    def _infer_topic(text):
+        """Infer topic from message content using keyword matching with specificity bonus."""
+        lower = text.lower()
+        scores = {}
+        for topic, keywords in _TOPIC_KEYWORDS.items():
+            score = 0
+            for kw in keywords:
+                if kw in lower:
+                    # Longer keywords are more specific → higher weight
+                    score += 1 + len(kw) // 8
+            if score > 0:
+                scores[topic] = score
+        if scores:
+            return max(scores, key=scores.get)
+        return "general"
+
+    # Topic assignment rules:
+    # 1. When a topic is explicitly set via [topic:xxx] → ALL subsequent messages
+    #    get that topic until a NEW explicit [topic:yyy] changes it
+    # 2. Keyword inference ONLY runs when active topic is "general"
+    # 3. Assistant messages always inherit the current active topic
+    _active_topic = "general"
+    for m in final:
+        if m.get("topic"):
+            # Explicit [topic:xxx] from user — set as active, keep it
+            _active_topic = m["topic"]
+        elif _active_topic != "general":
+            # A non-general topic is active — ALL messages stay in it
+            m["topic"] = _active_topic
+        elif m.get("role") == "user":
+            # General is active + user message — infer from content
+            inferred = _infer_topic(m.get("text", ""))
+            _active_topic = inferred  # could be "general" or a detected topic
+            m["topic"] = _active_topic
+        else:
+            # General is active + assistant message — inherit
+            m["topic"] = _active_topic
+
+    result = final[-last_n:] if len(final) > last_n else final
+    _msg_cache["result"] = result
+    _msg_cache["ts"] = time.time()
+    _msg_cache["last_n"] = last_n
+    return result
 
 
-def check_auth(request: Request) -> bool:
-    auth = request.headers.get("authorization", "")
-    if auth.startswith("Bearer "):
-        return hmac.compare_digest(auth[7:], BEARER_TOKEN)
-    # Allow query param token for WebSocket paths (browsers cannot set headers on WS upgrade)
-    # and for /api/chat/uploads/ (inline images in chat rendered via <img src="...?token=">)
-    # and for /api/download (browser navigates directly to download URL, cannot set headers)
-    path = request.url.path
-    if "/ws" in path or "/api/chat/uploads/" in path or "/api/download" in path:
-        return hmac.compare_digest(request.query_params.get("token", ""), BEARER_TOKEN)
-    return False
-
-
-# ── User activity tracking (throttled, in-memory gate) ──────────────────────
-# We track the portal owner's activity for session counting.
-# In-memory cache prevents hitting DB on every single request.
-_last_activity_track_time: float = 0.0
-_ACTIVITY_TRACK_INTERVAL = 60  # seconds — matches tracking.ACTIVITY_THROTTLE_SECONDS
-
-
-def _maybe_track_activity() -> None:
-    """Fire-and-forget: track portal owner activity (throttled to 1x/min).
-
-    Called on authenticated requests. Uses in-memory gate so we don't
-    even open the DB more than once per minute.
-    """
-    global _last_activity_track_time
-    now = time.time()
-    if now - _last_activity_track_time < _ACTIVITY_TRACK_INTERVAL:
-        return
-    _last_activity_track_time = now
-
-    try:
-        owner_file = SCRIPT_DIR / "portal_owner.json"
-        if owner_file.exists():
-            owner = json.loads(owner_file.read_text())
-            email = owner.get("human_email", "")
-            if email:
-                record_activity(str(CLIENTS_DB), email)
-    except Exception as e:
-        print(f"[tracking] activity track error: {e}")
-
-
-_login_recorded_this_process: bool = False
-
-def check_auth_and_track(request: Request) -> bool:
-    """check_auth + activity tracking + first-request login recording."""
-    global _login_recorded_this_process
-    authed = check_auth(request)
-    if authed:
-        # C-1: Record login on the FIRST authenticated request per process lifetime.
-        # Since the portal uses a single Bearer token (no per-user sessions),
-        # we detect "login" as the first auth'd request after process start.
-        if not _login_recorded_this_process:
-            _login_recorded_this_process = True
-            try:
-                owner_file = SCRIPT_DIR / "portal_owner.json"
-                if owner_file.exists():
-                    owner = json.loads(owner_file.read_text())
-                    email = owner.get("human_email", "")
-                    if email:
-                        record_login(str(CLIENTS_DB), email)
-                        print(f"[tracking] recorded login for {email}")
-            except Exception as e:
-                print(f"[tracking] login record error: {e}")
-        _maybe_track_activity()
-    return authed
-
+# check_auth, check_auth_and_track, _maybe_track_activity → portal_config.py
 
 # ── PayPal Webhook Endpoint ─────────────────────────────────────────────────
 
@@ -1300,14 +1297,26 @@ def _inject_custom_panels(html: str) -> str:
     """Inject custom panels from custom/panels/*.html into the portal HTML (Flux overlay).
 
     If custom/panels/ does not exist or is empty, returns html unchanged (no-op).
+
+    Supports two modes per panel file:
+      1. **Add** (default): Creates a new sidebar nav item + panel div + mobile menu item.
+      2. **Replace** (panel-replace mode): If the first 10 lines contain a comment like
+         ``<!-- panel-replace: status -->``, the custom panel *replaces* an existing built-in
+         panel instead of adding a new one.  Specifically:
+           - The original nav item (``data-panel="{replace_id}"``) is hidden via display:none.
+           - A new nav item is injected with the custom label/icon/tooltip but still targeting
+             the original panel div ID so existing CSS/JS selectors keep working.
+           - The built-in panel div's innerHTML is swapped for the custom panel content.
+           - The original mobile menu item is similarly hidden and a replacement injected.
     """
     custom_panels_dir = SCRIPT_DIR / "custom" / "panels"
     if not custom_panels_dir.exists():
         return html
 
-    nav_items = []
-    panel_html_parts = []
-    mobile_items = []
+    nav_items = []          # new nav items to inject (additive panels)
+    panel_html_parts = []   # new panel divs to inject (additive panels)
+    mobile_items = []       # new mobile menu items to inject (additive panels)
+    replacements = []       # list of dicts for panel-replace panels
 
     for panel_file in sorted(custom_panels_dir.glob("*.html")):
         try:
@@ -1323,9 +1332,30 @@ def _inject_custom_panels(html: str) -> str:
 
         panel_id = escape(meta["id"], quote=True)
         panel_label = escape(meta.get("label", panel_id), quote=True)
-        panel_icon = meta.get("icon", "&#x2726;")  # icons are HTML entities, keep as-is
+        panel_icon = meta.get("icon", "&#x2726;")
+        if '<' in panel_icon or '>' in panel_icon:
+            print(f"[portal-custom] WARNING: panel icon contains HTML tags, using default: {panel_file.name}")
+            panel_icon = "&#x2726;"
         panel_tooltip = escape(meta.get("tooltip", ""), quote=True)
 
+        # --- Panel-replace mode ---
+        # If panel-replace metadata is present, this panel replaces an existing built-in panel
+        # rather than being added as a new one.
+        replace_target = meta.get("replace")
+        if replace_target:
+            replace_id = escape(replace_target.strip(), quote=True)
+            replacements.append({
+                "replace_id": replace_id,
+                "panel_id": panel_id,
+                "label": panel_label,
+                "icon": panel_icon,
+                "tooltip": panel_tooltip,
+                "content": panel_content,
+            })
+            print(f"[portal-custom] Replacing panel: {replace_id} with {panel_id} ({panel_label})")
+            continue
+
+        # --- Normal additive mode ---
         nav_items.append(
             f'    <div class="nav-item" data-panel="{panel_id}" '
             f'data-tooltip="{panel_tooltip}">'
@@ -1344,55 +1374,133 @@ def _inject_custom_panels(html: str) -> str:
 
         print(f"[portal-custom] Injecting panel: {panel_id} ({panel_label})")
 
-    if not nav_items:
+    # --- Apply panel replacements ---
+    for repl in replacements:
+        rid = repl["replace_id"]
+
+        # 1. Hide the original nav item and inject a replacement nav item pointing to the
+        #    same panel div ID (so the portal's panel switching JS still works).
+        old_nav = re.search(
+            r'(<div\s+class="nav-item"\s+data-panel="' + re.escape(rid) + r'"[^>]*>)',
+            html
+        )
+        if old_nav:
+            original_tag = old_nav.group(1)
+            # Insert display:none style into the original tag to hide it
+            hidden_tag = original_tag.replace('class="nav-item"', 'class="nav-item" style="display:none"', 1)
+            html = html.replace(original_tag, hidden_tag, 1)
+
+            # Inject a replacement nav item (uses the original panel's ID so clicking it
+            # activates the same panel div, but with custom label/icon/tooltip)
+            replacement_nav = (
+                f'    <div class="nav-item" data-panel="{rid}" '
+                f'data-tooltip="{repl["tooltip"]}">'
+                f'<span class="nav-icon">{repl["icon"]}</span>'
+                f'{repl["label"]}</div>'
+            )
+            if '<!-- /nav-panels -->' in html:
+                html = html.replace(
+                    '    <!-- /nav-panels -->',
+                    f'{replacement_nav}\n    <!-- /nav-panels -->',
+                    1
+                )
+        else:
+            print(f"[portal-custom] WARNING: could not find nav item for panel '{rid}' to replace")
+
+        # 2. Replace the built-in panel div's innerHTML with custom content.
+        #    The div keeps its original id="panel-{rid}" so all existing CSS/JS targeting works.
+        panel_div_pattern = re.compile(
+            r'(<div\s+class="panel"\s+id="panel-' + re.escape(rid) + r'"[^>]*>)'
+            r'(.*?)'
+            r'(</div>\s*(?=\n\s*(?:<div\s+class="panel"|<!--\s*/panels|$)))',
+            re.DOTALL
+        )
+        panel_match = panel_div_pattern.search(html)
+        if panel_match:
+            # Keep the opening tag, swap the inner content, keep the closing tag
+            new_panel = f'{panel_match.group(1)}{repl["content"]}</div>'
+            html = html[:panel_match.start()] + new_panel + html[panel_match.end():]
+        else:
+            print(f"[portal-custom] WARNING: could not find panel div 'panel-{rid}' to replace content")
+
+        # 3. Hide original mobile menu item and inject replacement (if mobile menu exists)
+        old_mobile = re.search(
+            r'(<div\s+class="tab-menu-item"\s+data-panel="' + re.escape(rid) + r'"[^>]*>)',
+            html
+        )
+        if old_mobile:
+            original_mobile_tag = old_mobile.group(1)
+            hidden_mobile_tag = original_mobile_tag.replace(
+                'class="tab-menu-item"', 'class="tab-menu-item" style="display:none"', 1
+            )
+            html = html.replace(original_mobile_tag, hidden_mobile_tag, 1)
+
+        if '<!-- /mobile-menu-items -->' in html:
+            replacement_mobile = (
+                f'    <div class="tab-menu-item" data-panel="{rid}" '
+                f'onclick="selectMobileMenuItem(\'{rid}\')">'
+                f'<span style="margin-right:10px;">{repl["icon"]}</span>'
+                f'{repl["label"]}</div>'
+            )
+            html = html.replace(
+                '    <!-- /mobile-menu-items -->',
+                f'{replacement_mobile}\n    <!-- /mobile-menu-items -->',
+                1
+            )
+
+    # --- Inject additive panels (unchanged behavior) ---
+    if not nav_items and not replacements:
         return html
 
     markers_found = 0
-    markers_expected = 3
+    markers_expected = 3 if nav_items else 0  # only expect markers if there are additive panels
 
     # Inject nav items among other panel nav items (before <!-- /nav-panels --> marker)
-    if '<!-- /nav-panels -->' in html:
-        nav_inject = '\n'.join(nav_items)
-        html = html.replace(
-            '    <!-- /nav-panels -->',
-            f'{nav_inject}\n    <!-- /nav-panels -->',
-            1
-        )
-        markers_found += 1
-    else:
-        print("[portal-custom] WARNING: <!-- /nav-panels --> marker not found — custom nav items not injected")
+    if nav_items:
+        if '<!-- /nav-panels -->' in html:
+            nav_inject = '\n'.join(nav_items)
+            html = html.replace(
+                '    <!-- /nav-panels -->',
+                f'{nav_inject}\n    <!-- /nav-panels -->',
+                1
+            )
+            markers_found += 1
+        else:
+            print("[portal-custom] WARNING: <!-- /nav-panels --> marker not found — custom nav items not injected")
 
     # Inject panel divs inside .content area, before <!-- /panels --> marker
-    if '<!-- /panels -->' in html:
-        panels_inject = '\n'.join(panel_html_parts)
-        html = html.replace(
-            '<!-- /panels -->',
-            f'{panels_inject}\n  <!-- /panels -->',
-            1
-        )
-        markers_found += 1
-    else:
-        print("[portal-custom] WARNING: <!-- /panels --> marker not found — custom panels not injected")
+    if panel_html_parts:
+        if '<!-- /panels -->' in html:
+            panels_inject = '\n'.join(panel_html_parts)
+            html = html.replace(
+                '<!-- /panels -->',
+                f'{panels_inject}\n  <!-- /panels -->',
+                1
+            )
+            markers_found += 1
+        else:
+            print("[portal-custom] WARNING: <!-- /panels --> marker not found — custom panels not injected")
 
     # Inject mobile menu items inside #mobile-more-menu, before its closing marker
-    if '<!-- /mobile-menu-items -->' in html:
-        mobile_inject = '\n'.join(mobile_items)
-        html = html.replace(
-            '    <!-- /mobile-menu-items -->',
-            f'{mobile_inject}\n    <!-- /mobile-menu-items -->',
-            1
-        )
-        markers_found += 1
-    else:
-        print("[portal-custom] WARNING: <!-- /mobile-menu-items --> marker not found — mobile items not injected")
+    if mobile_items:
+        if '<!-- /mobile-menu-items -->' in html:
+            mobile_inject = '\n'.join(mobile_items)
+            html = html.replace(
+                '    <!-- /mobile-menu-items -->',
+                f'{mobile_inject}\n    <!-- /mobile-menu-items -->',
+                1
+            )
+            markers_found += 1
+        else:
+            print("[portal-custom] WARNING: <!-- /mobile-menu-items --> marker not found — mobile items not injected")
 
-    if markers_found < markers_expected:
+    if markers_expected > 0 and markers_found < markers_expected:
         print(f"[portal-custom] WARNING: Only {markers_found}/{markers_expected} injection markers found — some custom panels may not display")
 
     return html
 
 async def health(request: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok", "civ": CIV_NAME, "uptime": int(time.time() - START_TIME)})
+    return JSONResponse({"status": "ok", "civ": CIV_NAME, "version": PORTAL_VERSION, "uptime": int(time.time() - START_TIME)})
 
 
 async def index(request: Request) -> Response:
@@ -1465,6 +1573,21 @@ async def api_status(request: Request) -> JSONResponse:
     })
 
 
+async def api_gateway_status(request: Request) -> JSONResponse:
+    """Stub: gateway module not installed in this portal bundle.
+
+    Returns 503 with explicit payload so callers can distinguish
+    "endpoint not exposed" (404) from "module not installed" (503).
+    When the gateway module ships, this stub will be replaced
+    with a real implementation. Approved by Aether on 2026-06-10
+    (Morphe audit finding).
+    """
+    return JSONResponse(
+        {"status": "not_installed", "module": "gateway", "version": PORTAL_VERSION},
+        status_code=503,
+    )
+
+
 async def api_release_notes(request: Request) -> JSONResponse:
     """Return release notes and current version."""
     if not check_auth(request):
@@ -1474,7 +1597,16 @@ async def api_release_notes(request: Request) -> JSONResponse:
         data["current_version"] = PORTAL_VERSION
         return JSONResponse(data)
     except Exception as e:
-        return JSONResponse({"current_version": PORTAL_VERSION, "releases": [], "error": str(e)})
+        return JSONResponse({"current_version": PORTAL_VERSION, "releases": [], "error": _sanitize_error(e, "release notes")})
+
+
+async def api_chat_topics(request: Request) -> JSONResponse:
+    """Return unique topic tags found in recent messages."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    messages = _parse_all_messages(last_n=200)
+    topics = sorted({m["topic"] for m in messages if m.get("topic")})
+    return JSONResponse({"topics": topics})
 
 
 async def api_chat_history(request: Request) -> JSONResponse:
@@ -1511,6 +1643,15 @@ async def api_chat_send(request: Request) -> JSONResponse:
     try:
         body = await request.json()
         message = str(body.get("message", "")).strip()
+        topic = str(body.get("topic", "")).strip() or None
+        # Normalize to key format (lowercase, hyphens) for consistent filtering
+        if topic:
+            topic = re.sub(r'[^a-z0-9]+', '-', topic.lower()).strip('-') or None
+        # "general" is a valid explicit topic — signals user wants to reset to general
+        # Don't convert to None
+        reply_to_id = str(body.get("reply_to_id", "")).strip() or None
+        reply_to_text = str(body.get("reply_to_text", "")).strip()[:100] or None
+        reply_to_author = str(body.get("reply_to_author", "")).strip()[:50] or None
     except Exception:
         return JSONResponse({"error": "invalid json"}, status_code=400)
 
@@ -1520,17 +1661,22 @@ async def api_chat_send(request: Request) -> JSONResponse:
     # Save to portal chat log for history
     # Return the saved entry's ID so the client can pre-register it in knownMsgIds,
     # preventing the WS poll-loop echo from rendering the message a second time.
-    saved_entry = _save_portal_message(message, role="user")
+    saved_entry = _save_portal_message(message, role="user", topic=topic,
+                                       reply_to_id=reply_to_id,
+                                       reply_to_text=reply_to_text,
+                                       reply_to_author=reply_to_author)
     msg_id = saved_entry["id"]
 
     # Tag injection source so tmux pane shows where input came from
     host = request.headers.get("referer", "")
+    # Prepend topic tag if present (embedded in tmux text for JSONL capture)
+    topic_prefix = f"[topic:{topic}] " if topic else ""
     if "react" in host:
-        tagged = f"[portal-react] {message}"
+        tagged = f"[portal-react] {topic_prefix}{message}"
     else:
-        tagged = f"[portal] {message}"
+        tagged = f"[portal] {topic_prefix}{message}"
 
-    session = get_tmux_session()
+    session = await _find_primary_pane_async()
     print(f"[portal] DEBUG api_chat_send: session={session} msg_len={len(message)} tagged_len={len(tagged)} referer={request.headers.get('referer','none')[:50]} client={request.client.host if request.client else 'unknown'}")
     try:
         # For long messages, write to a temp file and use load-buffer instead of send-keys -l
@@ -1571,11 +1717,11 @@ async def api_chat_send(request: Request) -> JSONResponse:
                 await _run_subprocess_async(["tmux", "send-keys", "-t", session, "Enter"])
         _fire_and_forget(_retry_enters())
         print(f"[portal] DEBUG api_chat_send: SUCCESS msg_id={msg_id}")
+        log_activity("Chat: " + message[:60], "", "chat")
         # Return msg_id so the client pre-registers it and WS echo is suppressed
         return JSONResponse({"status": "sent", "timestamp": int(time.time()), "msg_id": msg_id})
     except Exception as e:
-        print(f"[portal] ERROR api_chat_send exception: {type(e).__name__}: {e}")
-        return JSONResponse({"error": f"tmux error: {e}"}, status_code=500)
+        return JSONResponse({"error": _sanitize_error(e, "tmux session")}, status_code=500)
 
 
 async def api_notify(request: Request) -> JSONResponse:
@@ -1619,10 +1765,15 @@ async def ws_chat(websocket: WebSocket) -> None:
 
     # Register initial batch of recent messages as "seen" to avoid re-sending old messages.
     # Only NEW messages (arriving after connect) will be pushed via the poll loop below.
+    # NOTE (2026-06-03): Do NOT add to stable_sent here. Adding to stable_sent permanently
+    # prevents a message from being pushed, even if the frontend never received it (e.g.,
+    # the previous WS dropped before delivery). By only setting seen_texts, the message
+    # won't trigger the "new message" path (prev_len >= 0), but CAN still be pushed via
+    # the stable-final path if its text changes. The frontend's knownMsgIds (now properly
+    # cleared on history load) handles dedup for messages already rendered from history.
     messages = _parse_all_messages(last_n=200)
     for msg in messages:
         seen_texts[msg["id"]] = len(msg.get("text", ""))
-        stable_sent.add(msg["id"])  # existing messages already complete — skip final-send
 
     try:
         while True:
@@ -1648,6 +1799,15 @@ async def ws_chat(websocket: WebSocket) -> None:
                     stable_counts[msg_id] = 0
 
                 # ── Send path ──────────────────────────────────────────────────────
+                # Detect [topic:xxx] prefix in assistant messages and extract as topic field
+                _raw_text = msg.get("text", "")
+                _topic_ws_match = re.match(r'^\[topic:([^\]]+)\]\s*', _raw_text)
+                if _topic_ws_match and not msg.get("topic"):
+                    _ws_raw_topic = _topic_ws_match.group(1)
+                    # Normalize to key format (lowercase, hyphens)
+                    msg["topic"] = re.sub(r'[^a-z0-9]+', '-', _ws_raw_topic.lower()).strip('-') or None
+                    msg["text"] = _raw_text[_topic_ws_match.end():]
+
                 # Noise guard (shared by all send paths below)
                 _ws_text = msg.get("text", "").strip()
                 _is_noise = (not _ws_text or len(_ws_text) < 3 or
@@ -1691,6 +1851,22 @@ async def ws_chat(websocket: WebSocket) -> None:
                     # Fix 1: message stopped growing — persist now even if below growth threshold
                     _mirror_to_portal_log(msg)
 
+            # Prune per-connection dicts every 100 poll cycles to prevent unbounded growth
+            if not hasattr(websocket, '_poll_count'):
+                websocket._poll_count = 0
+            websocket._poll_count += 1
+            if websocket._poll_count % 100 == 0:
+                if len(seen_texts) > 500:
+                    to_remove = sorted(seen_texts.keys())[:-500]
+                    for k in to_remove:
+                        seen_texts.pop(k, None)
+                        first_seen.pop(k, None)
+                        stable_counts.pop(k, None)
+                        stable_sent.discard(k)
+                if len(first_seen) > 500:
+                    to_remove = sorted(first_seen.keys())[:-500]
+                    for k in to_remove:
+                        first_seen.pop(k, None)
             await asyncio.sleep(1.5)  # Poll interval — increased from 0.8s to reduce CPU (still near-real-time)
             # Server-side keepalive ping every 20s to prevent Cloudflare/client 30s stale detection
             _now = time.time()
@@ -1743,17 +1919,22 @@ async def api_chat_upload(request: Request) -> JSONResponse:
         # Detect if this is an image
         is_image = safe_name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp'))
 
+        # Generate a unique upload_id shared between portal log and tmux injection
+        # so _parse_all_messages can reliably dedup the two entries regardless of timing
+        upload_id = f"upload-{timestamp_ms}-{secrets.token_hex(4)}"
+
         # Save ONE combined user message to portal chat log (image + caption together)
         # Include stored_name so frontend can render inline image via /api/chat/uploads/
         chat_text = f"[Image: {stored_name}]" if is_image else f"[File: {stored_name}]"
         if caption:
             chat_text += f"\n{caption}"
-        user_entry = _save_portal_message(chat_text, role="user")
+        user_entry = _save_portal_message(chat_text, role="user", upload_id=upload_id)
 
         # Inject notification into AI's tmux session via debounced batch.
         # Multiple files within _DEBOUNCE_WINDOW_S (2.5s) are combined into
         # ONE tmux notification instead of N separate messages (saves tokens).
-        _schedule_upload_batch_item(original_name, str(portal_copy_path), is_image, caption)
+        _schedule_upload_batch_item(original_name, str(portal_copy_path), is_image, caption, upload_id)
+        log_activity(f"File uploaded: {original_name}", "", "file")
         tmux_ok = True  # Assume success for ack message (file IS saved regardless)
 
         # Auto-acknowledge in portal chat so user sees confirmation immediately
@@ -1769,6 +1950,12 @@ async def api_chat_upload(request: Request) -> JSONResponse:
         ack_text = " ".join(ack_parts)
         ack_entry = _save_portal_message(ack_text, role="assistant")
 
+        # Push both messages to WebSocket clients so they appear live without refresh
+        if _chat_ws_clients:
+            import asyncio as _asyncio
+            _asyncio.create_task(_push_message_to_clients(user_entry))
+            _asyncio.create_task(_push_message_to_clients(ack_entry))
+
         return JSONResponse({
             "ok": True,
             "filename": stored_name,
@@ -1779,9 +1966,10 @@ async def api_chat_upload(request: Request) -> JSONResponse:
             "ack": ack_text,
             "user_msg_id": user_entry["id"],
             "ack_msg_id": ack_entry["id"],
+            "upload_id": upload_id,
         })
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": _sanitize_error(e, "chat send")}, status_code=500)
 
 
 async def api_chat_serve_upload(request: Request) -> Response:
@@ -1794,7 +1982,10 @@ async def api_chat_serve_upload(request: Request) -> Response:
         return JSONResponse({"error": "invalid filename"}, status_code=400)
     filepath = UPLOADS_DIR / filename
     if not filepath.exists() or not filepath.is_file():
-        return JSONResponse({"error": "not found"}, status_code=404)
+        # Also check from-portal/ subdirectory
+        filepath = UPLOADS_DIR / "from-portal" / filename
+        if not filepath.exists() or not filepath.is_file():
+            return JSONResponse({"error": "not found"}, status_code=404)
     return FileResponse(str(filepath))
 
 
@@ -1847,13 +2038,48 @@ async def api_download_list(request: Request) -> JSONResponse:
         return JSONResponse({"error": "directory not found"}, status_code=404)
     items = []
     for item in sorted(dirpath.iterdir()):
+        try:
+            st = item.stat()
+        except OSError:
+            continue
         items.append({
             "name": item.name,
             "path": str(item),
             "is_dir": item.is_dir(),
-            "size": item.stat().st_size if item.is_file() else None,
+            "size": st.st_size if item.is_file() else None,
+            "mtime": st.st_mtime,
         })
     return JSONResponse({"dir": str(dirpath), "items": items})
+
+
+async def api_files_delete(request: Request) -> JSONResponse:
+    """Delete a file. Restricted to portal_uploads directory only."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+        file_path_str = body.get("path", "").strip()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    if not file_path_str:
+        return JSONResponse({"error": "missing 'path'"}, status_code=400)
+    if ".." in file_path_str:
+        return JSONResponse({"error": "path traversal not allowed"}, status_code=403)
+    try:
+        filepath = Path(file_path_str).resolve()
+    except Exception:
+        return JSONResponse({"error": "invalid path"}, status_code=400)
+    # Security: only allow deletion within portal_uploads
+    uploads_dir = Path.home() / "portal_uploads"
+    if not (filepath == uploads_dir or uploads_dir in filepath.parents):
+        return JSONResponse({"error": "deletion only allowed in portal_uploads"}, status_code=403)
+    if not filepath.exists() or not filepath.is_file():
+        return JSONResponse({"error": "file not found"}, status_code=404)
+    try:
+        filepath.unlink()
+    except OSError as e:
+        return JSONResponse({"error": _sanitize_error(e, "file delete")}, status_code=500)
+    return JSONResponse({"ok": True, "deleted": str(filepath)})
 
 
 # ---------------------------------------------------------------------------
@@ -2061,6 +2287,16 @@ async def api_context(request: Request) -> JSONResponse:
 
         total = input_tokens + cache_read + cache_creation
         pct = round(min(total / MAX_TOKENS * 100, 100), 1)
+
+        # Message count from portal-chat.jsonl
+        msg_count = 0
+        try:
+            if PORTAL_CHAT_LOG.exists():
+                with open(PORTAL_CHAT_LOG, "rb") as _f:
+                    msg_count = sum(1 for _ in _f)
+        except Exception:
+            pass
+
         return JSONResponse({
             "input_tokens": input_tokens,
             "cache_read": cache_read,
@@ -2068,10 +2304,13 @@ async def api_context(request: Request) -> JSONResponse:
             "total_tokens": total,
             "max_tokens": MAX_TOKENS,
             "pct": pct,
+            "percent": pct,
+            "used_tokens": total,
             "session_id": latest.stem,
+            "message_count": msg_count,
         })
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": _sanitize_error(e, "file read")}, status_code=500)
 
 
 async def api_resume(request: Request) -> JSONResponse:
@@ -2100,8 +2339,7 @@ async def api_resume(request: Request) -> JSONResponse:
         # Write session name so portal can track it
         marker = Path.home() / ".current_session"
         marker.write_text(tmux_session)
-        model_file = Path.home() / ".claude_session_model"
-        model = model_file.read_text().strip() if model_file.exists() else "claude-opus-4-6"
+        model = _detect_session_model()
         claude_cmd = (
             f"claude --model {model} --dangerously-skip-permissions "
             f"--resume {session_id}"
@@ -2114,11 +2352,13 @@ async def api_resume(request: Request) -> JSONResponse:
         ))
         return JSONResponse({"status": "resuming", "session_id": session_id, "tmux": tmux_session})
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": _sanitize_error(e, "file write")}, status_code=500)
 
 
 async def api_panes(request: Request) -> JSONResponse:
-    """Return all tmux panes with their current content."""
+    """Return all tmux panes with their current content.
+    Includes panes from the primary session AND any agent-team sessions
+    (prefixed with 'cc-' or containing the CIV name)."""
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     session = get_tmux_session()
@@ -2130,6 +2370,10 @@ async def api_panes(request: Request) -> JSONResponse:
         )
         if not out:
             return JSONResponse({"panes": []})
+        primary_session = session.split(":")[0] if ":" in session else session
+        civ_lower = CIV_NAME.lower() if CIV_NAME else ""
+        # Excluded sessions (not ours)
+        _excluded = {"boop-daemon"}
         panes = []
         for line in out.splitlines():
             line = line.strip()
@@ -2139,8 +2383,13 @@ async def api_panes(request: Request) -> JSONResponse:
             pane_id = parts[0] if len(parts) > 0 else ""
             title = parts[1] if len(parts) > 1 else pane_id
             target = parts[2] if len(parts) > 2 else pane_id
-            session_name = session.split(":")[0] if ":" in session else session
-            if session_name not in target and session not in target:
+            pane_session = target.split(":")[0] if ":" in target else target
+            # Include: primary session, cc- prefixed (agent teams), or civ-name sessions
+            is_primary = primary_session in target
+            is_agent_team = pane_session.startswith("cc-")
+            is_civ = civ_lower and civ_lower in pane_session.lower()
+            is_excluded = pane_session in _excluded
+            if not (is_primary or is_agent_team or is_civ) or is_excluded:
                 continue
             capture = await _run_subprocess_output(
                 ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-30"], timeout=3
@@ -2148,7 +2397,7 @@ async def api_panes(request: Request) -> JSONResponse:
             panes.append({"id": pane_id, "title": title or pane_id, "target": target, "content": (capture or "").strip()})
         return JSONResponse({"panes": panes})
     except Exception as e:
-        return JSONResponse({"error": str(e), "panes": []})
+        return JSONResponse({"error": _sanitize_error(e, "tmux panes"), "panes": []})
 
 
 async def api_inject_pane(request: Request) -> JSONResponse:
@@ -2170,7 +2419,7 @@ async def api_inject_pane(request: Request) -> JSONResponse:
         await _run_subprocess_async(["tmux", "send-keys", "-t", pane_id, "Enter"], check=True)
         return JSONResponse({"status": "sent"})
     except Exception as e:
-        return JSONResponse({"error": f"tmux error: {e}"}, status_code=500)
+        return JSONResponse({"error": _sanitize_error(e, "tmux capture")}, status_code=500)
 
 
 # ---------------------------------------------------------------------------
@@ -2213,7 +2462,7 @@ async def api_boop_config(request: Request) -> JSONResponse:
             return JSONResponse({"ok": True, "active_command": g.get("active_command"),
                                  "cadence_minutes": g.get("cadence_minutes")})
         except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=500)
+            return JSONResponse({"error": _sanitize_error(e, "command exec")}, status_code=500)
     # GET
     try:
         cfg = json.loads(BOOP_CONFIG_FILE.read_text()) if BOOP_CONFIG_FILE.exists() else {}
@@ -2224,7 +2473,7 @@ async def api_boop_config(request: Request) -> JSONResponse:
             "paused": g.get("paused", False),
         })
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": _sanitize_error(e, "command exec")}, status_code=500)
 
 
 async def api_boops_list(request: Request) -> JSONResponse:
@@ -2256,15 +2505,89 @@ async def api_boop_read(request: Request) -> JSONResponse:
 
 
 # BOOP daemon control — session name and script path for toggle/status
-BOOP_TMUX_SESSION = "boop-daemon"
-BOOP_DAEMON_SCRIPT = Path.home() / "civ" / "tools" / "boop-daemon.sh"
+BOOP_TMUX_SESSION = "boop-daemon"  # Legacy fallback
+BOOP_POLLER_PROCESS = "boop_poller.py"  # New background process
+BOOP_SYSTEM_DIR = Path.home() / "boop-system"
+BOOP_DAEMON_SCRIPT = Path.home() / "civ" / "tools" / "boop-daemon.sh"  # Legacy fallback
+
+
+async def api_boops_active(request: Request) -> JSONResponse:
+    """GET /api/boops/active — return all scheduled BOOPs from state file."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    state_file = Path(os.environ.get("CIV_ROOT", str(Path.home()))) / ".claude" / "scheduled-tasks-state.json"
+    if not state_file.exists():
+        return JSONResponse({"boops": [], "total": 0})
+    try:
+        data = json.loads(state_file.read_text())
+        tasks = data.get("tasks", {})
+        boops = []
+        for name, info in tasks.items():
+            boops.append({
+                "id": name,
+                "name": name.replace("-", " ").replace("_", " ").title(),
+                "description": info.get("description", ""),
+                "frequency": info.get("frequency", ""),
+                "schedule": info.get("target_time_pkt", info.get("target_time_et", info.get("target_day", ""))),
+                "agents": info.get("agents", [info.get("agent", "")]),
+                "last_run": info.get("last_run", "never"),
+                "status": info.get("status", "unknown"),
+                "log_path": info.get("log_path", ""),
+            })
+        # Also include BOOP poller state
+        boop_state_file = BOOP_SYSTEM_DIR / "boop-state.json"
+        if boop_state_file.exists():
+            try:
+                bstate = json.loads(boop_state_file.read_text())
+                _poller_running = subprocess.run(
+                    ["pgrep", "-f", BOOP_POLLER_PROCESS], capture_output=True
+                ).returncode == 0
+                boops.append({
+                    "id": "boop-poller",
+                    "name": "BOOP Grounding Poller",
+                    "description": "External cadence enforcer — alternates sprint (ops) and haiku (reflection) cycles",
+                    "frequency": "Every 40 min (active) / 60 min (overnight)",
+                    "schedule": "Continuous",
+                    "agents": ["Primary"],
+                    "last_run": bstate.get("last_boop_utc", "never"),
+                    "status": "active" if _poller_running else "inactive",
+                    "log_path": str(BOOP_SYSTEM_DIR / "boop-log.jsonl"),
+                    "boop_count": bstate.get("boop_count", 0),
+                    "today_count": bstate.get("today_boop_count", 0),
+                })
+            except Exception:
+                pass
+        return JSONResponse({"boops": boops, "total": len(boops)})
+    except Exception as e:
+        return JSONResponse({"boops": [], "total": 0, "error": _sanitize_error(e, "boop list")})
 
 
 async def api_boop_status(request: Request) -> JSONResponse:
-    """Check if the BOOP daemon tmux session is running."""
+    """Check if the BOOP daemon/poller is running."""
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
+        # Check for new boop_poller.py process first
+        r = await _run_subprocess_async(["pgrep", "-f", BOOP_POLLER_PROCESS])
+        if r is not None and r.returncode == 0:
+            pid_out = await _run_subprocess_output(["pgrep", "-f", BOOP_POLLER_PROCESS], timeout=3)
+            pid = int(pid_out.strip().split()[0]) if pid_out and pid_out.strip() else None
+            # Load state for extra info
+            state_file = BOOP_SYSTEM_DIR / "boop-state.json"
+            state = {}
+            if state_file.exists():
+                try:
+                    state = json.loads(state_file.read_text())
+                except Exception:
+                    pass
+            return JSONResponse({
+                "active": True, "pid": pid, "type": "poller",
+                "boop_count": state.get("boop_count", 0),
+                "last_boop": state.get("last_boop_utc"),
+                "today_count": state.get("today_boop_count", 0),
+            })
+
+        # Legacy: check tmux session
         r = await _run_subprocess_async(["tmux", "has-session", "-t", BOOP_TMUX_SESSION])
         running = r is not None and r.returncode == 0
         pid = None
@@ -2277,35 +2600,58 @@ async def api_boop_status(request: Request) -> JSONResponse:
                     pid = int(out.strip().split()[0])
             except (ValueError, Exception):
                 pass
-        return JSONResponse({"active": running, "pid": pid})
+        return JSONResponse({"active": running, "pid": pid, "type": "tmux" if running else None})
     except Exception:
-        return JSONResponse({"active": False, "pid": None})
+        return JSONResponse({"active": False, "pid": None, "type": None})
 
 
 async def api_boop_toggle(request: Request) -> JSONResponse:
-    """Toggle the BOOP daemon on/off via tmux session."""
+    """Toggle the BOOP poller on/off."""
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
-        r = await _run_subprocess_async(["tmux", "has-session", "-t", BOOP_TMUX_SESSION])
-        currently_running = r is not None and r.returncode == 0
+        # Check if new poller is running
+        r = await _run_subprocess_async(["pgrep", "-f", BOOP_POLLER_PROCESS])
+        poller_running = r is not None and r.returncode == 0
 
-        if currently_running:
-            await _run_subprocess_async(["tmux", "kill-session", "-t", BOOP_TMUX_SESSION])
+        if poller_running:
+            # Stop via stop.sh
+            stop_script = BOOP_SYSTEM_DIR / "stop.sh"
+            if stop_script.exists():
+                await _run_subprocess_async(["bash", str(stop_script)])
+            else:
+                await _run_subprocess_async(["pkill", "-f", BOOP_POLLER_PROCESS])
+            log_activity("BOOP stopped", "", "system")
             return JSONResponse({"active": False, "action": "stopped"})
         else:
-            if not BOOP_DAEMON_SCRIPT.exists():
+            # Start via start.sh
+            start_script = BOOP_SYSTEM_DIR / "start.sh"
+            if start_script.exists():
+                await _run_subprocess_async(["bash", str(start_script)])
+                log_activity("BOOP started", "", "system")
+                return JSONResponse({"active": True, "action": "started"})
+
+            # Legacy fallback: try tmux approach
+            r = await _run_subprocess_async(["tmux", "has-session", "-t", BOOP_TMUX_SESSION])
+            currently_running = r is not None and r.returncode == 0
+            if currently_running:
+                await _run_subprocess_async(["tmux", "kill-session", "-t", BOOP_TMUX_SESSION])
+                log_activity("BOOP stopped", "", "system")
+                return JSONResponse({"active": False, "action": "stopped"})
+            elif BOOP_DAEMON_SCRIPT.exists():
+                await _run_subprocess_async(
+                    ["tmux", "new-session", "-d", "-s", BOOP_TMUX_SESSION,
+                     f"bash {BOOP_DAEMON_SCRIPT} > /tmp/boop-daemon.log 2>&1"]
+                )
+                log_activity("BOOP started", "", "system")
+                return JSONResponse({"active": True, "action": "started"})
+            else:
                 return JSONResponse(
-                    {"error": f"boop-daemon.sh not found at {BOOP_DAEMON_SCRIPT}"},
+                    {"error": "No BOOP system found (neither boop_poller.py nor boop-daemon.sh)"},
                     status_code=500
                 )
-            await _run_subprocess_async(
-                ["tmux", "new-session", "-d", "-s", BOOP_TMUX_SESSION,
-                 f"bash {BOOP_DAEMON_SCRIPT} > /tmp/boop-daemon.log 2>&1"]
-            )
-            return JSONResponse({"active": True, "action": "started"})
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": _sanitize_error(e, "boop toggle")}, status_code=500)
 
 
 # ---------------------------------------------------------------------------
@@ -2622,7 +2968,7 @@ async def api_claude_auth_start(request: Request) -> JSONResponse:
         return JSONResponse(result)
     except Exception as e:
         _save_portal_message(f"Auth flow v2 failed: {e}", role="assistant")
-        return JSONResponse({"error": f"auth flow error: {e}"}, status_code=500)
+        return JSONResponse({"error": _sanitize_error(e, "auth flow")}, status_code=500)
     finally:
         _auth_flow_running = False
 
@@ -2661,7 +3007,7 @@ async def api_claude_auth_code(request: Request) -> JSONResponse:
         return JSONResponse({"injected": True})
     except Exception as e:
         _save_portal_message(f"Code injection failed: tmux error — pane={pane}, err={e}", role="assistant")
-        return JSONResponse({"error": f"tmux error: {e}"}, status_code=500)
+        return JSONResponse({"error": _sanitize_error(e, "tmux restart")}, status_code=500)
 
 
 async def api_claude_auth_url(request: Request) -> JSONResponse:
@@ -2737,45 +3083,51 @@ async def _push_message_to_clients(entry: dict) -> None:
 
 
 async def _thinking_monitor_loop() -> None:
-    """Background task: tail latest JSONL session file and push thinking blocks to portal."""
-    last_file: str = ""
-    last_pos: int = 0
+    """Background task: tail latest JSONL session files and push thinking blocks to portal."""
+    # Track file positions per path (top 3 files, matching _parse_all_messages)
+    file_positions: dict[str, int] = {}
 
     while True:
         try:
-            # Find the most recently modified JSONL session file across all projects
+            # Find the most recently modified JSONL session files across all projects
             logs = _find_all_project_jsonl()
             if not logs:
                 await asyncio.sleep(2)
                 continue
 
-            current_file = str(logs[0])
+            # Check top 3 files (same as _parse_all_messages) — subagent sessions
+            # often have newer mtimes, so checking only logs[0] misses the main session.
+            all_new_lines: list[str] = []
+            for log_path in logs[:3]:
+                current_file = str(log_path)
+                last_pos = file_positions.get(current_file, 0)
 
-            # If we switched to a new file, reset position
-            if current_file != last_file:
-                last_file = current_file
-                last_pos = 0
+                try:
+                    with open(current_file, "rb") as f:
+                        f.seek(0, 2)
+                        file_size = f.tell()
+                        if file_size < last_pos:
+                            # File was truncated/rotated — reset
+                            last_pos = 0
+                        f.seek(last_pos)
+                        new_bytes = f.read()
+                        file_positions[current_file] = f.tell()
+                except Exception:
+                    continue
 
-            # Read new lines from where we left off
-            try:
-                with open(current_file, "rb") as f:
-                    f.seek(0, 2)
-                    file_size = f.tell()
-                    if file_size < last_pos:
-                        # File was truncated/rotated — reset
-                        last_pos = 0
-                    f.seek(last_pos)
-                    new_bytes = f.read()
-                    last_pos = f.tell()
-            except Exception:
-                await asyncio.sleep(2)
-                continue
+                if new_bytes:
+                    all_new_lines.extend(new_bytes.decode("utf-8", errors="replace").splitlines())
 
-            if not new_bytes:
+            # Prune stale entries from file_positions
+            active_paths = {str(p) for p in logs[:3]}
+            for stale in [k for k in file_positions if k not in active_paths]:
+                del file_positions[stale]
+
+            if not all_new_lines:
                 await asyncio.sleep(1.5)
                 continue
 
-            lines = new_bytes.decode("utf-8", errors="replace").splitlines()
+            lines = all_new_lines
             for line in lines:
                 line = line.strip()
                 if not line:
@@ -2822,6 +3174,8 @@ async def _thinking_monitor_loop() -> None:
                     if content_hash in _sent_thinking_hashes:
                         continue
                     _sent_thinking_hashes.add(content_hash)
+                    if len(_sent_thinking_hashes) > 1000:
+                        _sent_thinking_hashes.clear()
 
                     ts = entry.get("timestamp")
                     if isinstance(ts, str):
@@ -2838,6 +3192,9 @@ async def _thinking_monitor_loop() -> None:
                     # Push to all connected clients (non-blocking)
                     if _chat_ws_clients:
                         await _push_thinking_to_clients(text, ts)
+
+                    # Thinking is ephemeral -- do NOT persist to portal-chat.jsonl
+                    # (was causing 414+ stale thinking entries to reload on every refresh)
 
         except Exception:
             pass
@@ -2879,6 +3236,8 @@ async def _scheduled_task_checker() -> None:
     """Background loop: check every 30s if any tasks are due, inject into tmux."""
     while True:
         await asyncio.sleep(30)
+        # Check BOOP state file tasks (Settings panel configured)
+        await _check_boop_state_tasks()
         if not _scheduled_tasks:
             continue
         now = datetime.now(timezone.utc)
@@ -2949,6 +3308,77 @@ async def _scheduled_task_checker() -> None:
             _save_scheduled_tasks()
 
 
+async def _check_boop_state_tasks() -> None:
+    """Check scheduled-tasks-state.json for due tasks and fire them."""
+    if not BOOP_STATE_FILE.exists():
+        return
+    try:
+        data = json.loads(BOOP_STATE_FILE.read_text())
+        tasks = data.get("tasks", {})
+    except Exception:
+        return
+
+    now = datetime.now(timezone.utc)
+    updated = False
+
+    for task_id, task_info in tasks.items():
+        status = task_info.get("status", "pending")
+        if status == "disabled":
+            continue
+
+        frequency = task_info.get("frequency", "")
+        last_run_str = task_info.get("last_run")
+        description = task_info.get("description", task_id)
+
+        # Determine if this task is due
+        due = False
+        if not last_run_str:
+            # Never run before — due now
+            due = True
+        else:
+            try:
+                last_run = datetime.fromisoformat(last_run_str)
+                elapsed = (now - last_run).total_seconds()
+                if frequency == "hourly" and elapsed >= 3600:
+                    due = True
+                elif frequency == "daily" and elapsed >= 86400:
+                    due = True
+                elif frequency == "weekly" and elapsed >= 604800:
+                    due = True
+                elif frequency == "every_30_min" and elapsed >= 1800:
+                    due = True
+                elif frequency == "every_2_hours" and elapsed >= 7200:
+                    due = True
+            except (ValueError, TypeError):
+                due = True  # Can't parse last_run — treat as due
+
+        if due:
+            session = get_tmux_session()
+            if session:
+                msg = f"[SCHEDULED TASK: {task_id}] {description}"
+                try:
+                    await _run_subprocess_async(
+                        ["tmux", "send-keys", "-t", session, "-l", f"\n{msg}"],
+                        timeout=5, check=True,
+                    )
+                    await _run_subprocess_async(
+                        ["tmux", "send-keys", "-t", session, "Enter"],
+                        timeout=5,
+                    )
+                    print(f"[sched] Fired BOOP task: {task_id}")
+                    task_info["last_run"] = now.isoformat()
+                    updated = True
+                except Exception as e:
+                    print(f"[sched] Failed to fire BOOP task {task_id}: {e}")
+
+    if updated:
+        data["last_updated"] = now.isoformat()
+        try:
+            BOOP_STATE_FILE.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            print(f"[sched] Failed to save BOOP state: {e}")
+
+
 async def api_schedule_task(request) -> JSONResponse:
     """POST /api/schedule-task — schedule a message for future delivery."""
     if not check_auth(request):
@@ -2989,32 +3419,7 @@ async def api_schedule_task(request) -> JSONResponse:
     return JSONResponse({"ok": True, "task_id": task_id, "fire_at": fire_at, "recur_type": recur_type})
 
 
-BOOP_STATE_FILE = Path(os.environ.get("CIV_ROOT", str(Path.home() / "projects/AI-CIV/aether"))) / ".claude/scheduled-tasks-state.json"
-
-async def api_boops_list(request) -> JSONResponse:
-    """GET /api/boops — list all BOOPs from boop_executor config."""
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    try:
-        data = json.loads(BOOP_STATE_FILE.read_text())
-        tasks = data.get("tasks", {})
-        rules = data.get("boop_rules", {})
-        boops = []
-        for boop_id, boop in tasks.items():
-            boops.append({
-                "id": boop_id,
-                "description": boop.get("description", ""),
-                "frequency": boop.get("frequency", "unknown"),
-                "status": boop.get("status", "active"),
-                "category": boop.get("category", ""),
-                "agent": boop.get("agent", ""),
-                "last_run": boop.get("last_run", ""),
-                "schedule_slot": boop.get("schedule_slot", ""),
-                "override_max_daily": boop.get("override_max_daily", False),
-            })
-        return JSONResponse({"boops": boops, "rules": rules})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+BOOP_STATE_FILE = Path(os.environ.get("CIV_ROOT", str(Path.home()))) / ".claude/scheduled-tasks-state.json"
 
 
 async def api_boop_update(request) -> JSONResponse:
@@ -3040,244 +3445,8 @@ async def api_boop_update(request) -> JSONResponse:
         print(f"[boop] Updated BOOP {boop_id}: {list(body.keys())}")
         return JSONResponse({"ok": True, "boop": boop})
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": _sanitize_error(e, "task update")}, status_code=500)
 
-
-# ---------------------------------------------------------------------------
-# 777 Command Center — AI Coaching Proxy
-# ---------------------------------------------------------------------------
-_777_SYSTEM_PROMPTS = {
-    'reflection': """You are a supportive daily performance coach inside the 777 Command Center — a private personal development tool.
-
-The user has just completed their daily check-in: 20 yes/no questions across areas like mindset, health, focus, relationships, and action-taking. You have access to today's scores and recent history.
-
-Your role:
-- Celebrate genuine wins without being sycophantic
-- Ask one probing question about a low score area rather than lecturing
-- Spot patterns across days when history shows them ("3 days of low fitness scores")
-- Suggest ONE specific micro-action for the biggest gap area
-- Be direct, warm, and brief — this is a morning check-in, not therapy
-- Never give generic advice — always anchor to their actual scores
-- Keep responses under 200 words unless they ask for more
-
-Tone: Direct coach, not cheerleader. Tim Ferriss meets Naval Ravikant.""",
-
-    'fear': """You are a Stoic-inspired fear analysis coach inside the 777 Command Center.
-
-The user is doing Tim Ferriss's Fear Setting exercise: defining worst cases, prevention steps, and repair paths for a specific fear.
-
-Your role:
-- Challenge whether worst cases are truly as likely/bad as perceived (Stoic reality check)
-- Identify gaps in their prevention column that they haven't considered
-- Strengthen the repair column — can they recover faster than they think?
-- Ask: "What's the real cost of NOT doing this?" if inaction cost is weak
-- Identify if this fear is actually a disguised excitement or opportunity
-- Be Socratic — ask questions more than make declarations
-- Never dismiss a fear as irrational, but help them see it clearly
-
-Tone: Wise Stoic mentor. Calm, direct, thought-provoking.""",
-
-    'goals': """You are a strategic goal advisor inside the 777 Command Center.
-
-The user has a vision statement, yearly goals with progress sliders, and a list of their Top 77 lifetime goals. You have access to their current progress data.
-
-Your role:
-- Analyze which goals are falling behind relative to where we are in the year
-- Identify if any yearly goals conflict with each other (resource/time competition)
-- Suggest the ONE goal that deserves focus this week based on impact + deadline proximity
-- Help them think about what "60% through Q1 but 20% on this goal" actually means
-- Flag if a goal seems vague or unmeasurable and suggest how to sharpen it
-- Keep the vision statement as the north star in your analysis
-
-Tone: Strategic advisor, not cheerleader. Sharp, practical, focused.""",
-
-    'ceo': """You are an executive performance coach inside the 777 Command Center.
-
-The user does a weekly CEO Review: scoring themselves 1-10 across the 7 F's (Family, Career, Fitness, Faith, Finance, Fellowship, Fun), noting wins, lessons, and next-week focuses.
-
-Your role:
-- Generate a 3-bullet "CEO Brief" summarizing the week from the scores and notes
-- Identify the 1-2 F's with the lowest scores and ask what specifically drove them down
-- Spot trend patterns if history is available ("Finance has been below 6 for 4 weeks")
-- Suggest ONE 20-minute action this week for the lowest-scored F
-- Validate wins genuinely — don't inflate them
-- Help them see if their "next week focuses" are actually addressing their weak F's
-
-Tone: Senior executive coach. Calm, analytical, high-trust.""",
-
-    'ritual': """You are a performance ritual optimizer inside the 777 Command Center.
-
-The user has a morning ritual stack with specific activities and durations. You have their completion history and their goals.
-
-Your role:
-- Identify which rituals have low completion rates and ask what's making them hard
-- Suggest one ritual addition that connects to their stated goals
-- Identify if their ritual stack is overcrowded (too many items = completion failure)
-- Flag time conflicts or unrealistic time allocations
-- Suggest optimal ordering based on energy management principles (high-focus work first)
-- Never suggest removing faith/prayer/family rituals unless user asks
-- Connect ritual suggestions back to the 7 F's they scored low on
-
-Tone: Practical performance coach. Evidence-based, respectful of personal practices.""",
-
-    'gratitude': """You are a gratitude depth coach inside the 777 Command Center.
-
-The user journals 3 gratitude entries daily plus a "why" elaboration. You have access to their recent entries and patterns.
-
-Your role:
-- Reflect themes you notice across their gratitude entries ("You often mention family — that's a core anchor")
-- If entries are shallow (one word, generic), ask ONE question to deepen them
-- Generate a monthly gratitude summary when they have enough history
-- Ask: "What would you lose if this gratitude was gone?" to deepen reflection
-- Identify if their gratitude entries are skewing toward one life area (work-heavy, etc.)
-- Never be preachy about gratitude practice — they're already doing it
-
-Tone: Thoughtful journal partner. Warm, curious, reflective.""",
-
-    'thinking': """You are a strategic thinking coach inside the 777 Command Center.
-
-The user is working through a structured thinking exercise. The exercise type and their current inputs are provided in the context data.
-
-Your role:
-- Analyze their inputs through the specific framework they're using (Eisenhower, SWOT, Pareto, etc.)
-- Challenge assumptions — point out what they might be missing
-- Ask ONE probing question that could shift their perspective
-- Offer ONE actionable insight based on their data
-- Keep responses under 250 words — this is a quick coaching nudge, not a lecture
-- Reference their specific data points, don't give generic advice
-- If their exercise data is sparse, encourage them to add more before the analysis will be truly useful
-
-Tone: Sharp strategic advisor. Direct, practical, Socratic.""",
-}
-
-_777_RATE_LIMITS: dict = {}  # ip -> {window_start, count}
-_777_RATE_WINDOW = 60  # seconds
-_777_RATE_MAX = 20  # requests per minute per IP
-_777_MAX_TURNS = 10
-_777_MAX_CHARS = 2000
-
-
-async def api_777_chat(request) -> JSONResponse:
-    """POST /api/777/chat — AI coaching proxy for 777 Command Center."""
-    # CORS for Vercel-hosted 777
-    origin = request.headers.get("origin", "")
-    cors_origin = origin if (
-        origin == "https://777-command-center.vercel.app"
-    ) else "https://777-command-center.vercel.app"
-    cors = {
-        "Access-Control-Allow-Origin": cors_origin,
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
-        "Vary": "Origin",
-    }
-
-    # Handle preflight
-    if request.method == "OPTIONS":
-        return Response("", status_code=204, headers=cors)
-
-    # Rate limit by IP — use client.host (not X-Forwarded-For which can be spoofed)
-    ip = request.client.host or "unknown"
-    now = time.time()
-    entry = _777_RATE_LIMITS.get(ip)
-    if not entry or now - entry["window_start"] > _777_RATE_WINDOW:
-        _777_RATE_LIMITS[ip] = {"window_start": now, "count": 1}
-    else:
-        entry["count"] += 1
-        if entry["count"] > _777_RATE_MAX:
-            return JSONResponse({"error": "Too many requests. Please wait a moment."}, status_code=429, headers=cors)
-
-    # Get API key
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        # Try loading from .env
-        env_path = Path(os.environ.get("CIV_ROOT", str(Path.home()))) / ".env"
-        if env_path.exists():
-            for line in env_path.read_text().splitlines():
-                if line.startswith("ANTHROPIC_API_KEY="):
-                    api_key = line.split("=", 1)[1].strip()
-                    break
-    if not api_key:
-        return JSONResponse({"error": "AI service not configured. Add ANTHROPIC_API_KEY to .env"}, status_code=500, headers=cors)
-
-    # Parse body
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400, headers=cors)
-
-    module = body.get("module", "")
-    messages = body.get("messages", [])
-    context = body.get("context")
-
-    # Validate module
-    if module not in _777_SYSTEM_PROMPTS:
-        return JSONResponse(
-            {"error": f"Invalid module. Must be one of: {', '.join(_777_SYSTEM_PROMPTS.keys())}"},
-            status_code=400, headers=cors
-        )
-
-    # Validate messages
-    if not isinstance(messages, list) or len(messages) == 0:
-        return JSONResponse({"error": "messages array required"}, status_code=400, headers=cors)
-
-    # Sanitize messages
-    sanitized = []
-    for m in messages[-_777_MAX_TURNS:]:
-        if not isinstance(m, dict) or "role" not in m or "content" not in m:
-            continue
-        role = "user" if m["role"] == "user" else "assistant"
-        content = str(m["content"])[:_777_MAX_CHARS]
-        sanitized.append({"role": role, "content": content})
-
-    if not sanitized or sanitized[0]["role"] != "user":
-        return JSONResponse({"error": "First message must be from user"}, status_code=400, headers=cors)
-
-    # Build system prompt
-    system_prompt = _777_SYSTEM_PROMPTS[module]
-    if context and isinstance(context, dict):
-        context_str = json.dumps(context, indent=2)[:3000]
-        system_prompt += f"\n\n---\nCURRENT EXERCISE DATA (JSON):\n{context_str}"
-
-    # Call Anthropic API
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "Content-Type": "application/json",
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                },
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 600,
-                    "system": system_prompt,
-                    "messages": sanitized,
-                },
-            )
-    except Exception as e:
-        print(f"[777-chat] Anthropic fetch error: {e}")
-        return JSONResponse({"error": "AI service unreachable. Please try again."}, status_code=502, headers=cors)
-
-    if resp.status_code != 200:
-        print(f"[777-chat] Anthropic error {resp.status_code}: {resp.text[:200]}")
-        status = 429 if resp.status_code == 429 else 502
-        msg = "AI rate limit hit. Please wait 30 seconds." if resp.status_code == 429 else "AI service error. Please try again."
-        return JSONResponse({"error": msg}, status_code=status, headers=cors)
-
-    try:
-        data = resp.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid response from AI service."}, status_code=502, headers=cors)
-
-    text = ""
-    if data.get("content") and len(data["content"]) > 0:
-        text = data["content"][0].get("text", "")
-    if not text:
-        return JSONResponse({"error": "Empty response from AI."}, status_code=502, headers=cors)
-
-    print(f"[777-chat] {module} response for {ip} ({len(text)} chars)")
-    return JSONResponse({"reply": text}, headers=cors)
 
 
 async def api_scheduled_tasks_list(request) -> JSONResponse:
@@ -3413,15 +3582,43 @@ async def _startup() -> None:
     await _init_referral_db()
     await _init_clients_db()
     await _init_agents_db()
-    _trio_init_db()
     asyncio.create_task(_thinking_monitor_loop())
     asyncio.create_task(_trim_portal_log_periodically())
     asyncio.create_task(_scheduled_task_checker())
     asyncio.create_task(_auto_import_clients_loop())
     asyncio.create_task(_paypal_subscription_sync_loop())
     _load_scheduled_tasks()
+    # Auto-seed module backup if none exists yet
+    if not (MODULE_BACKUP_DIR / "manifest.json").exists():
+        try:
+            _backup_modules()
+            print("[portal-startup] Auto-seeded module backup")
+        except Exception as _e:
+            print(f"[portal-startup] WARNING: module backup auto-seed failed: {_e}")
+    log_activity(f"Portal started (v{PORTAL_VERSION})", "", "system")
+    asyncio.create_task(_fleet_heartbeat_loop())
     for _hook in _custom_startup_hooks:  # Flux overlay: custom startup hooks
         await _hook()
+
+
+async def _fleet_heartbeat_loop() -> None:
+    """POST portal version + basic metrics to the release server every 5 min."""
+    while True:
+        await asyncio.sleep(300)
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    "https://cc.purebrain.ai/api/releases/portal/heartbeat",
+                    json={
+                        "civ_name": CIV_NAME,
+                        "version": PORTAL_VERSION,
+                        "uptime": int(time.time() - START_TIME),
+                    },
+                    headers={"User-Agent": f"PureBrain-Portal/{PORTAL_VERSION}"},
+                    timeout=10,
+                )
+        except Exception:
+            pass  # Silent fail — heartbeat is best-effort
 
 
 async def _auto_import_clients_loop() -> None:
@@ -3666,2942 +3863,45 @@ async def _trim_portal_log_periodically() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Referral System — SQLite-backed (replaces dead WP proxy endpoints)
+# Referral & Client Admin System — extracted to portal_referrals.py
 # ---------------------------------------------------------------------------
+from portal_referrals import (
+    # DB helpers
+    _referral_db, _init_referral_db, _log_financial_event,
+    _clients_db, _init_clients_db,
+    # Code/auth helpers
+    _generate_referral_code, _generate_unique_code, _referral_link,
+    _affiliate_login_rate_check, _create_affiliate_session, _verify_affiliate_session,
+    _hash_affiliate_password, _verify_affiliate_password,
+    _send_reset_email, _send_telegram_notification,
+    _paypal_get_access_token, _execute_paypal_payout,
+    _is_valid_admin_token, _is_admin_token_readonly,
+    # Payout helpers
+    _read_payout_requests_legacy, _write_payout_request_legacy, _update_payout_status_legacy,
+    _read_payout_requests_db, _write_payout_request_db, _update_payout_status_db,
+    # Referral endpoints
+    api_referral_register, api_referral_login, api_referral_session,
+    api_referral_forgot_password, api_referral_reset_password,
+    api_referral_dashboard, api_referral_track, api_referral_complete,
+    api_referral_record_commission, api_referral_code_lookup,
+    api_referral_paypal_email, api_referral_leaderboard,
+    api_portal_owner,
+    api_referral_payout_request, api_referral_payout_history,
+    api_referral_payout_approve,
+    # Admin endpoints
+    api_admin_payout_mark_paid,
+    api_admin_invite, api_admin_invites_list, api_admin_invite_revoke,
+    api_admin_affiliates, api_admin_payouts,
+    api_admin_affiliate_update, api_admin_affiliate_delete,
+    api_admin_referral_update, api_admin_referral_assign,
+    serve_admin_referrals,
+    # Client admin endpoints
+    api_admin_clients, api_public_client_stats,
+    api_admin_clients_update, api_admin_clients_import,
+    api_admin_clients_hide, api_admin_clients_restore,
+    serve_admin_clients, serve_affiliate_portal,
+)
 
-from contextlib import asynccontextmanager
-
-@asynccontextmanager
-async def _referral_db():
-    """Open referral DB with WAL mode and foreign keys enabled."""
-    async with aiosqlite.connect(str(REFERRALS_DB)) as db:
-        await db.execute("PRAGMA journal_mode = WAL")
-        await db.execute("PRAGMA foreign_keys = ON")
-        yield db
-
-
-async def _init_referral_db() -> None:
-    """Create referral tables on startup if they don't exist."""
-    async with aiosqlite.connect(str(REFERRALS_DB)) as db:
-        await db.execute("PRAGMA journal_mode = WAL")
-        await db.execute("PRAGMA foreign_keys = ON")
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS referrers (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_name     TEXT NOT NULL DEFAULT '',
-                user_email    TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                referral_code TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                paypal_email  TEXT NOT NULL DEFAULT '',
-                password_hash TEXT NOT NULL DEFAULT '',
-                created_at    TEXT NOT NULL
-            )
-        """)
-        # Migration: add password_hash column to existing DBs without it
-        try:
-            await db.execute("ALTER TABLE referrers ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''")
-        except Exception:
-            pass  # column already exists
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS referrals (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                referrer_id  INTEGER NOT NULL REFERENCES referrers(id),
-                referred_email TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
-                referred_name  TEXT NOT NULL DEFAULT '',
-                status       TEXT NOT NULL DEFAULT 'pending',
-                created_at   TEXT NOT NULL,
-                completed_at TEXT
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS referral_clicks (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                referral_code TEXT NOT NULL COLLATE NOCASE,
-                ip_hash      TEXT NOT NULL DEFAULT '',
-                clicked_at   TEXT NOT NULL
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS rewards (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                referrer_id INTEGER NOT NULL REFERENCES referrers(id),
-                referral_id INTEGER REFERENCES referrals(id),
-                reward_type TEXT NOT NULL DEFAULT 'cash',
-                reward_value REAL NOT NULL DEFAULT 0.0,
-                issued_at   TEXT NOT NULL
-            )
-        """)
-        # commission_payments tracks recurring 5% commissions from referred member payments
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS commission_payments (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                referrer_id     INTEGER NOT NULL REFERENCES referrers(id),
-                referral_id     INTEGER NOT NULL REFERENCES referrals(id),
-                payer_email     TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
-                order_id        TEXT NOT NULL DEFAULT '',
-                payment_amount  REAL NOT NULL DEFAULT 0.0,
-                commission_rate REAL NOT NULL DEFAULT 0.05,
-                commission_value REAL NOT NULL DEFAULT 0.0,
-                tier            TEXT NOT NULL DEFAULT '',
-                created_at      TEXT NOT NULL
-            )
-        """)
-        # admin_tokens table for read-only admin viewers
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS admin_tokens (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                token      TEXT NOT NULL UNIQUE,
-                email      TEXT NOT NULL DEFAULT '',
-                name       TEXT NOT NULL DEFAULT '',
-                role       TEXT NOT NULL DEFAULT 'viewer',
-                created_at TEXT NOT NULL
-            )
-        """)
-        # ── payout_requests (replaces JSONL file) ──
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS payout_requests (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                request_id   TEXT NOT NULL UNIQUE,
-                referral_code TEXT NOT NULL COLLATE NOCASE,
-                paypal_email TEXT NOT NULL DEFAULT '',
-                amount       REAL NOT NULL DEFAULT 0.0,
-                status       TEXT NOT NULL DEFAULT 'pending',
-                batch_id     TEXT NOT NULL DEFAULT '',
-                notes        TEXT NOT NULL DEFAULT '',
-                created_at   TEXT NOT NULL,
-                paid_at      TEXT
-            )
-        """)
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_payouts_code ON payout_requests(referral_code)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_payouts_status ON payout_requests(status)")
-
-        # ── financial_audit_log (immutable ledger) ──
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS financial_audit_log (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type  TEXT NOT NULL,
-                actor       TEXT NOT NULL DEFAULT '',
-                referral_code TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
-                amount      REAL NOT NULL DEFAULT 0.0,
-                details     TEXT NOT NULL DEFAULT '',
-                ip_address  TEXT NOT NULL DEFAULT '',
-                created_at  TEXT NOT NULL
-            )
-        """)
-
-        # ── Performance indexes for common query patterns ──
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer_status ON referrals(referrer_id, status)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referred_email ON referrals(referred_email)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_rewards_referrer ON rewards(referrer_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_clicks_code ON referral_clicks(referral_code)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_commissions_referrer ON commission_payments(referrer_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_commissions_order ON commission_payments(order_id)")
-
-        await db.commit()
-
-        # ── One-time migration: import existing JSONL payout requests into SQLite ──
-        if PAYOUT_REQUESTS_FILE.exists():
-            try:
-                with PAYOUT_REQUESTS_FILE.open("r") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            entry = json.loads(line)
-                            await db.execute(
-                                """INSERT OR IGNORE INTO payout_requests
-                                   (request_id, referral_code, paypal_email, amount, status, batch_id, notes, created_at, paid_at)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                                (entry.get("request_id", ""), entry.get("referral_code", ""),
-                                 entry.get("paypal_email", ""), entry.get("amount", 0.0),
-                                 entry.get("status", "pending"), entry.get("batch_id", ""),
-                                 entry.get("notes", ""), entry.get("created_at", ""),
-                                 entry.get("paid_at"))
-                            )
-                        except Exception:
-                            continue
-                await db.commit()
-                # Rename JSONL file to .migrated to prevent re-import
-                PAYOUT_REQUESTS_FILE.rename(PAYOUT_REQUESTS_FILE.with_suffix(".jsonl.migrated"))
-                print("[referral] Migrated payout requests from JSONL to SQLite")
-            except Exception as e:
-                print(f"[referral] JSONL migration error (non-fatal): {e}")
-
-    print(f"[referral] SQLite DB ready: {REFERRALS_DB}")
-
-
-async def _log_financial_event(
-    event_type: str,
-    referral_code: str = "",
-    amount: float = 0.0,
-    actor: str = "",
-    details: str = "",
-    ip_address: str = "",
-) -> None:
-    """Write an immutable audit log entry for financial operations."""
-    try:
-        async with _referral_db() as db:
-            await db.execute(
-                """INSERT INTO financial_audit_log
-                   (event_type, actor, referral_code, amount, details, ip_address, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (event_type, actor, referral_code, amount, details, ip_address,
-                 datetime.now(timezone.utc).isoformat())
-            )
-            await db.commit()
-    except Exception as e:
-        print(f"[referral][AUDIT] Failed to log event: {e}")
-
-
-def _generate_referral_code() -> str:
-    """Generate a unique PB-XXXX referral code."""
-    chars = REFERRAL_CODE_CHARS
-    suffix = "".join(secrets.choice(chars) for _ in range(REFERRAL_CODE_LENGTH))
-    return f"{REFERRAL_CODE_PREFIX}{suffix}"
-
-
-async def _generate_unique_code(db: aiosqlite.Connection) -> str:
-    """Keep generating until we find a code not already in DB."""
-    for _ in range(50):
-        code = _generate_referral_code()
-        cur = await db.execute(
-            "SELECT id FROM referrers WHERE referral_code = ? COLLATE NOCASE", (code,)
-        )
-        if await cur.fetchone() is None:
-            return code
-    raise RuntimeError("Could not generate unique referral code after 50 attempts")
-
-
-def _referral_link(code: str, base_url: str = "https://purebrain.ai") -> str:
-    return f"{base_url}/?ref={code}"
-
-
-def _affiliate_login_rate_check(ip: str) -> bool:
-    """Returns True if this IP is allowed to attempt login (not rate-limited)."""
-    now = time.time()
-    ip_hash = hashlib.sha256(ip.encode()).hexdigest()[:16]
-    entry = _AFFILIATE_LOGIN_ATTEMPTS.get(ip_hash)
-    if entry is None:
-        _AFFILIATE_LOGIN_ATTEMPTS[ip_hash] = {"count": 1, "window_start": now}
-        return True
-    if now - entry["window_start"] > _LOGIN_WINDOW_SECS:
-        # Window expired — reset
-        _AFFILIATE_LOGIN_ATTEMPTS[ip_hash] = {"count": 1, "window_start": now}
-        return True
-    if entry["count"] >= _LOGIN_MAX_ATTEMPTS:
-        return False
-    entry["count"] += 1
-    return True
-
-
-def _create_affiliate_session(referral_code: str) -> str:
-    """Create and store a session token for an affiliate. Returns the token."""
-    token = secrets.token_urlsafe(32)
-    _AFFILIATE_SESSIONS[token] = {
-        "code": referral_code.upper(),
-        "expires": time.time() + _SESSION_TTL_SECS,
-    }
-    return token
-
-
-def _verify_affiliate_session(token: str) -> str | None:
-    """Verify a session token. Returns the referral_code on success, None otherwise."""
-    if not token:
-        return None
-    entry = _AFFILIATE_SESSIONS.get(token)
-    if entry is None:
-        return None
-    if time.time() > entry["expires"]:
-        del _AFFILIATE_SESSIONS[token]
-        return None
-    return entry["code"]
-
-
-async def _paypal_get_access_token() -> str | None:
-    """Fetch a short-lived PayPal OAuth2 access token."""
-    if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
-        return None
-    base = "https://api-m.sandbox.paypal.com" if PAYPAL_SANDBOX else "https://api-m.paypal.com"
-    url  = f"{base}/v1/oauth2/token"
-    data = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode()
-    credentials = f"{PAYPAL_CLIENT_ID}:{PAYPAL_CLIENT_SECRET}"
-    b64 = __import__("base64").b64encode(credentials.encode()).decode()
-    req = urllib.request.Request(
-        url, data=data,
-        headers={"Authorization": f"Basic {b64}", "Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = json.loads(resp.read())
-            return body.get("access_token")
-    except Exception as e:
-        print(f"[paypal] Failed to get access token: {e}")
-        return None
-
-
-async def _execute_paypal_payout(paypal_email: str, amount: float, request_id: str, note: str = "") -> dict:
-    """Execute a PayPal payout via the Payouts API.
-
-    Returns dict with keys: ok (bool), batch_id (str|None), error (str|None).
-    """
-    access_token = await _paypal_get_access_token()
-    if not access_token:
-        return {"ok": False, "batch_id": None, "error": "Could not obtain PayPal access token. Check credentials."}
-
-    base = "https://api-m.sandbox.paypal.com" if PAYPAL_SANDBOX else "https://api-m.paypal.com"
-    url  = f"{base}/v1/payments/payouts"
-
-    sender_batch_id = f"pb-payout-{request_id}-{int(time.time())}"
-    payload = {
-        "sender_batch_header": {
-            "sender_batch_id": sender_batch_id,
-            "email_subject":   "PureBrain Affiliate Payout",
-            "email_message":   note or "Your PureBrain affiliate commission payout has been sent.",
-        },
-        "items": [
-            {
-                "recipient_type": "EMAIL",
-                "amount":         {"value": f"{amount:.2f}", "currency": "USD"},
-                "receiver":       paypal_email,
-                "note":           note or "PureBrain affiliate commission",
-                "sender_item_id": request_id,
-            }
-        ],
-    }
-    data = json.dumps(payload).encode()
-    req  = urllib.request.Request(
-        url, data=data,
-        headers={
-            "Authorization":  f"Bearer {access_token}",
-            "Content-Type":   "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            body = json.loads(resp.read())
-            batch_id = body.get("batch_header", {}).get("payout_batch_id", sender_batch_id)
-            return {"ok": True, "batch_id": batch_id, "error": None}
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode(errors="replace")
-        print(f"[paypal] Payout HTTP error {e.code}: {err_body}")
-        return {"ok": False, "batch_id": None, "error": f"PayPal error {e.code}: {err_body[:200]}"}
-    except Exception as e:
-        print(f"[paypal] Payout exception: {e}")
-        return {"ok": False, "batch_id": None, "error": str(e)}
-
-
-def _hash_affiliate_password(password: str, salt: str = "") -> str:
-    """Bcrypt hash of password. Returns bcrypt hash string.
-    The `salt` param is ignored (kept for call-site compatibility with old code).
-    """
-    import bcrypt as _bcrypt
-    return _bcrypt.hashpw(password.encode("utf-8"), _bcrypt.gensalt(rounds=12)).decode("utf-8")
-
-
-def _verify_affiliate_password(password: str, stored_hash: str) -> bool:
-    """Verify password against stored hash.
-    Supports both bcrypt (new, starts with $2b$) and legacy SHA-256 (salt:hash).
-    On successful legacy verify, the caller should migrate to bcrypt.
-    """
-    import bcrypt as _bcrypt
-    if not stored_hash:
-        return False
-    if stored_hash.startswith("$2b$") or stored_hash.startswith("$2a$"):
-        # Bcrypt hash
-        try:
-            return _bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8"))
-        except Exception:
-            return False
-    # Legacy SHA-256 format: salt:hexdigest
-    if ":" not in stored_hash:
-        return False
-    parts = stored_hash.split(":", 1)
-    if len(parts) != 2:
-        return False
-    salt_val, expected_hex = parts
-    h = hashlib.sha256(f"{salt_val}:{password}".encode()).hexdigest()
-    return hmac.compare_digest(h, expected_hex)
-
-
-# ── Password reset tokens (in-memory, expire after 1 hour) ──────────────────
-_password_reset_tokens: dict = {}  # token -> {"email": str, "expires": float}
-_PASSWORD_RESET_EXPIRY = 3600  # 1 hour
-
-
-def _send_reset_email(to_email: str, reset_url: str) -> bool:
-    """Send a password reset email via Gmail SMTP."""
-    import smtplib
-    from email.mime.text import MIMEText
-    from email.mime.multipart import MIMEMultipart
-
-    smtp_user = os.environ.get("SMTP_USER", "") or os.environ.get("GMAIL_USERNAME", "")
-    smtp_pass = os.environ.get("SMTP_PASS", "") or os.environ.get("GOOGLE_APP_PASSWORD", "")
-    if not smtp_user or not smtp_pass:
-        print("[portal] WARNING: SMTP_USER/SMTP_PASS (and GMAIL_USERNAME/GOOGLE_APP_PASSWORD) not set — cannot send reset email")
-        return False
-
-    msg = MIMEMultipart("alternative")
-    msg["From"] = f"PureBrain <{smtp_user}>"
-    msg["To"] = to_email
-    msg["Subject"] = "Reset Your PureBrain Affiliate Password"
-
-    text = f"Reset your PureBrain affiliate password:\n\n{reset_url}\n\nThis link expires in 1 hour. If you didn't request this, ignore this email."
-
-    html = f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"></head>
-<body style="background:#080a12;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:32px;">
-<div style="max-width:500px;margin:0 auto;background:#0d1120;border:1px solid #1e2a40;border-radius:12px;padding:40px;">
-  <div style="text-align:center;margin-bottom:24px;">
-    <span style="font-size:22px;font-weight:700;">
-      <span style="color:#2a93c1;">PUREBR</span><span style="color:#f1420b;">AI</span><span style="color:#2a93c1;">N</span>
-    </span>
-  </div>
-  <h2 style="color:#fff;font-size:20px;margin:0 0 16px;">Reset Your Password</h2>
-  <p style="color:#9ca3af;font-size:14px;line-height:1.6;margin:0 0 24px;">
-    Click the button below to reset your affiliate dashboard password. This link expires in 1 hour.
-  </p>
-  <div style="text-align:center;margin:32px 0;">
-    <a href="{reset_url}" style="display:inline-block;background:linear-gradient(135deg,#2a93c1,#1d6e99);color:#fff;font-size:15px;font-weight:700;text-decoration:none;padding:14px 36px;border-radius:8px;box-shadow:0 4px 16px rgba(42,147,193,0.4);">
-      Reset Password
-    </a>
-  </div>
-  <p style="color:#6b7280;font-size:12px;text-align:center;">If you didn't request this, you can safely ignore this email.</p>
-</div>
-</body></html>"""
-
-    msg.attach(MIMEText(text, "plain"))
-    msg.attach(MIMEText(html, "html"))
-
-    try:
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls()
-        server.login(smtp_user, smtp_pass)
-        server.sendmail(smtp_user, to_email, msg.as_string())
-        server.quit()
-        return True
-    except Exception as e:
-        print(f"[reset-email] SMTP error: {e}")
-        return False
-
-
-async def api_referral_forgot_password(request: Request) -> JSONResponse:
-    """POST /api/referral/forgot-password — send a password reset email."""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    email = str(body.get("email", "")).strip().lower()
-    if not email or "@" not in email:
-        return JSONResponse({"error": "valid email required"}, status_code=400)
-
-    # Always return success to prevent email enumeration
-    success_msg = {"ok": True, "message": "If that email is registered, a reset link has been sent."}
-
-    async with _referral_db() as db:
-        cur = await db.execute(
-            "SELECT referral_code FROM referrers WHERE user_email = ? COLLATE NOCASE",
-            (email,)
-        )
-        row = await cur.fetchone()
-
-    if not row:
-        return JSONResponse(success_msg)
-
-    # Generate reset token
-    token = secrets.token_urlsafe(32)
-    _password_reset_tokens[token] = {
-        "email": email,
-        "expires": time.time() + _PASSWORD_RESET_EXPIRY,
-    }
-
-    # Clean up expired tokens
-    now = time.time()
-    expired = [t for t, v in _password_reset_tokens.items() if v["expires"] < now]
-    for t in expired:
-        del _password_reset_tokens[t]
-
-    reset_url = f"https://purebrain.ai/refer/?reset={token}"
-    sent = _send_reset_email(email, reset_url)
-    if not sent:
-        print(f"[reset] Failed to send reset email to {email}")
-
-    return JSONResponse(success_msg)
-
-
-async def api_referral_reset_password(request: Request) -> JSONResponse:
-    """POST /api/referral/reset-password — set new password using reset token."""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    token = str(body.get("token", "")).strip()
-    new_password = str(body.get("password", "")).strip()
-
-    if not token:
-        return JSONResponse({"error": "reset token required"}, status_code=400)
-    if not new_password or len(new_password) < 6:
-        return JSONResponse({"error": "password must be at least 6 characters"}, status_code=400)
-
-    token_data = _password_reset_tokens.get(token)
-    if not token_data:
-        return JSONResponse({"error": "invalid or expired reset link. Please request a new one."}, status_code=400)
-
-    if time.time() > token_data["expires"]:
-        del _password_reset_tokens[token]
-        return JSONResponse({"error": "reset link has expired. Please request a new one."}, status_code=400)
-
-    email = token_data["email"]
-    pw_hash = _hash_affiliate_password(new_password)
-
-    async with _referral_db() as db:
-        await db.execute(
-            "UPDATE referrers SET password_hash = ? WHERE user_email = ? COLLATE NOCASE",
-            (pw_hash, email)
-        )
-        await db.commit()
-
-    # Consume the token
-    del _password_reset_tokens[token]
-
-    return JSONResponse({"ok": True, "message": "Password updated successfully. You can now log in."})
-
-
-
-async def api_referral_register(request: Request) -> JSONResponse:
-    """POST /api/referral/register — register as referrer, get unique code back."""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    name     = str(body.get("name", "")).strip()
-    email    = str(body.get("email", "")).strip().lower()
-    password = str(body.get("password", "")).strip()
-    paypal_email = str(body.get("paypal_email", "")).strip()
-
-    if not email or "@" not in email or "." not in email.split("@")[-1]:
-        return JSONResponse({"error": "invalid email"}, status_code=400)
-
-    # Auto-generate password if not provided (public form doesn't include a password field)
-    is_portal_auth = check_auth(request)
-    if not password or len(password) < 6:
-        password = secrets.token_urlsafe(16)
-
-    pw_hash = _hash_affiliate_password(password)
-
-    async with _referral_db() as db:
-        # Check if already registered
-        cur = await db.execute(
-            "SELECT id, referral_code FROM referrers WHERE user_email = ? COLLATE NOCASE",
-            (email,)
-        )
-        row = await cur.fetchone()
-        if row:
-            code = row[1]
-            return JSONResponse({
-                "ok": True,
-                "referral_code": code,
-                "referral_link": _referral_link(code),
-                "existing": True,
-                "message": "You are already registered. Here is your existing referral link.",
-            })
-
-        code = await _generate_unique_code(db)
-        now  = datetime.now(timezone.utc).isoformat()
-        await db.execute(
-            "INSERT INTO referrers (user_name, user_email, referral_code, password_hash, paypal_email, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (name, email, code, pw_hash, paypal_email, now)
-        )
-        await db.commit()
-
-    return JSONResponse({
-        "ok": True,
-        "referral_code": code,
-        "referral_link": _referral_link(code),
-        "existing": False,
-        "message": "Registration successful!",
-    })
-
-
-async def api_referral_login(request: Request) -> JSONResponse:
-    """POST /api/referral/login — verify affiliate password, return referral code."""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    code     = str(body.get("referral_code", "")).strip().upper()
-    email    = str(body.get("email", "")).strip().lower()
-    password = str(body.get("password", "")).strip()
-
-    if not password:
-        return JSONResponse({"error": "password required"}, status_code=400)
-    if not code and not email:
-        return JSONResponse({"error": "referral_code or email required"}, status_code=400)
-
-    # Rate-limit by IP (H1 fix — matches /session endpoint)
-    client_ip = request.client.host if request.client else "unknown"
-    if not _affiliate_login_rate_check(client_ip):
-        return JSONResponse({"error": "too many login attempts — try again later"}, status_code=429)
-
-    async with _referral_db() as db:
-        db.row_factory = aiosqlite.Row
-        if code:
-            cur = await db.execute(
-                "SELECT referral_code, password_hash FROM referrers WHERE referral_code = ? COLLATE NOCASE",
-                (code,)
-            )
-        else:
-            cur = await db.execute(
-                "SELECT referral_code, password_hash FROM referrers WHERE user_email = ? COLLATE NOCASE",
-                (email,)
-            )
-        row = await cur.fetchone()
-
-    if row is None:
-        return JSONResponse({"error": "referrer not found"}, status_code=404)
-
-    stored_hash = row["password_hash"]
-    if not stored_hash:
-        # Account created before password system — allow any password and set it now
-        pw_hash = _hash_affiliate_password(password)
-        async with _referral_db() as db:
-            await db.execute(
-                "UPDATE referrers SET password_hash = ? WHERE referral_code = ? COLLATE NOCASE",
-                (pw_hash, row["referral_code"])
-            )
-            await db.commit()
-        # Log the first-time password claim for security audit (H2 fix)
-        print(f"[referral][SECURITY] First password claim for {row['referral_code']} from IP {client_ip}")
-        try:
-            _send_telegram_notification(
-                f"FIRST PASSWORD SET\n"
-                f"Code: {row['referral_code']}\n"
-                f"IP: {client_ip}\n"
-                f"Via: /api/referral/login"
-            )
-        except Exception:
-            pass  # notification is best-effort
-    elif not _verify_affiliate_password(password, stored_hash):
-        return JSONResponse({"error": "incorrect password"}, status_code=401)
-    elif not (stored_hash.startswith("$2b$") or stored_hash.startswith("$2a$")):
-        # Auto-migrate legacy SHA-256 hash to bcrypt on successful login
-        migrated_hash = _hash_affiliate_password(password)
-        async with _referral_db() as db:
-            await db.execute(
-                "UPDATE referrers SET password_hash = ? WHERE referral_code = ? COLLATE NOCASE",
-                (migrated_hash, row["referral_code"])
-            )
-            await db.commit()
-
-    return JSONResponse({"ok": True, "referral_code": row["referral_code"]})
-
-
-async def api_referral_session(request: Request) -> JSONResponse:
-    """POST /api/referral/session — login and receive a session token for dashboard access.
-
-    Body: { email, password } or { referral_code, password }
-    Returns: { ok, session_token, referral_code, expires_in }
-    """
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    code     = str(body.get("referral_code", "")).strip().upper()
-    email    = str(body.get("email", "")).strip().lower()
-    password = str(body.get("password", "")).strip()
-
-    if not password:
-        return JSONResponse({"error": "password required"}, status_code=400)
-    if not code and not email:
-        return JSONResponse({"error": "referral_code or email required"}, status_code=400)
-
-    # Rate-limit by IP
-    client_ip = request.client.host if request.client else ""
-    if not _affiliate_login_rate_check(client_ip):
-        return JSONResponse({"error": "too many login attempts. Please wait 15 minutes."}, status_code=429)
-
-    async with _referral_db() as db:
-        db.row_factory = aiosqlite.Row
-        if code:
-            cur = await db.execute(
-                "SELECT referral_code, password_hash FROM referrers WHERE referral_code = ? COLLATE NOCASE",
-                (code,)
-            )
-        else:
-            cur = await db.execute(
-                "SELECT referral_code, password_hash FROM referrers WHERE user_email = ? COLLATE NOCASE",
-                (email,)
-            )
-        row = await cur.fetchone()
-
-    if row is None:
-        return JSONResponse({"error": "account not found"}, status_code=404)
-
-    stored_hash = row["password_hash"]
-    if not stored_hash:
-        # First login — set the password
-        pw_hash = _hash_affiliate_password(password)
-        async with _referral_db() as db:
-            await db.execute(
-                "UPDATE referrers SET password_hash = ? WHERE referral_code = ? COLLATE NOCASE",
-                (pw_hash, row["referral_code"])
-            )
-            await db.commit()
-        # FIX 3: Log and notify on first-login password claim
-        _code_for_log = row["referral_code"]
-        print(f"[SECURITY] First-login password claim for affiliate code {_code_for_log} from IP {client_ip}")
-        _tg_send = Path(__file__).parent.parent / "projects" / "AI-CIV" / "aether" / "tools" / "tg_send.sh"
-        if _tg_send.exists():
-            try:
-                subprocess.Popen(
-                    [str(_tg_send), f"[SECURITY] First-login claim: affiliate {_code_for_log} from IP {client_ip}. Verify this is legitimate."],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-            except Exception as _e:
-                print(f"[SECURITY] TG notify failed: {_e}")
-    elif not _verify_affiliate_password(password, stored_hash):
-        return JSONResponse({"error": "incorrect password"}, status_code=401)
-    elif not (stored_hash.startswith("$2b$") or stored_hash.startswith("$2a$")):
-        # Auto-migrate legacy SHA-256 hash to bcrypt on successful login
-        migrated_hash = _hash_affiliate_password(password)
-        async with _referral_db() as db:
-            await db.execute(
-                "UPDATE referrers SET password_hash = ? WHERE referral_code = ? COLLATE NOCASE",
-                (migrated_hash, row["referral_code"])
-            )
-            await db.commit()
-
-    referral_code = row["referral_code"]
-    session_token = _create_affiliate_session(referral_code)
-
-    return JSONResponse({
-        "ok":           True,
-        "session_token": session_token,
-        "referral_code": referral_code,
-        "expires_in":    _SESSION_TTL_SECS,
-    })
-
-
-async def api_referral_dashboard(request: Request) -> JSONResponse:
-    """GET /api/referral/dashboard?code=PB-XXXX — referrer stats. Requires session token or portal bearer token."""
-    code     = request.query_params.get("code", "").strip().upper()
-    email    = request.query_params.get("email", "").strip().lower()
-    # Portal owner (admin) can see any dashboard without affiliate password
-    portal_authed = check_auth(request)
-
-    if not code and not email:
-        return JSONResponse({"error": "missing code or email"}, status_code=400)
-
-    async with _referral_db() as db:
-        db.row_factory = aiosqlite.Row
-        if code:
-            cur = await db.execute(
-                "SELECT * FROM referrers WHERE referral_code = ? COLLATE NOCASE", (code,)
-            )
-        else:
-            cur = await db.execute(
-                "SELECT * FROM referrers WHERE user_email = ? COLLATE NOCASE", (email,)
-            )
-        referrer = await cur.fetchone()
-        if referrer is None:
-            return JSONResponse({"error": "referrer not found"}, status_code=404)
-
-        # Security: dashboard requires either:
-        #   1. Portal bearer token (admin)
-        #   2. A valid affiliate session token (?session=TOKEN, or X-Affiliate-Session header)
-        #   3. Direct password param (?password=...) as fallback for API callers
-        if not portal_authed:
-            session_token = (
-                request.query_params.get("session", "").strip()
-                or request.headers.get("x-affiliate-session", "").strip()
-            )
-            session_code = _verify_affiliate_session(session_token)
-            if session_code:
-                # Session token valid — verify it belongs to this referrer
-                if session_code.upper() != referrer["referral_code"].upper():
-                    return JSONResponse({"error": "session token does not match this account"}, status_code=403)
-            else:
-                # Password-in-URL removed (security: passwords in query params leak to logs/history).
-                # Use POST /api/referral/session to get a session token, then pass ?session=TOKEN.
-                return JSONResponse({"error": "authentication required — use a session token (?session=TOKEN) or login at purebrain.ai/refer/"}, status_code=401)
-
-        referrer_id   = referrer["id"]
-        referral_code = referrer["referral_code"]
-
-        # Referral counts (exclude rejected paypal placeholder ghosts)
-        cur = await db.execute(
-            """SELECT COUNT(*) FROM referrals WHERE referrer_id = ?
-               AND NOT (status = 'rejected' AND referred_email LIKE 'paypal_%@pending')""",
-            (referrer_id,)
-        )
-        total_referrals = (await cur.fetchone())[0]
-
-        cur = await db.execute(
-            "SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND status = 'completed'",
-            (referrer_id,)
-        )
-        completed = (await cur.fetchone())[0]
-
-        cur = await db.execute(
-            "SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND status = 'pending'",
-            (referrer_id,)
-        )
-        pending = (await cur.fetchone())[0]
-
-        # Total earnings from rewards table
-        cur = await db.execute(
-            "SELECT COALESCE(SUM(reward_value), 0) FROM rewards WHERE referrer_id = ?",
-            (referrer_id,)
-        )
-        earnings = float((await cur.fetchone())[0])
-
-        # Click count
-        cur = await db.execute(
-            "SELECT COUNT(*) FROM referral_clicks WHERE referral_code = ? COLLATE NOCASE",
-            (referral_code,)
-        )
-        total_clicks = (await cur.fetchone())[0]
-
-        # Referral history
-        # Referral history with total commission earned per referred member
-        # Exclude rejected placeholder entries (paypal_*@pending) — they are
-        # unresolved webhook artifacts, not real referrals.
-        cur = await db.execute(
-            """SELECT r.referred_name, r.referred_email, r.status, r.created_at,
-                      COALESCE(SUM(cp.commission_value), 0) AS earnings,
-                      COUNT(cp.id) AS payment_count
-               FROM referrals r
-               LEFT JOIN commission_payments cp ON cp.referral_id = r.id
-               WHERE r.referrer_id = ?
-                 AND NOT (r.status = 'rejected' AND r.referred_email LIKE 'paypal_%@pending')
-               GROUP BY r.id
-               ORDER BY r.created_at DESC""",
-            (referrer_id,)
-        )
-        history = [dict(row) async for row in cur]
-
-    reward_tiers = [
-        {"label": "Commission Rate", "reward": f"{REFERRAL_COMMISSION_RATE * 100:.0f}% of every payment"},
-        {"label": "Frequency", "reward": "Every month, for as long as they are a member"},
-        {"label": "Awakened ($149/mo)", "reward": "$7.45/month per referral"},
-        {"label": "Partnered ($499/mo)", "reward": "$24.95/month per referral"},
-        {"label": "Unified ($999/mo)", "reward": "$49.95/month per referral"},
-        {"label": "Enterprise (Custom)", "reward": "5% of custom monthly rate"},
-    ]
-
-    return JSONResponse({
-        "referral_code": referral_code,
-        "referral_link": _referral_link(referral_code),
-        "email": referrer["user_email"],
-        "name": referrer["user_name"],
-        "paypal_email": referrer["paypal_email"],
-        "total_referrals": total_referrals,
-        "completed": completed,
-        "pending": pending,
-        "earnings": round(earnings, 2),
-        "total_clicks": total_clicks,
-        "history": history,
-        "reward_tiers": reward_tiers,
-        "commission_rate": REFERRAL_COMMISSION_RATE,
-        "commission_rate_pct": f"{REFERRAL_COMMISSION_RATE * 100:.0f}%",
-        "model": "recurring",
-    })
-
-
-async def api_referral_track(request: Request) -> JSONResponse:
-    """POST /api/referral/track — log a referral link click."""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    code = str(body.get("referral_code", "")).strip().upper()
-    if not code:
-        return JSONResponse({"error": "missing referral_code"}, status_code=400)
-
-    # Hash IP for privacy
-    client_ip = request.client.host if request.client else ""
-    ip_hash = hashlib.sha256(client_ip.encode()).hexdigest()[:16]
-
-    # HIGH-007: Rate limit click tracking to prevent spam/inflation
-    now_ts = time.time()
-    entry = _TRACK_RATE_LIMITS.get(ip_hash)
-    if entry is None:
-        _TRACK_RATE_LIMITS[ip_hash] = {"count": 1, "window_start": now_ts}
-    elif now_ts - entry["window_start"] > _TRACK_WINDOW_SECS:
-        _TRACK_RATE_LIMITS[ip_hash] = {"count": 1, "window_start": now_ts}
-    elif entry["count"] >= _TRACK_MAX_PER_WINDOW:
-        return JSONResponse({"error": "rate limited"}, status_code=429)
-    else:
-        entry["count"] += 1
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    async with _referral_db() as db:
-        # Verify code exists
-        cur = await db.execute(
-            "SELECT id FROM referrers WHERE referral_code = ? COLLATE NOCASE", (code,)
-        )
-        if await cur.fetchone() is None:
-            return JSONResponse({"error": "invalid referral code"}, status_code=404)
-
-        await db.execute(
-            "INSERT INTO referral_clicks (referral_code, ip_hash, clicked_at) VALUES (?, ?, ?)",
-            (code, ip_hash, now)
-        )
-        await db.commit()
-
-    return JSONResponse({"ok": True})
-
-
-async def api_referral_complete(request: Request) -> JSONResponse:
-    """POST /api/referral/complete — mark a referral as completed and issue reward.
-
-    NOTE: This endpoint is intentionally PUBLIC (no auth required).
-    It is called from browser JS on the landing pages immediately after PayPal payment.
-    The browser has no bearer token to send. The referral_code itself acts as the
-    credential — only existing referrer codes proceed past the lookup step.
-    Single-referrer enforcement: any previous completed referral for this email under
-    a DIFFERENT referrer is deleted before recording the new one.
-    """
-    # If a completion secret is configured, require it (C2 security fix)
-    complete_secret = os.environ.get("REFERRAL_COMPLETE_SECRET", "")
-    if complete_secret:
-        provided = request.headers.get("x-referral-secret", "")
-        if not hmac.compare_digest(provided, complete_secret):
-            return JSONResponse({"error": "unauthorized"}, status_code=403)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    referral_code  = str(body.get("referral_code", "")).strip().upper()
-    referred_email = str(body.get("referred_email", "")).strip().lower()
-    referred_name  = str(body.get("referred_name", "")).strip()
-    order_id       = str(body.get("order_id", "")).strip()  # PayPal subscription/order ID
-
-    if not referral_code:
-        return JSONResponse({"error": "missing referral_code"}, status_code=400)
-
-    # referred_email is optional for subscription payments where PayPal doesn't
-    # provide payer email in the onApprove callback. We accept an empty email and
-    # use a placeholder derived from order_id so the referral is still recorded.
-    # The admin can manually update the email later via PUT /api/admin/referral/update.
-    if not referred_email or "@" not in referred_email:
-        if order_id:
-            # Try to resolve real client info from clients.db by PayPal subscription ID
-            resolved = False
-            try:
-                async with aiosqlite.connect(str(CLIENTS_DB)) as cdb:
-                    cdb.row_factory = aiosqlite.Row
-                    ccur = await cdb.execute(
-                        "SELECT name, email FROM clients WHERE paypal_subscription_id = ? COLLATE NOCASE LIMIT 1",
-                        (order_id,)
-                    )
-                    client_row = await ccur.fetchone()
-                    if client_row and client_row["email"]:
-                        referred_email = client_row["email"].strip().lower()
-                        if not referred_name:
-                            referred_name = client_row["name"].strip()
-                        resolved = True
-                        print(f"[referral] Resolved PayPal order {order_id} -> {referred_name} <{referred_email}>")
-            except Exception as e:
-                print(f"[referral] Client lookup failed for order {order_id}: {e}")
-
-            if not resolved:
-                # Fallback: record with a placeholder email so the row is traceable
-                referred_email = f"paypal_{order_id.lower()}@pending"
-        else:
-            return JSONResponse({"error": "invalid referred_email"}, status_code=400)
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    async with _referral_db() as db:
-        cur = await db.execute(
-            "SELECT id FROM referrers WHERE referral_code = ? COLLATE NOCASE", (referral_code,)
-        )
-        row = await cur.fetchone()
-        if row is None:
-            return JSONResponse({"error": "invalid referral code"}, status_code=404)
-        referrer_id = row[0]
-
-        # Single-referrer enforcement: remove any existing completed referral for
-        # this email under a DIFFERENT referrer so a client is never double-counted.
-        # Skip single-referrer check for placeholder emails (they are unique per order).
-        if "@pending" not in referred_email:
-            await db.execute(
-                """DELETE FROM referrals
-                   WHERE referred_email = ? COLLATE NOCASE
-                     AND referrer_id != ?""",
-                (referred_email, referrer_id)
-            )
-
-        # Prevent double-completion for same referred email under this referrer.
-        # For placeholder emails (subscription path), always insert a new row since
-        # each order_id is unique and the real email is unknown at this point.
-        existing = None
-        if "@pending" not in referred_email:
-            cur = await db.execute(
-                """SELECT id, status FROM referrals
-                   WHERE referrer_id = ? AND referred_email = ? COLLATE NOCASE""",
-                (referrer_id, referred_email)
-            )
-            existing = await cur.fetchone()
-
-        if existing:
-            if existing[1] == "completed":
-                await db.commit()
-                return JSONResponse({"ok": True, "message": "already completed"})
-            # Update existing pending row
-            referral_id = existing[0]
-            await db.execute(
-                "UPDATE referrals SET status='completed', completed_at=?, referred_name=? WHERE id=?",
-                (now, referred_name or "", referral_id)
-            )
-        else:
-            cur = await db.execute(
-                """INSERT INTO referrals (referrer_id, referred_email, referred_name, status, created_at, completed_at)
-                   VALUES (?, ?, ?, 'completed', ?, ?)""",
-                (referrer_id, referred_email, referred_name, now, now)
-            )
-            referral_id = cur.lastrowid
-
-        await db.commit()
-
-    print(f"[referral] complete: {referral_code} → {referred_email}")
-    # Referral relationship recorded. Commission (5% recurring) will be issued
-    # automatically each time this referred member makes a payment.
-    return JSONResponse({"ok": True, "message": "Referral recorded. You will earn 5% of every payment this member makes."})
-
-
-async def api_referral_record_commission(request: Request) -> JSONResponse:
-    """POST /api/referral/commission — record a 5% recurring commission payment.
-
-    Called by purebrain_log_server when a payment is verified.
-    Payload: { payer_email, order_id, amount, tier }
-    Requires bearer token authentication.
-    """
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    payer_email = str(body.get("payer_email", "")).strip().lower()
-    order_id    = str(body.get("order_id", "")).strip()
-    try:
-        amount = float(body.get("amount", 0))
-    except (TypeError, ValueError):
-        amount = 0.0
-    tier = str(body.get("tier", "")).strip()
-
-    if not payer_email or "@" not in payer_email:
-        return JSONResponse({"error": "missing valid payer_email"}, status_code=400)
-    if not order_id:
-        return JSONResponse({"error": "missing order_id"}, status_code=400)
-    if amount <= 0:
-        return JSONResponse({"ok": True, "skipped": "zero amount, no commission"})
-
-    now = datetime.now(timezone.utc).isoformat()
-    commission_value = round(amount * REFERRAL_COMMISSION_RATE, 2)
-
-    async with _referral_db() as db:
-        # Find a completed referral where this payer was referred
-        cur = await db.execute(
-            """SELECT ref.id, ref.referrer_id
-               FROM referrals ref
-               WHERE ref.referred_email = ? COLLATE NOCASE AND ref.status = 'completed'
-               LIMIT 1""",
-            (payer_email,)
-        )
-        row = await cur.fetchone()
-        if row is None:
-            # This payer was not referred — no commission
-            return JSONResponse({"ok": True, "skipped": "payer not in referrals"})
-
-        referral_id  = row[0]
-        referrer_id  = row[1]
-
-        # Prevent duplicate commission for same order_id
-        cur = await db.execute(
-            "SELECT id FROM commission_payments WHERE order_id = ?", (order_id,)
-        )
-        if await cur.fetchone():
-            return JSONResponse({"ok": True, "skipped": "duplicate order_id"})
-
-        # Record commission payment
-        await db.execute(
-            """INSERT INTO commission_payments
-               (referrer_id, referral_id, payer_email, order_id, payment_amount,
-                commission_rate, commission_value, tier, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (referrer_id, referral_id, payer_email, order_id, amount,
-             REFERRAL_COMMISSION_RATE, commission_value, tier, now)
-        )
-        # Also insert into rewards table so balance queries stay consistent
-        await db.execute(
-            """INSERT INTO rewards (referrer_id, referral_id, reward_type, reward_value, issued_at)
-               VALUES (?, ?, 'commission', ?, ?)""",
-            (referrer_id, referral_id, commission_value, now)
-        )
-        await db.commit()
-
-        # Fetch referrer info for notification
-        cur = await db.execute(
-            "SELECT user_name, user_email FROM referrers WHERE id = ?", (referrer_id,)
-        )
-        referrer_row = await cur.fetchone()
-        referrer_name  = referrer_row[0] if referrer_row else "Unknown"
-        referrer_email = referrer_row[1] if referrer_row else ""
-
-    print(f"[referral] Commission recorded: ${commission_value:.2f} for referrer {referrer_email} "
-          f"(order {order_id}, payer {payer_email}, amount ${amount:.2f})")
-
-    return JSONResponse({
-        "ok": True,
-        "commission_value": commission_value,
-        "referrer_email": referrer_email,
-        "referrer_name": referrer_name,
-        "payer_email": payer_email,
-        "order_id": order_id,
-        "payment_amount": amount,
-        "tier": tier,
-    })
-
-
-async def api_referral_code_lookup(request: Request) -> JSONResponse:
-    """GET /api/referral/code/{email} — get referral code for a registered email."""
-    # Require portal bearer token or affiliate session (H4 fix — prevent email enumeration)
-    if not check_auth(request):
-        session_token = request.query_params.get("session", "") or request.headers.get("x-affiliate-session", "")
-        if not session_token or not _verify_affiliate_session(session_token):
-            return JSONResponse({"error": "authentication required"}, status_code=401)
-
-    email = request.path_params.get("email", "").strip().lower()
-    if not email:
-        return JSONResponse({"error": "missing email"}, status_code=400)
-
-    async with _referral_db() as db:
-        cur = await db.execute(
-            "SELECT referral_code FROM referrers WHERE user_email = ? COLLATE NOCASE", (email,)
-        )
-        row = await cur.fetchone()
-
-    if row is None:
-        return JSONResponse({"error": "not found"}, status_code=404)
-
-    code = row[0]
-    return JSONResponse({
-        "referral_code": code,
-        "referral_link": _referral_link(code),
-    })
-
-
-async def api_referral_paypal_email(request: Request) -> JSONResponse:
-    """POST /api/referral/paypal-email — save PayPal email for a referrer. Requires affiliate password."""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    email        = str(body.get("email", "")).strip().lower()
-    paypal_email = str(body.get("paypal_email", "")).strip().lower()
-    password     = str(body.get("password", "")).strip()
-
-    if not email or "@" not in email:
-        return JSONResponse({"error": "invalid email"}, status_code=400)
-    if not paypal_email or "@" not in paypal_email:
-        return JSONResponse({"error": "invalid paypal_email"}, status_code=400)
-
-    # Auth: portal bearer, affiliate session token, or password
-    portal_authed = check_auth(request)
-
-    async with _referral_db() as db:
-        if not portal_authed:
-            session_token = (
-                str(body.get("session_token", "")).strip()
-                or request.headers.get("x-affiliate-session", "").strip()
-            )
-            session_code = _verify_affiliate_session(session_token)
-            if not session_code:
-                # Fallback to password
-                cur_pw = await db.execute(
-                    "SELECT password_hash FROM referrers WHERE user_email = ? COLLATE NOCASE", (email,)
-                )
-                row_pw = await cur_pw.fetchone()
-                if row_pw is None:
-                    return JSONResponse({"error": "referrer not found"}, status_code=404)
-                stored_hash = row_pw[0]
-                if stored_hash and not _verify_affiliate_password(password, stored_hash):
-                    return JSONResponse({"error": "incorrect password or session required"}, status_code=401)
-
-        cur = await db.execute(
-            "UPDATE referrers SET paypal_email = ? WHERE user_email = ? COLLATE NOCASE",
-            (paypal_email, email)
-        )
-        await db.commit()
-        if cur.rowcount == 0:
-            # If the caller is authenticated via portal bearer token but has no
-            # referrer row yet (auto-registration hasn't run or raced), create
-            # one now so the PayPal save succeeds on first attempt.
-            if portal_authed:
-                code = await _generate_unique_code(db)
-                now  = datetime.now(timezone.utc).isoformat()
-                name = email.split("@")[0]
-                pw_hash = _hash_affiliate_password(secrets.token_urlsafe(16))
-                await db.execute(
-                    "INSERT INTO referrers (user_name, user_email, referral_code, password_hash, paypal_email, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (name, email, code, pw_hash, paypal_email, now)
-                )
-                await db.commit()
-            else:
-                return JSONResponse({"error": "referrer not found"}, status_code=404)
-
-    return JSONResponse({"ok": True})
-
-
-async def api_referral_leaderboard(request: Request) -> JSONResponse:
-    """GET /api/referral/leaderboard -- top referrers by completed referrals.
-
-    FIX (2026-03-31): Use subqueries instead of double LEFT JOIN to avoid
-    cartesian product between referrals and rewards tables.
-    """
-    limit = min(int(request.query_params.get("limit", "10")), 50)
-
-    async with _referral_db() as db:
-        cur = await db.execute(
-            """SELECT r.user_name, r.referral_code,
-                      COALESCE(ref_counts.completed_count, 0) AS completed_count,
-                      COALESCE(rw_totals.total_earned, 0) AS total_earned
-               FROM referrers r
-               LEFT JOIN (
-                   SELECT referrer_id, COUNT(*) AS completed_count
-                   FROM referrals
-                   WHERE status = 'completed'
-                   GROUP BY referrer_id
-               ) ref_counts ON ref_counts.referrer_id = r.id
-               LEFT JOIN (
-                   SELECT referrer_id, SUM(reward_value) AS total_earned
-                   FROM rewards
-                   GROUP BY referrer_id
-               ) rw_totals ON rw_totals.referrer_id = r.id
-               ORDER BY completed_count DESC, total_earned DESC
-               LIMIT ?""",
-            (limit,)
-        )
-        rows = await cur.fetchall()
-
-    leaders = [
-        {
-            "name": row[0] or "Anonymous",
-            "referral_code": row[1],
-            "completed": row[2],
-            "total_earned": round(float(row[3]), 2),
-        }
-        for row in rows
-    ]
-    return JSONResponse({"leaderboard": leaders})
-
-
-async def api_portal_owner(request: Request) -> JSONResponse:
-    """Return portal owner identity for dynamic referral/share features."""
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    owner_file = SCRIPT_DIR / "portal_owner.json"
-    try:
-        owner = json.loads(owner_file.read_text())
-        return JSONResponse(owner)
-    except Exception:
-        return JSONResponse({"name": "Portal User", "email": "", "referral_code": ""})
-
-
-# ---------------------------------------------------------------------------
-# Payout Request API (Phase 3a — Manual Bridge)
-# ---------------------------------------------------------------------------
-
-def _send_telegram_notification(message: str) -> bool:
-    """Send a Telegram notification via tg_send.sh (searches standard locations)."""
-    try:
-        candidates = [
-            Path.home() / "civ" / "tools" / "tg_send.sh",
-            Path.home() / "tools" / "tg_send.sh",
-        ]
-        for tg_send in candidates:
-            if tg_send.exists():
-                subprocess.run(
-                    ["bash", str(tg_send), message],
-                    timeout=15, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
-                )
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def _read_payout_requests_legacy() -> list:
-    """(LEGACY) Read all payout requests from JSONL file. Kept for migration only."""
-    requests_list = []
-    if not PAYOUT_REQUESTS_FILE.exists():
-        return requests_list
-    try:
-        with PAYOUT_REQUESTS_FILE.open("r") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    requests_list.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    except Exception:
-        pass
-    return requests_list
-
-
-def _write_payout_request_legacy(entry: dict) -> None:
-    """(LEGACY) Append a payout request to JSONL file. Kept for migration only."""
-    with PAYOUT_REQUESTS_FILE.open("a") as f:
-        f.write(json.dumps(entry) + "\n")
-
-
-def _update_payout_status_legacy(request_id: str, status: str, batch_id: str = "") -> bool:
-    """(LEGACY) Update payout request in JSONL file. Kept for migration only."""
-    all_requests = _read_payout_requests_legacy()
-    found = False
-    for req in all_requests:
-        if req.get("request_id") == request_id:
-            req["status"] = status
-            if batch_id:
-                req["batch_id"] = batch_id
-            if status in ("completed", "paid"):
-                req["paid_at"] = datetime.now(timezone.utc).isoformat()
-            found = True
-            break
-    if not found:
-        return False
-    try:
-        with PAYOUT_REQUESTS_FILE.open("w") as f:
-            for req in all_requests:
-                f.write(json.dumps(req) + "\n")
-    except Exception:
-        return False
-    return True
-
-
-# ── New SQLite-backed payout helpers (replace JSONL) ──
-
-async def _read_payout_requests_db() -> list:
-    """Read all payout requests from SQLite."""
-    async with _referral_db() as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM payout_requests ORDER BY created_at DESC")
-        rows = await cur.fetchall()
-        result = []
-        for row in rows:
-            d = dict(row)
-            # Synthesize created_at_ts from ISO created_at for backward compat
-            try:
-                dt = datetime.fromisoformat(d.get("created_at", ""))
-                d["created_at_ts"] = dt.timestamp()
-            except (ValueError, TypeError):
-                d["created_at_ts"] = 0.0
-            result.append(d)
-        return result
-
-
-async def _write_payout_request_db(entry: dict) -> None:
-    """Insert a payout request into SQLite. Raises IntegrityError on duplicate request_id."""
-    async with _referral_db() as db:
-        await db.execute(
-            """INSERT INTO payout_requests
-               (request_id, referral_code, paypal_email, amount, status, batch_id, notes, created_at, paid_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (entry["request_id"], entry["referral_code"], entry.get("paypal_email", ""),
-             entry.get("amount", 0.0), entry.get("status", "pending"),
-             entry.get("batch_id", ""), entry.get("notes", ""),
-             entry.get("created_at", ""), entry.get("paid_at"))
-        )
-        await db.commit()
-
-
-async def _update_payout_status_db(request_id: str, status: str, batch_id: str = "", notes: str = "") -> bool:
-    """Update payout request status in SQLite. Returns True if row was found and updated."""
-    async with _referral_db() as db:
-        paid_at = datetime.now(timezone.utc).isoformat() if status in ("completed", "paid") else None
-        cur = await db.execute(
-            """UPDATE payout_requests
-               SET status = ?,
-                   batch_id = CASE WHEN ? != '' THEN ? ELSE batch_id END,
-                   notes = CASE WHEN ? != '' THEN ? ELSE notes END,
-                   paid_at = CASE WHEN ? IS NOT NULL THEN ? ELSE paid_at END
-               WHERE request_id = ?""",
-            (status, batch_id, batch_id, notes, notes, paid_at, paid_at, request_id)
-        )
-        await db.commit()
-        return cur.rowcount > 0
-
-
-async def api_referral_payout_request(request: Request) -> JSONResponse:
-    """POST /api/referral/payout-request — user requests a payout.
-
-    Requires affiliate session token OR portal bearer token.
-    Body: { referral_code, paypal_email, amount, session_token? }
-    """
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    # Auth: portal bearer OR valid affiliate session
-    portal_authed = check_auth(request)
-    session_code = None
-    if not portal_authed:
-        session_token = (
-            str(body.get("session_token", "")).strip()
-            or request.headers.get("x-affiliate-session", "").strip()
-        )
-        session_code = _verify_affiliate_session(session_token)
-        if not session_code:
-            return JSONResponse({"error": "authentication required"}, status_code=401)
-
-    paypal_email = str(body.get("paypal_email", "")).strip().lower()
-    referral_code = str(body.get("referral_code", "")).strip()
-    try:
-        amount = float(body.get("amount", 0))
-    except (TypeError, ValueError):
-        return JSONResponse({"error": "invalid amount"}, status_code=400)
-
-    if not paypal_email or "@" not in paypal_email or "." not in paypal_email.split("@")[-1]:
-        return JSONResponse({"error": "invalid paypal_email"}, status_code=400)
-
-    if not referral_code:
-        return JSONResponse({"error": "missing referral_code"}, status_code=400)
-
-    # IDOR fix: affiliate sessions can only request payouts for their own code
-    if not portal_authed and session_code and session_code.upper() != referral_code.upper():
-        return JSONResponse({"error": "access denied"}, status_code=403)
-
-    if amount < PAYOUT_MIN_AMOUNT:
-        return JSONResponse(
-            {"error": f"minimum payout is ${PAYOUT_MIN_AMOUNT:.0f}"},
-            status_code=400
-        )
-
-    existing = await _read_payout_requests_db()
-    cooldown_secs = PAYOUT_COOLDOWN_DAYS * 86400
-    now_ts = time.time()
-    for req in existing:
-        if req.get("referral_code") == referral_code and req.get("status") in ("pending", "processing"):
-            created_at = req.get("created_at_ts", 0)
-            if (now_ts - created_at) < cooldown_secs:
-                days_left = int((cooldown_secs - (now_ts - created_at)) / 86400) + 1
-                return JSONResponse(
-                    {"error": f"payout already requested. Please wait {days_left} more day(s)."},
-                    status_code=429
-                )
-
-    # Check balance against SQLite rewards table
-    actual_earnings = 0.0
-    try:
-        async with _referral_db() as _db:
-            _cur = await _db.execute(
-                """SELECT COALESCE(SUM(rw.reward_value), 0)
-                   FROM rewards rw
-                   JOIN referrers r ON r.id = rw.referrer_id
-                   WHERE r.referral_code = ? COLLATE NOCASE""",
-                (referral_code,)
-            )
-            _row = await _cur.fetchone()
-            actual_earnings = float(_row[0]) if _row else 0.0
-    except Exception as e:
-        print(f"[referral] DB error during payout balance check: {e}")
-        return JSONResponse(
-            {"error": "unable to verify balance — please try again later"},
-            status_code=503
-        )
-
-    # Subtract already-paid amounts from available balance (C4 fix, now atomic via SQLite)
-    try:
-        async with _referral_db() as _db:
-            _cur = await _db.execute(
-                """SELECT COALESCE(SUM(amount), 0) FROM payout_requests
-                   WHERE referral_code = ? COLLATE NOCASE
-                   AND status IN ('completed', 'paid')""",
-                (referral_code,)
-            )
-            _row = await _cur.fetchone()
-            paid_total = float(_row[0]) if _row else 0.0
-            actual_earnings -= paid_total
-    except Exception as e:
-        print(f"[referral] Error reading payout history for balance deduction: {e}")
-        return JSONResponse(
-            {"error": "unable to verify payout history — please try again later"},
-            status_code=503
-        )
-
-    if amount > actual_earnings:
-        return JSONResponse(
-            {"error": f"requested amount ${amount:.2f} exceeds available balance ${actual_earnings:.2f}"},
-            status_code=400
-        )
-
-    request_id = f"payout-{referral_code}-{int(now_ts)}"
-    entry = {
-        "request_id": request_id,
-        "referral_code": referral_code,
-        "paypal_email": paypal_email,
-        "amount": round(amount, 2),
-        "status": "pending",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "created_at_ts": now_ts,
-        "paid_at": None,
-        "notes": "",
-    }
-    await _write_payout_request_db(entry)
-
-    # Audit log: payout requested
-    client_ip = request.client.host if request.client else "unknown"
-    await _log_financial_event(
-        event_type="payout_requested",
-        referral_code=referral_code,
-        amount=round(amount, 2),
-        actor=f"affiliate:{referral_code}",
-        details=f"paypal={paypal_email}, request_id={request_id}, available_balance=${actual_earnings:.2f}",
-        ip_address=client_ip,
-    )
-
-    # Auto-approve payouts up to $1,000; larger amounts require manual approval
-    if amount <= PAYOUT_AUTO_APPROVE_LIMIT:
-        try:
-            payout_result = await _execute_paypal_payout(
-                paypal_email=paypal_email,
-                amount=round(amount, 2),
-                request_id=request_id,
-                note=f"PureBrain referral payout for {referral_code}",
-            )
-            if payout_result.get("ok"):
-                # Update payout status to completed
-                await _update_payout_status_db(request_id, "completed", batch_id=payout_result.get("batch_id", ""))
-                # Audit log: auto-payout sent
-                await _log_financial_event(
-                    event_type="auto_payout_sent",
-                    referral_code=referral_code,
-                    amount=round(amount, 2),
-                    actor=f"affiliate:{referral_code}",
-                    details=f"paypal={paypal_email}, batch_id={payout_result.get('batch_id', 'n/a')}, request_id={request_id}",
-                    ip_address=client_ip,
-                )
-                tg_msg = (
-                    f"AUTO-PAYOUT SENT\n"
-                    f"Referral: {referral_code}\n"
-                    f"Amount: ${amount:.2f}\n"
-                    f"PayPal: {paypal_email}\n"
-                    f"Batch ID: {payout_result.get('batch_id', 'n/a')}\n"
-                    f"Request ID: {request_id}"
-                )
-                _send_telegram_notification(tg_msg)
-                return JSONResponse({
-                    "ok": True,
-                    "request_id": request_id,
-                    "message": f"Payout of ${amount:.2f} sent to {paypal_email}!",
-                    "amount": round(amount, 2),
-                    "paypal_email": paypal_email,
-                    "auto_approved": True,
-                    "batch_id": payout_result.get("batch_id"),
-                })
-            else:
-                # PayPal failed — fall through to manual
-                tg_msg = (
-                    f"AUTO-PAYOUT FAILED — NEEDS MANUAL\n"
-                    f"Referral: {referral_code}\n"
-                    f"Amount: ${amount:.2f}\n"
-                    f"PayPal: {paypal_email}\n"
-                    f"Error: {payout_result.get('error', 'unknown')}\n"
-                    f"Request ID: {request_id}"
-                )
-                _send_telegram_notification(tg_msg)
-        except Exception as e:
-            tg_msg = (
-                f"AUTO-PAYOUT EXCEPTION — NEEDS MANUAL\n"
-                f"Referral: {referral_code}\n"
-                f"Amount: ${amount:.2f}\n"
-                f"PayPal: {paypal_email}\n"
-                f"Error: {str(e)[:200]}\n"
-                f"Request ID: {request_id}"
-            )
-            _send_telegram_notification(tg_msg)
-    else:
-        # Over $1,000 — require manual approval
-        tg_msg = (
-            f"PAYOUT REQUEST — MANUAL APPROVAL REQUIRED (>${PAYOUT_AUTO_APPROVE_LIMIT:.0f})\n"
-            f"Referral: {referral_code}\n"
-            f"Amount: ${amount:.2f}\n"
-            f"PayPal: {paypal_email}\n"
-            f"Request ID: {request_id}\n"
-            f"Earnings on file: ${actual_earnings:.2f}\n"
-            f"To approve: POST /api/referral/payout-approve with request_id"
-        )
-        _send_telegram_notification(tg_msg)
-
-    return JSONResponse({
-        "ok": True,
-        "request_id": request_id,
-        "message": "Payout request submitted. We will process within 2 business days." if amount > PAYOUT_AUTO_APPROVE_LIMIT else "Payout is being processed.",
-        "amount": round(amount, 2),
-        "paypal_email": paypal_email,
-    })
-
-
-async def api_referral_payout_history(request: Request) -> JSONResponse:
-    """GET /api/referral/payout-history?referral_code=XXX&session=TOKEN"""
-    portal_authed = check_auth(request)
-    session_code = None
-    if not portal_authed:
-        session_token = (
-            request.query_params.get("session", "").strip()
-            or request.headers.get("x-affiliate-session", "").strip()
-        )
-        session_code = _verify_affiliate_session(session_token)
-        if not session_code:
-            return JSONResponse({"error": "authentication required"}, status_code=401)
-
-    referral_code = request.query_params.get("referral_code", "").strip()
-    if not referral_code:
-        return JSONResponse({"error": "missing referral_code"}, status_code=400)
-
-    # HIGH-005: IDOR fix — affiliate sessions can only view their own payout history
-    if not portal_authed and session_code and session_code.upper() != referral_code.upper():
-        return JSONResponse({"error": "access denied"}, status_code=403)
-
-    all_requests = await _read_payout_requests_db()
-    user_requests = [r for r in all_requests if r.get("referral_code") == referral_code]
-    user_requests.sort(key=lambda r: r.get("created_at_ts", 0), reverse=True)
-
-    cooldown_secs = PAYOUT_COOLDOWN_DAYS * 86400
-    now_ts = time.time()
-    has_pending = False
-    days_until_eligible = 0
-    for req in user_requests:
-        if req.get("status") in ("pending", "processing"):
-            created_at = req.get("created_at_ts", 0)
-            elapsed = now_ts - created_at
-            if elapsed < cooldown_secs:
-                has_pending = True
-                days_until_eligible = int((cooldown_secs - elapsed) / 86400) + 1
-                break
-
-    return JSONResponse({
-        "requests": user_requests,
-        "has_pending": has_pending,
-        "days_until_eligible": days_until_eligible,
-    })
-
-
-async def api_admin_payout_mark_paid(request: Request) -> JSONResponse:
-    """POST /api/admin/payout/mark-paid — admin marks a payout as paid."""
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    request_id = str(body.get("request_id", "")).strip()
-    notes = str(body.get("notes", "")).strip()
-
-    if not request_id:
-        return JSONResponse({"error": "missing request_id"}, status_code=400)
-
-    # Read the target request from DB first to get details for notification
-    all_requests = await _read_payout_requests_db()
-    paid_entry = None
-    for req in all_requests:
-        if req.get("request_id") == request_id:
-            paid_entry = req
-            break
-
-    if not paid_entry:
-        return JSONResponse({"error": "request_id not found"}, status_code=404)
-
-    ok = await _update_payout_status_db(request_id, "paid", notes=notes)
-    if not ok:
-        return JSONResponse({"error": "failed to update payout status"}, status_code=500)
-
-    paid_at = datetime.now(timezone.utc).isoformat()
-
-    tg_msg = (
-        f"PAYOUT MARKED PAID\n"
-        f"Request: {request_id}\n"
-        f"Amount: ${paid_entry.get('amount', 0):.2f}\n"
-        f"PayPal: {paid_entry.get('paypal_email', '')}"
-    )
-    _send_telegram_notification(tg_msg)
-
-    return JSONResponse({
-        "ok": True,
-        "request_id": request_id,
-        "status": "paid",
-        "paid_at": paid_at,
-    })
-
-
-
-async def _is_valid_admin_token(token: str) -> bool:
-    """Check if token is a valid admin_tokens entry in the DB."""
-    if not token:
-        return False
-    async with _referral_db() as db:
-        cur = await db.execute(
-            "SELECT id FROM admin_tokens WHERE token = ?", (token,)
-        )
-        row = await cur.fetchone()
-    return row is not None
-
-
-async def _is_admin_token_readonly(token: str) -> bool:
-    """Returns True if the token exists and is a viewer (read-only) role."""
-    if not token:
-        return True
-    async with _referral_db() as db:
-        cur = await db.execute(
-            "SELECT role FROM admin_tokens WHERE token = ?", (token,)
-        )
-        row = await cur.fetchone()
-    if row is None:
-        return True  # unknown token = treat as read-only
-    return row[0] != "admin"
-
-
-async def api_admin_invite(request: Request) -> JSONResponse:
-    """POST /api/admin/invite — generate a read-only admin viewer token (main bearer only)."""
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    email = str(body.get("email", "")).strip().lower()
-    name  = str(body.get("name", "")).strip()
-    if not email or "@" not in email:
-        return JSONResponse({"error": "invalid email"}, status_code=400)
-
-    token = secrets.token_urlsafe(32)
-    now   = datetime.now(timezone.utc).isoformat()
-
-    async with _referral_db() as db:
-        await db.execute(
-            "INSERT INTO admin_tokens (token, email, name, role, created_at) VALUES (?, ?, ?, ?, ?)",
-            (token, email, name, "viewer", now)
-        )
-        await db.commit()
-
-    return JSONResponse({
-        "ok": True,
-        "token": token,
-        "email": email,
-        "name": name,
-        "role": "viewer",
-        "dashboard_url": f"https://portal.purebrain.ai/admin/clients?admin_token={token}",
-    })
-
-
-async def api_admin_invites_list(request: Request) -> JSONResponse:
-    """GET /api/admin/invites — list all active admin viewer tokens. Main bearer only."""
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    async with _referral_db() as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT id, token, email, name, role, created_at FROM admin_tokens ORDER BY created_at DESC"
-        )
-        rows = await cur.fetchall()
-        invitees = [dict(r) for r in rows]
-
-    return JSONResponse({"ok": True, "invitees": invitees})
-
-
-async def api_admin_invite_revoke(request: Request) -> JSONResponse:
-    """POST /api/admin/invite/revoke — delete an admin viewer token by id. Main bearer only."""
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    token_id = body.get("id")
-    if not token_id:
-        return JSONResponse({"error": "id required"}, status_code=400)
-
-    async with _referral_db() as db:
-        cur = await db.execute("SELECT id FROM admin_tokens WHERE id = ?", (token_id,))
-        row = await cur.fetchone()
-        if not row:
-            return JSONResponse({"error": "token not found"}, status_code=404)
-        await db.execute("DELETE FROM admin_tokens WHERE id = ?", (token_id,))
-        await db.commit()
-
-    return JSONResponse({"ok": True, "id": token_id})
-
-
-async def api_referral_payout_approve(request: Request) -> JSONResponse:
-    """POST /api/referral/payout-approve — approve a pending payout and execute PayPal transfer.
-
-    Portal bearer token required (admin only).
-    Body: { request_id, dry_run? }
-    On success: marks payout as "completed", fires PayPal payout, notifies via Telegram.
-    """
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    request_id = str(body.get("request_id", "")).strip()
-    dry_run    = bool(body.get("dry_run", False))
-
-    if not request_id:
-        return JSONResponse({"error": "missing request_id"}, status_code=400)
-
-    # Read target request from SQLite
-    all_requests = await _read_payout_requests_db()
-    target = None
-    for req in all_requests:
-        if req.get("request_id") == request_id:
-            target = req
-            break
-
-    if not target:
-        return JSONResponse({"error": "request_id not found"}, status_code=404)
-
-    if target.get("status") in ("completed", "paid"):
-        return JSONResponse({"error": f"payout already {target['status']}", "request_id": request_id}, status_code=409)
-
-    paypal_email = target.get("paypal_email", "")
-    amount       = float(target.get("amount", 0))
-
-    if not paypal_email or "@" not in paypal_email:
-        return JSONResponse({"error": "no valid PayPal email on this payout request"}, status_code=400)
-    if amount <= 0:
-        return JSONResponse({"error": "invalid amount on payout request"}, status_code=400)
-
-    if dry_run:
-        return JSONResponse({
-            "ok":          True,
-            "dry_run":     True,
-            "request_id":  request_id,
-            "paypal_email": paypal_email,
-            "amount":      amount,
-            "message":     "Dry run — no payment sent.",
-        })
-
-    # Execute PayPal payout
-    payout_result = await _execute_paypal_payout(
-        paypal_email=paypal_email,
-        amount=amount,
-        request_id=request_id,
-        note=f"PureBrain affiliate commission — request {request_id}",
-    )
-
-    if payout_result["ok"]:
-        batch_id = payout_result.get("batch_id", "")
-        notes_text = f"Auto-paid via PayPal Payouts API. Batch: {batch_id}"
-        await _update_payout_status_db(request_id, "completed", batch_id=batch_id, notes=notes_text)
-    else:
-        error_notes = f"PayPal error: {payout_result.get('error', 'unknown')}"
-        await _update_payout_status_db(request_id, "failed", notes=error_notes)
-
-    # Audit log: payout approval attempt
-    await _log_financial_event(
-        event_type="payout_approved" if payout_result["ok"] else "payout_approve_failed",
-        referral_code=target.get("referral_code", ""),
-        amount=amount,
-        actor="admin:bearer",
-        details=f"request_id={request_id}, batch_id={payout_result.get('batch_id', 'n/a')}, paypal={paypal_email}",
-        ip_address=request.client.host if request.client else "unknown",
-    )
-
-    if payout_result["ok"]:
-        tg_msg = (
-            f"PAYOUT SENT via PayPal\n"
-            f"Request: {request_id}\n"
-            f"Amount: ${amount:.2f}\n"
-            f"PayPal: {paypal_email}\n"
-            f"Batch ID: {payout_result.get('batch_id', 'n/a')}"
-        )
-        _send_telegram_notification(tg_msg)
-        return JSONResponse({
-            "ok":          True,
-            "request_id":  request_id,
-            "batch_id":    payout_result.get("batch_id"),
-            "amount":      amount,
-            "paypal_email": paypal_email,
-            "status":      "completed",
-            "message":     f"Payout of ${amount:.2f} sent to {paypal_email}.",
-        })
-    else:
-        tg_msg = (
-            f"PAYOUT FAILED\n"
-            f"Request: {request_id}\n"
-            f"Amount: ${amount:.2f}\n"
-            f"PayPal: {paypal_email}\n"
-            f"Error: {payout_result.get('error', 'unknown')}"
-        )
-        _send_telegram_notification(tg_msg)
-        return JSONResponse({
-            "ok":         False,
-            "request_id": request_id,
-            "error":      payout_result.get("error"),
-            "status":     "failed",
-        }, status_code=502)
-
-
-async def api_admin_affiliates(request: Request) -> JSONResponse:
-    """GET /api/admin/affiliates — all referrers with full stats (admin or viewer token)."""
-    admin_token = (
-        request.query_params.get("admin_token", "").strip()
-        or request.headers.get("x-admin-token", "").strip()
-    )
-    is_main_admin = check_auth(request)
-    if not is_main_admin:
-        if not await _is_valid_admin_token(admin_token):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    async with _referral_db() as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM referrers ORDER BY created_at DESC")
-        referrers = await cur.fetchall()
-
-        affiliates = []
-        for r in referrers:
-            rid  = r["id"]
-            code = r["referral_code"]
-
-            cur2 = await db.execute(
-                "SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (rid,)
-            )
-            total = (await cur2.fetchone())[0]
-
-            cur2 = await db.execute(
-                "SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND status = \'completed\'", (rid,)
-            )
-            completed = (await cur2.fetchone())[0]
-
-            cur2 = await db.execute(
-                "SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND status = \'pending\'", (rid,)
-            )
-            pending = (await cur2.fetchone())[0]
-
-            cur2 = await db.execute(
-                "SELECT COALESCE(SUM(reward_value), 0) FROM rewards WHERE referrer_id = ?", (rid,)
-            )
-            earnings = float((await cur2.fetchone())[0])
-
-            cur2 = await db.execute(
-                "SELECT COUNT(*) FROM referral_clicks WHERE referral_code = ? COLLATE NOCASE", (code,)
-            )
-            clicks = (await cur2.fetchone())[0]
-
-            cur2 = await db.execute(
-                """SELECT ref.id, ref.referred_name, ref.referred_email, ref.status, ref.created_at,
-                          COALESCE(SUM(cp.commission_value), 0) AS earnings,
-                          COUNT(cp.id) AS payment_count
-                   FROM referrals ref
-                   LEFT JOIN commission_payments cp ON cp.referral_id = ref.id
-                   WHERE ref.referrer_id = ?
-                   GROUP BY ref.id
-                   ORDER BY ref.created_at DESC""",
-                (rid,)
-            )
-            history = [dict(row) async for row in cur2]
-
-            affiliates.append({
-                "id":          rid,
-                "name":        r["user_name"],
-                "email":       r["user_email"],
-                "code":        code,
-                "paypal_email": r["paypal_email"],
-                "clicks":      clicks,
-                "total":       total,
-                "completed":   completed,
-                "pending":     pending,
-                "earnings":    round(earnings, 2),
-                "joined":      r["created_at"],
-                "history":     history,
-            })
-
-    return JSONResponse({"affiliates": affiliates, "count": len(affiliates)})
-
-
-async def api_admin_payouts(request: Request) -> JSONResponse:
-    """GET /api/admin/payouts — all payout requests (admin or viewer token)."""
-    admin_token = (
-        request.query_params.get("admin_token", "").strip()
-        or request.headers.get("x-admin-token", "").strip()
-    )
-    is_main_admin = check_auth(request)
-    if not is_main_admin:
-        if not await _is_valid_admin_token(admin_token):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    requests_list = await _read_payout_requests_db()
-    requests_list.sort(key=lambda r: r.get("created_at_ts", 0), reverse=True)
-    return JSONResponse({"requests": requests_list, "count": len(requests_list)})
-
-
-async def api_admin_affiliate_update(request: Request) -> JSONResponse:
-    """PUT /api/admin/affiliate/update — update affiliate name, email, or PayPal email."""
-    if request.method == "OPTIONS":
-        return Response(status_code=204)
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    referral_code = str(body.get("referral_code", "")).strip()
-    if not referral_code:
-        return JSONResponse({"error": "referral_code required"}, status_code=400)
-
-    user_name    = body.get("user_name")
-    user_email   = body.get("user_email")
-    paypal_email = body.get("paypal_email")
-
-    # Validate emails if provided
-    def _valid_email(e: str) -> bool:
-        return "@" in e and "." in e.split("@")[-1]
-
-    if user_email is not None:
-        user_email = str(user_email).strip().lower()
-        if user_email and not _valid_email(user_email):
-            return JSONResponse({"error": "invalid user_email format"}, status_code=400)
-
-    if paypal_email is not None:
-        paypal_email = str(paypal_email).strip().lower()
-        if paypal_email and not _valid_email(paypal_email):
-            return JSONResponse({"error": "invalid paypal_email format"}, status_code=400)
-
-    fields: list[str] = []
-    params: list = []
-
-    if user_name is not None:
-        fields.append("user_name = ?")
-        params.append(str(user_name).strip())
-    if user_email is not None:
-        fields.append("user_email = ?")
-        params.append(user_email)
-    if paypal_email is not None:
-        fields.append("paypal_email = ?")
-        params.append(paypal_email)
-
-    if not fields:
-        return JSONResponse({"error": "no fields to update"}, status_code=400)
-
-    params.append(referral_code)
-
-    async with _referral_db() as db:
-        cur = await db.execute(
-            "SELECT id FROM referrers WHERE referral_code = ? COLLATE NOCASE", (referral_code,)
-        )
-        row = await cur.fetchone()
-        if not row:
-            return JSONResponse({"error": "affiliate not found"}, status_code=404)
-
-        await db.execute(
-            f"UPDATE referrers SET {', '.join(fields)} WHERE referral_code = ? COLLATE NOCASE",
-            params,
-        )
-        await db.commit()
-
-    updated_fields = []
-    if user_name is not None:
-        updated_fields.append("user_name")
-    if user_email is not None:
-        updated_fields.append("user_email")
-    if paypal_email is not None:
-        updated_fields.append("paypal_email")
-
-    print(f"[admin] Affiliate updated: {referral_code} — fields: {updated_fields}")
-    return JSONResponse({"ok": True, "updated_fields": updated_fields})
-
-
-async def api_admin_affiliate_delete(request: Request) -> JSONResponse:
-    """DELETE /api/admin/affiliate/delete — delete an affiliate and optionally their referral records."""
-    if request.method == "OPTIONS":
-        return Response(status_code=204)
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    referral_code    = str(body.get("referral_code", "")).strip()
-    delete_referrals = bool(body.get("delete_referrals", False))
-
-    if not referral_code:
-        return JSONResponse({"error": "referral_code required"}, status_code=400)
-
-    referrals_deleted = 0
-
-    async with _referral_db() as db:
-        cur = await db.execute(
-            "SELECT id FROM referrers WHERE referral_code = ? COLLATE NOCASE", (referral_code,)
-        )
-        row = await cur.fetchone()
-        if not row:
-            return JSONResponse({"error": "affiliate not found"}, status_code=404)
-
-        referrer_id = row[0]
-
-        if delete_referrals:
-            # Count referrals first
-            cur2 = await db.execute(
-                "SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (referrer_id,)
-            )
-            referrals_deleted = (await cur2.fetchone())[0]
-
-            # Delete dependent records
-            await db.execute(
-                """DELETE FROM commission_payments
-                   WHERE referral_id IN (SELECT id FROM referrals WHERE referrer_id = ?)""",
-                (referrer_id,),
-            )
-            await db.execute(
-                "DELETE FROM rewards WHERE referrer_id = ?", (referrer_id,)
-            )
-            await db.execute(
-                "DELETE FROM referral_clicks WHERE referral_code = ? COLLATE NOCASE", (referral_code,)
-            )
-            await db.execute(
-                "DELETE FROM referrals WHERE referrer_id = ?", (referrer_id,)
-            )
-
-        await db.execute(
-            "DELETE FROM referrers WHERE id = ?", (referrer_id,)
-        )
-        await db.commit()
-
-    print(f"[admin] Affiliate deleted: {referral_code} (referrals_deleted={referrals_deleted})")
-    return JSONResponse({
-        "ok": True,
-        "deleted": referral_code,
-        "referrals_deleted": referrals_deleted,
-    })
-
-
-async def api_admin_referral_update(request: Request) -> JSONResponse:
-    """PUT /api/admin/referral/update — update a specific referral record."""
-    if request.method == "OPTIONS":
-        return Response(status_code=204)
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    referral_id = body.get("referral_id")
-    if referral_id is None:
-        return JSONResponse({"error": "referral_id required"}, status_code=400)
-
-    try:
-        referral_id = int(referral_id)
-    except (ValueError, TypeError):
-        return JSONResponse({"error": "referral_id must be an integer"}, status_code=400)
-
-    referred_email = body.get("referred_email")
-    referred_name  = body.get("referred_name")
-    status         = body.get("status")
-
-    allowed_statuses = {"pending", "completed", "rejected"}
-    if status is not None:
-        status = str(status).strip().lower()
-        if status not in allowed_statuses:
-            return JSONResponse(
-                {"error": f"invalid status — must be one of: {', '.join(sorted(allowed_statuses))}"},
-                status_code=400,
-            )
-
-    fields: list[str] = []
-    params: list = []
-
-    if referred_email is not None:
-        referred_email = str(referred_email).strip().lower()
-        fields.append("referred_email = ?")
-        params.append(referred_email)
-    if referred_name is not None:
-        fields.append("referred_name = ?")
-        params.append(str(referred_name).strip())
-    if status is not None:
-        fields.append("status = ?")
-        params.append(status)
-
-    if not fields:
-        return JSONResponse({"error": "no fields to update"}, status_code=400)
-
-    params.append(referral_id)
-
-    async with _referral_db() as db:
-        cur = await db.execute("SELECT id FROM referrals WHERE id = ?", (referral_id,))
-        row = await cur.fetchone()
-        if not row:
-            return JSONResponse({"error": "referral not found"}, status_code=404)
-
-        await db.execute(
-            f"UPDATE referrals SET {', '.join(fields)} WHERE id = ?",
-            params,
-        )
-        await db.commit()
-
-    updated_fields = []
-    if referred_email is not None:
-        updated_fields.append("referred_email")
-    if referred_name is not None:
-        updated_fields.append("referred_name")
-    if status is not None:
-        updated_fields.append("status")
-
-    print(f"[admin] Referral {referral_id} updated — fields: {updated_fields}")
-
-    # Audit log: admin referral update
-    await _log_financial_event(
-        event_type="admin_referral_update",
-        referral_code=str(referral_id),
-        details=f"fields={updated_fields}, email={referred_email}, name={referred_name}, status={status}",
-        actor="admin:bearer",
-        ip_address=request.client.host if request.client else "unknown",
-    )
-
-    return JSONResponse({"ok": True, "updated_fields": updated_fields})
-
-
-
-async def api_admin_referral_assign(request: Request) -> JSONResponse:
-    """POST /api/admin/referral/assign — manually assign an existing client to a referrer (retroactive credit).
-    Body: { referral_code: str, client_email: str, client_name?: str }
-    Creates or updates a referral record with status=completed.
-    """
-    if request.method == "OPTIONS":
-        return Response(status_code=204)
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    referral_code  = str(body.get("referral_code", "")).strip().upper()
-    client_email   = str(body.get("client_email", "")).strip().lower()
-    client_name    = str(body.get("client_name", "")).strip()
-
-    if not referral_code:
-        return JSONResponse({"error": "referral_code required"}, status_code=400)
-    if not client_email or "@" not in client_email:
-        return JSONResponse({"error": "invalid client_email"}, status_code=400)
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    async with _referral_db() as db:
-        # Verify referrer exists
-        cur = await db.execute(
-            "SELECT id FROM referrers WHERE referral_code = ? COLLATE NOCASE", (referral_code,)
-        )
-        row = await cur.fetchone()
-        if row is None:
-            return JSONResponse({"error": "referral code not found"}, status_code=404)
-        referrer_id = row[0]
-
-        # Look up client name from clients db if not provided
-        if not client_name:
-            async with _clients_db() as cdb:
-                ccur = await cdb.execute(
-                    "SELECT name FROM clients WHERE email = ? COLLATE NOCASE", (client_email,)
-                )
-                crow = await ccur.fetchone()
-                if crow:
-                    client_name = crow[0]
-
-        # Single-referrer enforcement: remove any existing completed referral for
-        # this email under a DIFFERENT referrer before assigning to the new one.
-        # A client must never be counted under two referrers simultaneously.
-        removed_cur = await db.execute(
-            """DELETE FROM referrals
-               WHERE referred_email = ? COLLATE NOCASE
-                 AND referrer_id != ?""",
-            (client_email, referrer_id)
-        )
-        removed_count = removed_cur.rowcount
-
-        # Check for existing referral record under the target referrer
-        cur = await db.execute(
-            """SELECT id, status FROM referrals
-               WHERE referrer_id = ? AND referred_email = ? COLLATE NOCASE""",
-            (referrer_id, client_email)
-        )
-        existing = await cur.fetchone()
-
-        if existing:
-            if existing[1] == "completed" and removed_count == 0:
-                await db.commit()
-                return JSONResponse({"ok": True, "message": "Referral already credited — no change needed.", "action": "noop"})
-            await db.execute(
-                "UPDATE referrals SET status='completed', completed_at=?, referred_name=? WHERE id=?",
-                (now, client_name, existing[0])
-            )
-            action = "updated"
-        else:
-            await db.execute(
-                """INSERT INTO referrals (referrer_id, referred_email, referred_name, status, created_at, completed_at)
-                   VALUES (?, ?, ?, 'completed', ?, ?)""",
-                (referrer_id, client_email, client_name, now, now)
-            )
-            action = "created"
-
-        await db.commit()
-
-    if removed_count > 0:
-        print(f"[admin] Single-referrer enforcement: removed {removed_count} prior referral record(s) for {client_email} from other referrers")
-    print(f"[admin] Referral assigned: {referral_code} → {client_email} ({action})")
-
-    # Audit log: admin referral assign
-    await _log_financial_event(
-        event_type="admin_referral_assign",
-        referral_code=referral_code,
-        details=f"client={client_email}, action={action}, removed_prior={removed_count}",
-        actor="admin:bearer",
-        ip_address=request.client.host if request.client else "unknown",
-    )
-
-    return JSONResponse({"ok": True, "action": action, "removed_prior": removed_count, "message": f"Client {client_email} assigned to referrer {referral_code}."})
-
-
-async def serve_admin_referrals(request: Request) -> Response:
-    """GET /admin/referrals — serve admin dashboard HTML."""
-    html_path = SCRIPT_DIR / "admin-referrals.html"
-    if html_path.exists():
-        return FileResponse(str(html_path), media_type="text/html")
-    return Response("<h1>Admin dashboard not found</h1>", media_type="text/html", status_code=503)
-
-
-# ---------------------------------------------------------------------------
-# Client Admin System
-# ---------------------------------------------------------------------------
-
-@asynccontextmanager
-async def _clients_db():
-    """Open clients DB with WAL mode enabled."""
-    async with aiosqlite.connect(str(CLIENTS_DB)) as db:
-        await db.execute("PRAGMA journal_mode = WAL")
-        yield db
-
-
-async def _init_clients_db() -> None:
-    """Create clients table on startup if it doesn't exist."""
-    async with aiosqlite.connect(str(CLIENTS_DB)) as db:
-        await db.execute("PRAGMA journal_mode = WAL")
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS clients (
-                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-                name                  TEXT NOT NULL,
-                email                 TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                goes_by               TEXT NOT NULL DEFAULT '',
-                ai_name               TEXT NOT NULL DEFAULT '',
-                company               TEXT NOT NULL DEFAULT '',
-                role                  TEXT NOT NULL DEFAULT '',
-                goal                  TEXT NOT NULL DEFAULT '',
-                tier                  TEXT NOT NULL DEFAULT 'unknown',
-                status                TEXT NOT NULL DEFAULT 'active',
-                payment_status        TEXT NOT NULL DEFAULT 'none',
-                paypal_subscription_id TEXT NOT NULL DEFAULT '',
-                total_paid            REAL NOT NULL DEFAULT 0,
-                payment_count         INTEGER NOT NULL DEFAULT 0,
-                referral_code         TEXT NOT NULL DEFAULT '',
-                first_seen_at         TEXT NOT NULL,
-                last_active_at        TEXT NOT NULL DEFAULT '',
-                onboarded_at          TEXT NOT NULL DEFAULT '',
-                notes                 TEXT NOT NULL DEFAULT '',
-                magic_link_token      TEXT NOT NULL DEFAULT '',
-                created_at            TEXT NOT NULL DEFAULT '',
-                updated_at            TEXT NOT NULL DEFAULT '',
-                hidden                INTEGER NOT NULL DEFAULT 0
-            )
-        """)
-        # Ensure hidden column exists for older databases
-        try:
-            await db.execute("ALTER TABLE clients ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
-        except Exception:
-            pass  # column already exists
-        await db.commit()
-
-    # Add tracking columns (login_count, session_count, etc.) + webhook log table
-    ensure_tracking_columns(str(CLIENTS_DB))
-
-
-async def serve_admin_clients(request: Request) -> Response:
-    """GET /admin/clients — serve clients admin dashboard HTML."""
-    html_path = SCRIPT_DIR / "admin-clients.html"
-    if html_path.exists():
-        return FileResponse(str(html_path), media_type="text/html")
-    return Response("<h1>Client admin dashboard not found</h1>", media_type="text/html", status_code=503)
-
-
-async def api_admin_clients(request: Request) -> JSONResponse:
-    """GET /api/admin/clients — list all clients with stats. Bearer auth or viewer token required."""
-    admin_token_param = request.query_params.get("admin_token", "")
-    is_viewer = False
-    if not check_auth(request):
-        # Check viewer token
-        if admin_token_param and await _is_valid_admin_token(admin_token_param):
-            is_viewer = True
-        else:
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    show_hidden = request.query_params.get("show_hidden", "0") == "1"
-
-    async with _clients_db() as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM clients ORDER BY first_seen_at DESC")
-        rows = await cur.fetchall()
-        all_clients = [dict(r) for r in rows]
-
-        # Separate hidden vs visible
-        visible_clients = [c for c in all_clients if not c.get("hidden")]
-        hidden_clients  = [c for c in all_clients if c.get("hidden")]
-
-        # Stats are always based on visible (non-hidden) clients
-        clients = visible_clients
-        total   = len(clients)
-        active  = sum(1 for c in clients if c.get("status") == "active")
-        onboard = sum(1 for c in clients if c.get("status") == "onboarding")
-        churned = sum(1 for c in clients if c.get("status") == "churned")
-        total_rev = sum(float(c.get("total_paid") or 0) for c in clients)
-
-        # MRR: subscription_active clients, estimate by tier
-        tier_prices = {"awakened": 149, "insiders": 74.50, "partnered": 499, "unified": 999, "brainiac": 299}
-        mrr = sum(
-            tier_prices.get((c.get("tier") or "").lower(), 0)
-            for c in clients
-            if c.get("payment_status") == "subscription_active"
-        )
-
-    stats = {
-        "total":         total,
-        "active":        active,
-        "onboarding":    onboard,
-        "churned":       churned,
-        "total_revenue": round(total_rev, 2),
-        "mrr":           mrr,
-        "hidden_count":  len(hidden_clients),
-    }
-
-    # Return visible clients by default; if show_hidden, return all
-    response_clients = all_clients if show_hidden else visible_clients
-    return JSONResponse({"clients": response_clients, "stats": stats})
-
-
-async def api_public_client_stats(request: Request) -> JSONResponse:
-    """GET /api/public/client-stats — lightweight stats for 777 dashboard. CORS enabled for 777.purebrain.ai."""
-    origin = request.headers.get("origin", "")
-    cors = {
-        "Access-Control-Allow-Origin": "https://777.purebrain.ai" if "777.purebrain.ai" in origin else origin,
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
-        "Vary": "Origin",
-    }
-    if request.method == "OPTIONS":
-        return Response("", status_code=204, headers=cors)
-
-    async with _clients_db() as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM clients WHERE hidden = 0 OR hidden IS NULL")
-        rows = await cur.fetchall()
-        clients = [dict(r) for r in rows]
-        total = len(clients)
-        active = sum(1 for c in clients if c.get("status") == "active")
-        tier_prices = {"awakened": 149, "insiders": 74.50, "partnered": 499, "unified": 999, "brainiac": 299}
-        mrr = sum(tier_prices.get((c.get("tier") or "").lower(), 0) for c in clients if c.get("payment_status") == "subscription_active")
-        tiers = {}
-        for c in clients:
-            t = (c.get("tier") or "unknown").lower()
-            tiers[t] = tiers.get(t, 0) + 1
-
-    return JSONResponse({
-        "subscribers": total,
-        "active": active,
-        "mrr": round(mrr, 2),
-        "tiers": tiers,
-        "updated": __import__("datetime").datetime.utcnow().isoformat() + "Z"
-    }, headers=cors)
-
-
-async def api_admin_clients_update(request: Request) -> JSONResponse:
-    """POST /api/admin/clients/update — update client fields. Bearer auth required."""
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    client_id = body.get("id")
-    if not client_id:
-        return JSONResponse({"error": "id required"}, status_code=400)
-
-    # Validate status
-    status = str(body.get("status", "")).strip().lower()
-    allowed_statuses = {"active", "onboarding", "churned", "trial", ""}
-    if status and status not in allowed_statuses:
-        return JSONResponse({"error": "invalid status — must be one of: active, onboarding, trial, churned"}, status_code=400)
-
-    # Validate tier
-    tier = str(body.get("tier", "")).strip().lower()
-    allowed_tiers = {"awakened", "insiders", "partnered", "unified", "brainiac", "unknown", ""}
-    if tier and tier not in allowed_tiers:
-        return JSONResponse({"error": "invalid tier — must be one of: awakened, insiders, partnered, unified, brainiac, unknown"}, status_code=400)
-
-    # Email uniqueness check (if email is being changed)
-    new_email = str(body.get("email", "")).strip().lower()
-    if new_email:
-        async with _clients_db() as db:
-            cur = await db.execute(
-                "SELECT id FROM clients WHERE LOWER(email) = ? AND id != ?",
-                (new_email, client_id)
-            )
-            existing = await cur.fetchone()
-        if existing:
-            return JSONResponse({"error": "email already in use by another client"}, status_code=409)
-
-    # Build dynamic update — only include fields present in body
-    now = datetime.now(timezone.utc).isoformat()
-    fields = ["updated_at = ?"]
-    params: list = [now]
-
-    text_fields = {
-        "name":    body.get("name"),
-        "goes_by": body.get("goes_by"),
-        "email":   new_email if new_email else None,
-        "ai_name": body.get("ai_name"),
-        "company": body.get("company"),
-        "role":    body.get("role"),
-        "goal":    body.get("goal"),
-        "notes":   body.get("notes"),
-    }
-    for col, val in text_fields.items():
-        if val is not None:
-            fields.append(f"{col} = ?")
-            params.append(str(val).strip())
-
-    if status:
-        fields.append("status = ?")
-        params.append(status)
-    elif "status" in body:
-        # Allow explicit empty to keep existing — skip
-        pass
-
-    if tier:
-        fields.append("tier = ?")
-        params.append(tier)
-    elif "tier" in body:
-        pass
-
-    params.append(client_id)
-    async with _clients_db() as db:
-        await db.execute(f"UPDATE clients SET {', '.join(fields)} WHERE id = ?", params)
-        await db.commit()
-
-    return JSONResponse({"ok": True, "id": client_id})
-
-
-async def api_admin_clients_import(request: Request) -> JSONResponse:
-    """POST /api/admin/clients/import — scan JSONL logs and upsert client records. Bearer auth required."""
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    imported = 0
-    updated  = 0
-    errors   = 0
-
-    # Collect candidate records keyed by email (lowercased)
-    # Priority: seed (pay_test) > payments > web_conversations
-    candidates: dict[str, dict] = {}
-
-    # --- 1. Parse purebrain_pay_test.jsonl (seed/questionnaire data) ---
-    if PAY_TEST_LOG.exists():
-        try:
-            with PAY_TEST_LOG.open("r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        d = json.loads(line)
-                    except Exception:
-                        continue
-
-                    email = (d.get("email") or "").strip().lower()
-                    if not email or "@" not in email:
-                        continue
-
-                    # Skip obvious test/sandbox entries
-                    order_id = (d.get("orderId") or "").strip()
-                    if any(order_id.startswith(p) for p in ("SANDBOX-", "E2E-", "test-", "TEST-")):
-                        continue
-                    if "sandbox" in email or "test" in email.split("@")[0]:
-                        continue
-
-                    ts = d.get("server_timestamp", "")
-                    rec = candidates.setdefault(email, {
-                        "email": email,
-                        "name": "",
-                        "goes_by": "",
-                        "ai_name": "",
-                        "company": "",
-                        "role": "",
-                        "goal": "",
-                        "tier": "unknown",
-                        "payment_status": "none",
-                        "paypal_subscription_id": "",
-                        "total_paid": 0.0,
-                        "payment_count": 0,
-                        "referral_code": "",
-                        "first_seen_at": ts,
-                        "last_active_at": ts,
-                        "onboarded_at": "",
-                        "_sources": set(),
-                    })
-
-                    rec["_sources"].add("pay_test")
-
-                    # Update fields if we get richer data
-                    if d.get("name"):
-                        rec["name"] = d["name"].strip()
-                    if d.get("aiName"):
-                        rec["ai_name"] = d["aiName"].strip()
-                    if d.get("goesBy"):
-                        rec["goes_by"] = d["goesBy"].strip()
-                    if d.get("company"):
-                        rec["company"] = d["company"].strip()
-                    if d.get("role"):
-                        rec["role"] = d["role"].strip()
-                    if d.get("primaryGoal"):
-                        rec["goal"] = d["primaryGoal"].strip()
-                    if d.get("tier") and d["tier"] not in ("unknown", "test", ""):
-                        rec["tier"] = d["tier"].strip()
-                    if d.get("paypalSubscriptionId"):
-                        rec["paypal_subscription_id"] = d["paypalSubscriptionId"].strip()
-                    if d.get("session_uuid") and d.get("event") == "seed:complete":
-                        rec["onboarded_at"] = ts
-
-                    # Track earliest / latest timestamps
-                    if ts and (not rec["first_seen_at"] or ts < rec["first_seen_at"]):
-                        rec["first_seen_at"] = ts
-                    if ts and ts > rec.get("last_active_at", ""):
-                        rec["last_active_at"] = ts
-        except Exception:
-            pass
-
-    # --- 2. Parse purebrain_payments.jsonl ---
-    if PAYMENTS_LOG.exists():
-        try:
-            with PAYMENTS_LOG.open("r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        d = json.loads(line)
-                    except Exception:
-                        continue
-
-                    email = (d.get("payerEmail") or "").strip().lower()
-                    if not email or "@" not in email:
-                        continue
-
-                    order_id = (d.get("orderId") or "").strip()
-                    if any(order_id.startswith(p) for p in ("SANDBOX-", "E2E-", "test-", "TEST-")):
-                        continue
-                    if "sandbox" in email or "test" in email.split("@")[0]:
-                        continue
-
-                    ts    = d.get("server_timestamp", "")
-                    tier  = (d.get("tier") or "").strip()
-                    amount = float(d.get("amount") or 0)
-
-                    rec = candidates.setdefault(email, {
-                        "email": email,
-                        "name": "",
-                        "goes_by": "",
-                        "ai_name": "",
-                        "company": "",
-                        "role": "",
-                        "goal": "",
-                        "tier": "unknown",
-                        "payment_status": "none",
-                        "paypal_subscription_id": "",
-                        "total_paid": 0.0,
-                        "payment_count": 0,
-                        "referral_code": "",
-                        "first_seen_at": ts,
-                        "last_active_at": ts,
-                        "onboarded_at": "",
-                        "_sources": set(),
-                    })
-
-                    rec["_sources"].add("payments")
-                    if d.get("payerName") and not rec["name"]:
-                        rec["name"] = d["payerName"].strip()
-                    if tier and tier not in ("unknown", ""):
-                        rec["tier"] = tier
-                    if amount > 0:
-                        rec["total_paid"] = round(rec["total_paid"] + amount, 2)
-                        rec["payment_count"] += 1
-                    # Subscription IDs start with I-
-                    if order_id.startswith("I-"):
-                        rec["paypal_subscription_id"] = order_id
-                        rec["payment_status"] = "subscription_active"
-                    elif amount > 0:
-                        rec["payment_status"] = "paid"
-
-                    if ts and (not rec["first_seen_at"] or ts < rec["first_seen_at"]):
-                        rec["first_seen_at"] = ts
-                    if ts and ts > rec.get("last_active_at", ""):
-                        rec["last_active_at"] = ts
-        except Exception:
-            pass
-
-    # --- 3. Parse purebrain_web_conversations.jsonl (fill gaps only) ---
-    if WEB_CONVERSATIONS_LOG.exists():
-        try:
-            with WEB_CONVERSATIONS_LOG.open("r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        d = json.loads(line)
-                    except Exception:
-                        continue
-
-                    ai_name  = (d.get("aiName") or "").strip()
-                    user_name = (d.get("userName") or "").strip()
-                    tier     = (d.get("userTier") or "").strip()
-                    ref_code = (d.get("referralCode") or "").strip()
-                    ts       = d.get("server_timestamp", "")
-
-                    # Web conversations rarely have emails — skip if no useful data
-                    if not ai_name and not user_name:
-                        continue
-                    if user_name.lower() in ("guest user", "atlas", "guest", ""):
-                        continue
-
-                    # Try to match by ai_name to existing candidate
-                    matched = None
-                    if ai_name:
-                        for rec in candidates.values():
-                            if rec.get("ai_name", "").lower() == ai_name.lower():
-                                matched = rec
-                                break
-
-                    if matched:
-                        if ref_code and not matched.get("referral_code"):
-                            matched["referral_code"] = ref_code
-                        if tier and matched.get("tier") in ("unknown", ""):
-                            matched["tier"] = tier
-                        if ts and ts > matched.get("last_active_at", ""):
-                            matched["last_active_at"] = ts
-        except Exception:
-            pass
-
-    # --- 4. Upsert into clients DB ---
-    now = datetime.now(timezone.utc).isoformat()
-    async with _clients_db() as db:
-        db.row_factory = aiosqlite.Row
-        for email, rec in candidates.items():
-            # Require at minimum a name or ai_name to insert
-            name = rec.get("name") or rec.get("ai_name") or email.split("@")[0]
-            if not name:
-                continue
-
-            try:
-                # Check existing
-                cur = await db.execute(
-                    "SELECT id, total_paid, payment_count, name, ai_name FROM clients WHERE email = ? COLLATE NOCASE",
-                    (email,)
-                )
-                existing = await cur.fetchone()
-
-                if existing:
-                    # Merge: update fields only if they improve the record
-                    ex_id    = existing["id"]
-                    ex_paid  = float(existing["total_paid"] or 0)
-                    ex_count = int(existing["payment_count"] or 0)
-                    new_paid  = max(ex_paid,  rec["total_paid"])
-                    new_count = max(ex_count, rec["payment_count"])
-
-                    await db.execute("""
-                        UPDATE clients SET
-                            name = CASE WHEN name = '' OR name IS NULL THEN ? ELSE name END,
-                            goes_by = CASE WHEN goes_by = '' OR goes_by IS NULL THEN ? ELSE goes_by END,
-                            ai_name = CASE WHEN ai_name = '' OR ai_name IS NULL THEN ? ELSE ai_name END,
-                            company = CASE WHEN company = '' OR company IS NULL THEN ? ELSE company END,
-                            role = CASE WHEN role = '' OR role IS NULL THEN ? ELSE role END,
-                            goal = CASE WHEN goal = '' OR goal IS NULL THEN ? ELSE goal END,
-                            tier = CASE WHEN tier = 'unknown' OR tier = '' OR tier IS NULL THEN ? ELSE tier END,
-                            payment_status = CASE WHEN payment_status = 'none' OR payment_status IS NULL THEN ? ELSE payment_status END,
-                            paypal_subscription_id = CASE WHEN paypal_subscription_id = '' OR paypal_subscription_id IS NULL THEN ? ELSE paypal_subscription_id END,
-                            total_paid = ?,
-                            payment_count = ?,
-                            referral_code = CASE WHEN referral_code = '' OR referral_code IS NULL THEN ? ELSE referral_code END,
-                            last_active_at = CASE WHEN last_active_at < ? THEN ? ELSE last_active_at END,
-                            onboarded_at = CASE WHEN onboarded_at = '' OR onboarded_at IS NULL THEN ? ELSE onboarded_at END,
-                            updated_at = ?
-                        WHERE id = ?
-                    """, (
-                        name,
-                        rec["goes_by"],
-                        rec["ai_name"],
-                        rec["company"],
-                        rec["role"],
-                        rec["goal"],
-                        rec["tier"],
-                        rec["payment_status"],
-                        rec["paypal_subscription_id"],
-                        new_paid,
-                        new_count,
-                        rec["referral_code"],
-                        rec["last_active_at"],
-                        rec["last_active_at"],
-                        rec["onboarded_at"],
-                        now,
-                        ex_id,
-                    ))
-                    updated += 1
-                else:
-                    await db.execute("""
-                        INSERT INTO clients
-                            (name, email, goes_by, ai_name, company, role, goal, tier, status,
-                             payment_status, paypal_subscription_id, total_paid, payment_count,
-                             referral_code, first_seen_at, last_active_at, onboarded_at,
-                             created_at, updated_at)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """, (
-                        name,
-                        email,
-                        rec["goes_by"],
-                        rec["ai_name"],
-                        rec["company"],
-                        rec["role"],
-                        rec["goal"],
-                        rec["tier"],
-                        "active",
-                        rec["payment_status"],
-                        rec["paypal_subscription_id"],
-                        rec["total_paid"],
-                        rec["payment_count"],
-                        rec["referral_code"],
-                        rec["first_seen_at"] or now,
-                        rec["last_active_at"] or now,
-                        rec["onboarded_at"],
-                        now,
-                        now,
-                    ))
-                    imported += 1
-            except Exception:
-                errors += 1
-                continue
-
-        await db.commit()
-
-    return JSONResponse({"ok": True, "imported": imported, "updated": updated, "errors": errors})
-
-
-async def api_admin_clients_hide(request: Request) -> JSONResponse:
-    """POST /api/admin/clients/hide — soft-delete a client (hide from default view). Bearer auth required."""
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    client_id = body.get("id")
-    if not client_id:
-        return JSONResponse({"error": "id required"}, status_code=400)
-
-    now = datetime.now(timezone.utc).isoformat()
-    async with _clients_db() as db:
-        cur = await db.execute("SELECT id, name FROM clients WHERE id = ?", (client_id,))
-        row = await cur.fetchone()
-        if not row:
-            return JSONResponse({"error": "client not found"}, status_code=404)
-        await db.execute("UPDATE clients SET hidden = 1, updated_at = ? WHERE id = ?", (now, client_id))
-        await db.commit()
-
-    print(f"[admin] Client {client_id} hidden (soft-delete)")
-    return JSONResponse({"ok": True, "id": client_id})
-
-
-async def api_admin_clients_restore(request: Request) -> JSONResponse:
-    """POST /api/admin/clients/restore — restore a hidden client back to the default view. Bearer auth required."""
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    client_id = body.get("id")
-    if not client_id:
-        return JSONResponse({"error": "id required"}, status_code=400)
-
-    now = datetime.now(timezone.utc).isoformat()
-    async with _clients_db() as db:
-        cur = await db.execute("SELECT id FROM clients WHERE id = ?", (client_id,))
-        row = await cur.fetchone()
-        if not row:
-            return JSONResponse({"error": "client not found"}, status_code=404)
-        await db.execute("UPDATE clients SET hidden = 0, updated_at = ? WHERE id = ?", (now, client_id))
-        await db.commit()
-
-    print(f"[admin] Client {client_id} restored from hidden")
-    return JSONResponse({"ok": True, "id": client_id})
-
-
-async def serve_affiliate_portal(request: Request) -> Response:
-    """GET /affiliate — redirect to canonical /refer/ page on purebrain.ai."""
-    code = request.query_params.get("code", "").strip()
-    redirect_url = "https://purebrain.ai/refer/"
-    if code:
-        redirect_url += f"?code={code}"
-    from starlette.responses import RedirectResponse
-    return RedirectResponse(url=redirect_url, status_code=301)
-
-
-# ---------------------------------------------------------------------------
-# Emoji Reaction Sentiment Engine
 # ---------------------------------------------------------------------------
 
 EMOJI_SENTIMENT_MAP = {
@@ -6728,10 +4028,830 @@ async def api_reaction_summary(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# AgentMail Inbox Proxy — exposes email via server-side SDK
+# ---------------------------------------------------------------------------
+
+def _migrate_email_accounts(settings: dict) -> bool:
+    """Migrate old single-account format to email_accounts array. Returns True if migrated."""
+    if settings.get("email_accounts"):
+        return False
+    api_key = settings.get("agentmail_api_key", "").strip()
+    email = settings.get("agentmail_email", "").strip()
+    if api_key and email:
+        label = email.split("@")[0] if "@" in email else email
+        settings["email_accounts"] = [
+            {"provider": "agentmail", "api_key": api_key, "address": email, "label": label}
+        ]
+        _save_settings(settings)
+        return True
+    return False
+
+
+class GmailClient:
+    """Gmail IMAP/SMTP client providing the same interface shape as AgentMail."""
+
+    def __init__(self, address: str, app_password: str):
+        self.address = address
+        self.app_password = app_password.replace(" ", "")
+        self.imap_host = "imap.gmail.com"
+        self.imap_port = 993
+        self.smtp_host = "smtp.gmail.com"
+        self.smtp_port = 587
+
+    # ── helpers ──────────────────────────────────────────────────────────
+    def _imap_connect(self):
+        import imaplib
+        imaplib._MAXLINE = 10_000_000  # 10MB — Gmail SEARCH can return huge UID lists
+        conn = imaplib.IMAP4_SSL(self.imap_host, self.imap_port)
+        conn.login(self.address, self.app_password)
+        return conn
+
+    @staticmethod
+    def _decode_header(raw):
+        from email.header import decode_header as _dh
+        if not raw:
+            return ""
+        parts = _dh(raw)
+        decoded = []
+        for data, charset in parts:
+            if isinstance(data, bytes):
+                decoded.append(data.decode(charset or "utf-8", errors="replace"))
+            else:
+                decoded.append(data)
+        return " ".join(decoded)
+
+    @staticmethod
+    def _parse_addr(raw):
+        from email.utils import parseaddr
+        _, addr = parseaddr(raw or "")
+        return addr or raw or ""
+
+    @staticmethod
+    def _msg_date(msg):
+        from email.utils import parsedate_to_datetime
+        date_str = msg.get("Date")
+        if not date_str:
+            return datetime.now(timezone.utc)
+        try:
+            return parsedate_to_datetime(date_str)
+        except Exception:
+            return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _strip_html(html_str: str) -> str:
+        """Convert HTML to readable plain text."""
+        import re as _re_html, html as html_mod
+        text = _re_html.sub(r'<(style|script)[^>]*>.*?</\1>', '', html_str, flags=_re_html.DOTALL | _re_html.IGNORECASE)
+        text = _re_html.sub(r'<br\s*/?>', '\n', text, flags=_re_html.IGNORECASE)
+        text = _re_html.sub(r'</(p|div|tr|li|h[1-6])>', '\n', text, flags=_re_html.IGNORECASE)
+        text = _re_html.sub(r'<[^>]+>', '', text)
+        text = html_mod.unescape(text)
+        text = _re_html.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
+
+    @staticmethod
+    def _body_html(msg):
+        """Extract raw HTML body from an email.message.Message, or empty string."""
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == "text/html":
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or "utf-8"
+                        return payload.decode(charset, errors="replace")
+            return ""
+        if msg.get_content_type() == "text/html":
+            payload = msg.get_payload(decode=True)
+            if payload:
+                charset = msg.get_content_charset() or "utf-8"
+                return payload.decode(charset, errors="replace")
+        return ""
+
+    @staticmethod
+    def _body_text(msg):
+        """Extract plain-text body from an email.message.Message."""
+        if msg.is_multipart():
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if ct == "text/plain":
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or "utf-8"
+                        return payload.decode(charset, errors="replace")
+            # Fallback: try text/html, strip tags for plain-text output
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if ct == "text/html":
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or "utf-8"
+                        return GmailClient._strip_html(payload.decode(charset, errors="replace"))
+            return ""
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            raw = payload.decode(charset, errors="replace")
+            if msg.get_content_type() == "text/html":
+                return GmailClient._strip_html(raw)
+            return raw
+        return ""
+
+    # ── public API ───────────────────────────────────────────────────────
+    def list_threads(self, limit: int = 30, folder: str = "inbox"):
+        """Return list of thread dicts, grouped by Gmail thread ID (X-GM-THRID).
+        folder: 'inbox' (default) or 'sent' to list sent messages."""
+        import imaplib
+        import email as email_mod
+        conn = self._imap_connect()
+        try:
+            if folder == "sent":
+                conn.select("[Gmail]/Sent Mail", readonly=True)
+            else:
+                conn.select("INBOX", readonly=True)
+            # Search recent emails only (last 30 days) to avoid massive UID lists
+            from datetime import timedelta
+            since_date = (datetime.now() - timedelta(days=30)).strftime("%d-%b-%Y")
+            _typ, data = conn.search(None, f'(SINCE {since_date})')
+            all_uids = data[0].split() if data[0] else []
+            # If no recent emails, try last 90 days
+            if not all_uids:
+                since_date = (datetime.now() - timedelta(days=90)).strftime("%d-%b-%Y")
+                _typ, data = conn.search(None, f'(SINCE {since_date})')
+                all_uids = data[0].split() if data[0] else []
+            # Take most recent messages (fetch more than limit to group into threads)
+            recent_uids = all_uids[-(limit * 3):] if len(all_uids) > limit * 3 else all_uids
+            if not recent_uids:
+                return []
+
+            uid_range = b",".join(recent_uids)
+            # Fetch envelope + flags + Gmail thread ID
+            try:
+                _typ, fetch_data = conn.fetch(uid_range, "(FLAGS BODY.PEEK[HEADER] X-GM-THRID)")
+            except imaplib.IMAP4.error:
+                # Fallback if X-GM-THRID not supported
+                _typ, fetch_data = conn.fetch(uid_range, "(FLAGS BODY.PEEK[HEADER])")
+
+            # Parse messages and group by thread
+            threads_map = {}  # thread_key -> {msgs, flags, ...}
+            for item in fetch_data:
+                if not isinstance(item, tuple) or len(item) < 2:
+                    continue
+                header_line = item[0] if isinstance(item[0], (str, bytes)) else b""
+                if isinstance(header_line, str):
+                    header_line = header_line.encode()
+                raw_header = item[1] if isinstance(item[1], bytes) else b""
+
+                # Parse flags
+                flags_str = header_line.decode("utf-8", errors="replace")
+                is_seen = "\\Seen" in flags_str
+
+                # Extract X-GM-THRID if present
+                gm_thrid = None
+                import re as _re
+                thrid_match = _re.search(r"X-GM-THRID\s+(\d+)", flags_str)
+                if thrid_match:
+                    gm_thrid = thrid_match.group(1)
+
+                msg = email_mod.message_from_bytes(raw_header)
+                subject = self._decode_header(msg.get("Subject")) or "(no subject)"
+                from_addr = self._decode_header(msg.get("From", ""))
+                to_addr = self._decode_header(msg.get("To", ""))
+                msg_id = msg.get("Message-ID", "")
+                date = self._msg_date(msg)
+
+                # Thread key: use Gmail thread ID or fall back to subject
+                thread_key = gm_thrid or re.sub(r"^(Re|Fwd):\s*", "", subject, flags=re.IGNORECASE).strip().lower()
+
+                if thread_key not in threads_map:
+                    threads_map[thread_key] = {
+                        "thread_id": gm_thrid or msg_id or str(hash(thread_key)),
+                        "subject": subject,
+                        "senders": [],
+                        "recipients": [],
+                        "preview": "",
+                        "labels": [],
+                        "message_count": 0,
+                        "timestamp": date,
+                        "unread": False,
+                        "_date": date,
+                    }
+                t = threads_map[thread_key]
+                t["message_count"] += 1
+                from_email = self._parse_addr(from_addr)
+                if from_email and from_email not in t["senders"]:
+                    t["senders"].append(from_email)
+                to_email = self._parse_addr(to_addr)
+                if to_email and to_email not in t["recipients"]:
+                    t["recipients"].append(to_email)
+                if not is_seen:
+                    t["unread"] = True
+                if date > t["_date"]:
+                    t["_date"] = date
+                    t["timestamp"] = date
+
+            # Sort by most recent, limit
+            threads = sorted(threads_map.values(), key=lambda x: x["_date"], reverse=True)[:limit]
+            for t in threads:
+                t["timestamp"] = t["_date"].isoformat()
+                if t["unread"]:
+                    t["labels"] = ["unread"]
+                del t["_date"]
+            return threads
+        finally:
+            try:
+                conn.close()
+                conn.logout()
+            except Exception:
+                pass
+
+    def get_thread(self, thread_id: str):
+        """Fetch all messages for a thread. thread_id may be X-GM-THRID or Message-ID."""
+        import imaplib
+        import email as email_mod
+        conn = self._imap_connect()
+        try:
+            conn.select("INBOX", readonly=True)
+
+            # Try Gmail thread search first (X-GM-THRID)
+            uids = []
+            try:
+                _typ, data = conn.search(None, f"X-GM-THRID {thread_id}")
+                uids = data[0].split() if data[0] else []
+            except imaplib.IMAP4.error:
+                pass
+
+            if not uids:
+                # Fallback: search by Message-ID header
+                _typ, data = conn.search(None, f'HEADER Message-ID "{thread_id}"')
+                uids = data[0].split() if data[0] else []
+
+            if not uids:
+                # Fallback: search by subject from a broader set
+                _typ, data = conn.search(None, "ALL")
+                uids = data[0].split()[-50:] if data[0] else []
+
+            if not uids:
+                return {"thread_id": thread_id, "subject": "", "senders": [], "recipients": [], "labels": [], "messages": []}
+
+            uid_range = b",".join(uids)
+            _typ, fetch_data = conn.fetch(uid_range, "(FLAGS BODY.PEEK[])")
+
+            messages = []
+            subject = ""
+            senders = []
+            recipients = []
+            for item in fetch_data:
+                if not isinstance(item, tuple) or len(item) < 2:
+                    continue
+                flags_str = item[0].decode("utf-8", errors="replace") if isinstance(item[0], bytes) else str(item[0])
+                is_seen = "\\Seen" in flags_str
+                raw = item[1] if isinstance(item[1], bytes) else b""
+                msg = email_mod.message_from_bytes(raw)
+                msg_subject = self._decode_header(msg.get("Subject")) or "(no subject)"
+                from_addr = self._decode_header(msg.get("From", ""))
+                to_addr = self._decode_header(msg.get("To", ""))
+                cc_addr = self._decode_header(msg.get("Cc", ""))
+                msg_id = msg.get("Message-ID", "")
+                date = self._msg_date(msg)
+                body = self._body_text(msg)
+                html_body = self._body_html(msg)
+
+                if not subject:
+                    subject = msg_subject
+                from_email = self._parse_addr(from_addr)
+                if from_email and from_email not in senders:
+                    senders.append(from_email)
+                to_email = self._parse_addr(to_addr)
+                if to_email and to_email not in recipients:
+                    recipients.append(to_email)
+
+                messages.append({
+                    "message_id": msg_id,
+                    "thread_id": thread_id,
+                    "from": from_email or from_addr,
+                    "to": [self._parse_addr(a) for a in to_addr.split(",") if a.strip()] if to_addr else [],
+                    "cc": [self._parse_addr(a) for a in cc_addr.split(",") if a.strip()] if cc_addr else [],
+                    "subject": msg_subject,
+                    "text": body,
+                    "html": html_body,
+                    "preview": body[:200] if body else "",
+                    "labels": [] if is_seen else ["unread"],
+                    "timestamp": date.isoformat(),
+                    "unread": not is_seen,
+                    "in_reply_to": msg.get("In-Reply-To", ""),
+                })
+
+            messages.sort(key=lambda m: m["timestamp"])
+            return {
+                "thread_id": thread_id,
+                "subject": subject or "(no subject)",
+                "senders": senders,
+                "recipients": recipients,
+                "labels": ["unread"] if any(m["unread"] for m in messages) else [],
+                "messages": messages,
+            }
+        finally:
+            try:
+                conn.close()
+                conn.logout()
+            except Exception:
+                pass
+
+    def send_message(self, to: str, subject: str, body: str, cc: str = None):
+        """Send an email via SMTP. Returns dict with message_id."""
+        import smtplib
+        import email.message
+        msg = email.message.EmailMessage()
+        msg["From"] = self.address
+        msg["To"] = to
+        msg["Subject"] = subject or "(no subject)"
+        if cc:
+            msg["Cc"] = cc
+        msg.set_content(body)
+        msg_id = msg["Message-ID"]  # auto-generated
+
+        smtp = smtplib.SMTP(self.smtp_host, self.smtp_port)
+        try:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.ehlo()
+            smtp.login(self.address, self.app_password)
+            smtp.send_message(msg)
+        finally:
+            smtp.quit()
+
+        return {"message_id": msg_id or "", "thread_id": ""}
+
+    def reply_to_thread(self, thread_id: str, message_id: str, body: str):
+        """Reply to a message via SMTP with In-Reply-To and References headers."""
+        import smtplib
+        import email.message as email_message_mod
+
+        # Fetch original message to get subject and reply-to info
+        original_subject = ""
+        original_from = ""
+        try:
+            thread_data = self.get_thread(thread_id)
+            for m in thread_data.get("messages", []):
+                if m.get("message_id") == message_id:
+                    original_subject = m.get("subject", "")
+                    original_from = m.get("from", "")
+                    break
+            if not original_subject and thread_data.get("messages"):
+                last = thread_data["messages"][-1]
+                original_subject = last.get("subject", "")
+                original_from = last.get("from", "")
+                message_id = last.get("message_id", message_id)
+        except Exception:
+            pass
+
+        msg = email_message_mod.EmailMessage()
+        msg["From"] = self.address
+        msg["To"] = original_from or self.address
+        msg["Subject"] = ("Re: " + original_subject) if original_subject and not original_subject.startswith("Re:") else (original_subject or "Re:")
+        if message_id:
+            msg["In-Reply-To"] = message_id
+            msg["References"] = message_id
+        msg.set_content(body)
+        new_msg_id = msg["Message-ID"] or ""
+
+        smtp = smtplib.SMTP(self.smtp_host, self.smtp_port)
+        try:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.ehlo()
+            smtp.login(self.address, self.app_password)
+            smtp.send_message(msg)
+        finally:
+            smtp.quit()
+
+        return {"message_id": new_msg_id, "thread_id": thread_id}
+
+    def mark_thread_read(self, thread_id: str):
+        """Mark all messages in a thread as read (add \\Seen flag)."""
+        import imaplib
+        conn = self._imap_connect()
+        try:
+            conn.select("INBOX")
+            uids = []
+            try:
+                _typ, data = conn.search(None, f"X-GM-THRID {thread_id}")
+                uids = data[0].split() if data[0] else []
+            except imaplib.IMAP4.error:
+                pass
+            if not uids:
+                _typ, data = conn.search(None, f'HEADER Message-ID "{thread_id}"')
+                uids = data[0].split() if data[0] else []
+            if uids:
+                uid_range = b",".join(uids)
+                conn.store(uid_range, "+FLAGS", "\\Seen")
+        finally:
+            try:
+                conn.close()
+                conn.logout()
+            except Exception:
+                pass
+
+
+def _get_email_client(account_idx: int = 0):
+    """Return (client, inbox_email) or (None, None) for given account index.
+    Routes to AgentMail or GmailClient based on provider."""
+    settings = _load_settings()
+    _migrate_email_accounts(settings)
+    accounts = settings.get("email_accounts", [])
+    if not accounts or account_idx >= len(accounts):
+        # Fallback to legacy keys for backward compat (agentmail only)
+        api_key = settings.get("agentmail_api_key", "").strip()
+        email_addr = settings.get("agentmail_email", "").strip()
+        if not api_key or not email_addr:
+            return None, None
+        try:
+            from agentmail import AgentMail
+            return AgentMail(api_key=api_key), email_addr
+        except Exception:
+            return None, None
+    acct = accounts[account_idx]
+    provider = acct.get("provider", "agentmail")
+    api_key = acct.get("api_key", "").strip()
+    email_addr = acct.get("address", "").strip()
+    if not api_key or not email_addr:
+        return None, None
+
+    if provider == "gmail":
+        try:
+            return GmailClient(email_addr, api_key), email_addr
+        except Exception:
+            return None, None
+    else:
+        # Default: AgentMail
+        try:
+            from agentmail import AgentMail
+            return AgentMail(api_key=api_key), email_addr
+        except Exception:
+            return None, None
+
+
+def _send_email_notification(to_email: str, subject: str, body: str, cc: str = None) -> dict:
+    """Send an email notification using the configured email provider (Gmail or AgentMail).
+    Returns {"ok": True, "message_id": ...} on success or {"ok": False, "error": "..."} on failure.
+    CIV-agnostic: uses whatever provider the CIV has configured in settings.
+    """
+    try:
+        client, from_addr = _get_email_client()
+        if client is None:
+            return {"ok": False, "error": "No email provider configured"}
+        if isinstance(client, GmailClient):
+            result = client.send_message(to=to_email, subject=subject, body=body, cc=cc)
+            return {"ok": True, "message_id": result.get("message_id", "")}
+        else:
+            # AgentMail SDK
+            result = client.inboxes.messages.send(
+                inbox_id=from_addr,
+                to=to_email,
+                subject=subject,
+                text=body,
+            )
+            return {"ok": True, "message_id": getattr(result, "message_id", "")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _thread_to_dict(t) -> dict:
+    """Serialize an AgentMail thread object to a JSON-safe dict."""
+    return {
+        "thread_id": t.thread_id,
+        "subject": t.subject or "(no subject)",
+        "senders": t.senders or [],
+        "recipients": t.recipients or [],
+        "preview": t.preview or "",
+        "labels": t.labels or [],
+        "message_count": t.message_count or 0,
+        "timestamp": t.timestamp.isoformat() if t.timestamp else None,
+        "unread": "unread" in (t.labels or []),
+    }
+
+
+def _message_to_dict(m) -> dict:
+    """Serialize an AgentMail message object to a JSON-safe dict."""
+    return {
+        "message_id": m.message_id,
+        "thread_id": m.thread_id,
+        "from": m.from_ or "",
+        "to": m.to or [],
+        "cc": m.cc or [],
+        "subject": m.subject or "(no subject)",
+        "text": m.text or "",
+        "html": m.html or "",
+        "preview": m.preview or "",
+        "labels": m.labels or [],
+        "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+        "unread": "unread" in (m.labels or []),
+        "in_reply_to": m.in_reply_to or "",
+    }
+
+
+async def api_inbox_status(request: Request) -> JSONResponse:
+    """GET /api/inbox/status — check if AgentMail is configured. Returns all accounts."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    settings = _load_settings()
+    _migrate_email_accounts(settings)
+    accounts = settings.get("email_accounts", [])
+    if accounts:
+        safe_accounts = [
+            {"provider": a.get("provider", ""), "address": a.get("address", ""), "label": a.get("label", "")}
+            for a in accounts
+        ]
+        return JSONResponse({
+            "configured": True,
+            "email": accounts[0].get("address", ""),
+            "accounts": safe_accounts,
+        })
+    # Legacy fallback
+    api_key = settings.get("agentmail_api_key", "").strip()
+    email = settings.get("agentmail_email", "").strip()
+    return JSONResponse({
+        "configured": bool(api_key and email),
+        "email": email if api_key else "",
+        "accounts": [],
+    })
+
+
+_gmail_thread_cache = {}  # {account_idx: {"threads": [...], "ts": float, "email": str}}
+_GMAIL_CACHE_TTL = 30  # seconds
+
+async def api_inbox_threads(request: Request) -> JSONResponse:
+    """GET /api/inbox/threads — list recent email threads."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    account_idx = int(request.query_params.get("account", "0"))
+    client, email = _get_email_client(account_idx)
+    if not client:
+        return JSONResponse({"error": "Email not configured"}, status_code=400)
+    try:
+        limit = int(request.query_params.get("limit", "30"))
+        limit = min(limit, 100)
+        folder = request.query_params.get("folder", "inbox")
+        if isinstance(client, GmailClient):
+            # Server-side cache for Gmail (IMAP is slow) — keyed by folder
+            cache_key = (account_idx, folder)
+            cached = _gmail_thread_cache.get(cache_key)
+            if cached and (time.time() - cached["ts"]) < _GMAIL_CACHE_TTL:
+                return JSONResponse({"threads": cached["threads"], "email": cached["email"]})
+            # Run blocking IMAP in thread pool to avoid blocking the event loop
+            loop = asyncio.get_event_loop()
+            threads = await loop.run_in_executor(None, lambda: client.list_threads(limit=limit, folder=folder))
+            _gmail_thread_cache[cache_key] = {"threads": threads, "ts": time.time(), "email": email}
+            return JSONResponse({"threads": threads, "email": email})
+        else:
+            kwargs = {"limit": limit}
+            if folder == "sent":
+                kwargs["labels"] = ["sent"]
+            result = client.inboxes.threads.list(email, **kwargs)
+            threads = [_thread_to_dict(t) for t in (result.threads or [])]
+            return JSONResponse({"threads": threads, "email": email})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+async def api_inbox_thread_detail(request: Request) -> JSONResponse:
+    """GET /api/inbox/threads/{thread_id} — get full thread with messages."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    account_idx = int(request.query_params.get("account", "0"))
+    client, email = _get_email_client(account_idx)
+    if not client:
+        return JSONResponse({"error": "Email not configured"}, status_code=400)
+    thread_id = request.path_params.get("thread_id", "")
+    try:
+        if isinstance(client, GmailClient):
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: client.get_thread(thread_id))
+            return JSONResponse(result)
+        else:
+            thread = client.threads.get(thread_id)
+            messages = [_message_to_dict(m) for m in (thread.messages or [])]
+            return JSONResponse({
+                "thread_id": thread.thread_id,
+                "subject": thread.subject or "(no subject)",
+                "senders": thread.senders or [],
+                "recipients": thread.recipients or [],
+                "labels": thread.labels or [],
+                "messages": messages,
+            })
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+async def api_inbox_send(request: Request) -> JSONResponse:
+    """POST /api/inbox/send — send a new email."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    account_idx = int(request.query_params.get("account", "0"))
+    client, email = _get_email_client(account_idx)
+    if not client:
+        return JSONResponse({"error": "Email not configured"}, status_code=400)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    to = body.get("to", "").strip()
+    subject = body.get("subject", "").strip()
+    text = body.get("text", "").strip()
+    if not to or not text:
+        return JSONResponse({"error": "to and text are required"}, status_code=400)
+    try:
+        if isinstance(client, GmailClient):
+            result = client.send_message(to=to, subject=subject or "(no subject)", body=text)
+            _gmail_thread_cache.pop(account_idx, None)  # Invalidate cache after send
+            return JSONResponse({
+                "ok": True,
+                "message_id": result.get("message_id", ""),
+                "thread_id": result.get("thread_id", ""),
+            })
+        else:
+            result = client.inboxes.messages.send(
+                inbox_id=email,
+                to=to,
+                subject=subject or "(no subject)",
+                text=text,
+            )
+            return JSONResponse({
+                "ok": True,
+                "message_id": result.message_id,
+                "thread_id": result.thread_id,
+            })
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+async def api_inbox_reply(request: Request) -> JSONResponse:
+    """POST /api/inbox/reply/{message_id} — reply to a message."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    account_idx = int(request.query_params.get("account", "0"))
+    client, email = _get_email_client(account_idx)
+    if not client:
+        return JSONResponse({"error": "Email not configured"}, status_code=400)
+    message_id = request.path_params.get("message_id", "")
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    text = body.get("text", "").strip()
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
+    try:
+        if isinstance(client, GmailClient):
+            thread_id = body.get("thread_id", "")
+            result = client.reply_to_thread(
+                thread_id=thread_id,
+                message_id=message_id,
+                body=text,
+            )
+            _gmail_thread_cache.pop(account_idx, None)  # Invalidate cache after reply
+            return JSONResponse({
+                "ok": True,
+                "message_id": result.get("message_id", ""),
+                "thread_id": result.get("thread_id", ""),
+            })
+        else:
+            result = client.inboxes.messages.reply(
+                inbox_id=email,
+                message_id=message_id,
+                text=text,
+            )
+            return JSONResponse({
+                "ok": True,
+                "message_id": result.message_id,
+                "thread_id": result.thread_id,
+            })
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+async def api_inbox_mark_read(request: Request) -> JSONResponse:
+    """POST /api/inbox/threads/{thread_id}/read — mark all messages in thread as read."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    account_idx = int(request.query_params.get("account", "0"))
+    client, email = _get_email_client(account_idx)
+    if not client:
+        return JSONResponse({"error": "Email not configured"}, status_code=400)
+    thread_id = request.path_params.get("thread_id", "")
+    try:
+        if isinstance(client, GmailClient):
+            client.mark_thread_read(thread_id)
+            return JSONResponse({"ok": True})
+        else:
+            thread = client.threads.get(thread_id)
+            for m in (thread.messages or []):
+                if "unread" in (m.labels or []):
+                    client.inboxes.messages.update(
+                        inbox_id=email,
+                        message_id=m.message_id,
+                        remove_labels=["unread"],
+                    )
+            return JSONResponse({"ok": True})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+async def api_inbox_mark_all_read(request: Request) -> JSONResponse:
+    """POST /api/inbox/mark-all-read — mark all unread threads as read."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    account_idx = int(request.query_params.get("account", "0"))
+    client, email = _get_email_client(account_idx)
+    if not client:
+        return JSONResponse({"error": "Email not configured"}, status_code=400)
+    try:
+        marked = 0
+        if isinstance(client, GmailClient):
+            threads = client.list_threads(limit=50, folder="inbox")
+            for t in threads:
+                if t.get("unread"):
+                    client.mark_thread_read(t["thread_id"])
+                    marked += 1
+        else:
+            result = client.inboxes.threads.list(email, labels=["unread"], limit=50)
+            for t in (result.threads or []):
+                thread_detail = client.threads.get(t.thread_id)
+                for m in (thread_detail.messages or []):
+                    if "unread" in (m.labels or []):
+                        client.inboxes.messages.update(
+                            inbox_id=email,
+                            message_id=m.message_id,
+                            remove_labels=["unread"],
+                        )
+                marked += 1
+        return JSONResponse({"ok": True, "marked": marked})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+
+async def api_inbox_accounts(request: Request) -> JSONResponse:
+    """POST /api/inbox/accounts — add a new email account.
+       DELETE /api/inbox/accounts — remove an account by index."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    settings = _load_settings()
+    _migrate_email_accounts(settings)
+    accounts = settings.get("email_accounts", [])
+
+    if request.method == "DELETE":
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        idx = body.get("index", -1)
+        if not isinstance(idx, int) or idx < 0 or idx >= len(accounts):
+            return JSONResponse({"error": "invalid account index"}, status_code=400)
+        accounts.pop(idx)
+        settings["email_accounts"] = accounts
+        _save_settings(settings)
+        return JSONResponse({"ok": True, "accounts": [
+            {"provider": a.get("provider", ""), "address": a.get("address", ""), "label": a.get("label", "")}
+            for a in accounts
+        ]})
+
+    # POST — add account
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    provider = body.get("provider", "agentmail").strip()
+    api_key = body.get("api_key", "").strip()
+    address = body.get("address", "").strip()
+    label = body.get("label", "").strip()
+    if not api_key or not address:
+        return JSONResponse({"error": "api_key and address are required"}, status_code=400)
+    if not label:
+        label = address.split("@")[0] if "@" in address else address
+    # Deduplicate by address
+    for a in accounts:
+        if a.get("address", "").lower() == address.lower():
+            return JSONResponse({"error": "account already exists"}, status_code=409)
+    accounts.append({"provider": provider, "api_key": api_key, "address": address, "label": label})
+    settings["email_accounts"] = accounts
+    # Also keep legacy keys pointing at first account for backward compat
+    settings["agentmail_api_key"] = accounts[0]["api_key"]
+    settings["agentmail_email"] = accounts[0]["address"]
+    _save_settings(settings)
+    return JSONResponse({"ok": True, "accounts": [
+        {"provider": a.get("provider", ""), "address": a.get("address", ""), "label": a.get("label", "")}
+        for a in accounts
+    ]})
+
+
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # User settings (synced across devices via server)
 # ---------------------------------------------------------------------------
 SETTINGS_FILE = SCRIPT_DIR / "user-settings.json"
+CC_CACHE_FILE = SCRIPT_DIR / "cc-cache.json"
+
+_SECRET_FIELDS = ("cc_civ_key", "agentmail_api_key")
 
 def _load_settings() -> dict:
     try:
@@ -6742,21 +4862,132 @@ def _load_settings() -> dict:
 def _save_settings(data: dict):
     SETTINGS_FILE.write_text(json.dumps(data, indent=2))
 
+def _load_cc_cache() -> list | None:
+    try:
+        return json.loads(CC_CACHE_FILE.read_text()) if CC_CACHE_FILE.exists() else None
+    except Exception:
+        return None
+
+def _save_cc_cache(messages) -> None:
+    CC_CACHE_FILE.write_text(json.dumps(messages))
+
 async def api_user_settings(request: Request) -> JSONResponse:
     """GET returns saved settings, POST/PUT merges new settings."""
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     if request.method == "GET":
-        return JSONResponse(_load_settings())
+        settings = _load_settings()
+        # Merge CC message cache from separate file (split for size)
+        cc_cache = _load_cc_cache()
+        if cc_cache is not None:
+            settings["cc_cached_messages"] = cc_cache
+        # Mask secrets before returning to browser (defense-in-depth)
+        for field in _SECRET_FIELDS:
+            val = settings.get(field)
+            if val and isinstance(val, str):
+                settings[field] = "****" + val[-4:] if len(val) > 4 else "****"
+        return JSONResponse(settings)
     # POST/PUT — merge incoming keys
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "invalid json"}, status_code=400)
     settings = _load_settings()
-    settings.update(body)
+    # Extract cc_cached_messages to separate file (keeps settings small)
+    if "cc_cached_messages" in body:
+        cc_data = body.pop("cc_cached_messages")
+        if cc_data is not None:
+            _save_cc_cache(cc_data)
+    # Deep-merge nested dicts (e.g. notifications) instead of replacing them
+    for key, value in body.items():
+        # Skip masked secret values (browser echoes back "****..." from GET)
+        if key in _SECRET_FIELDS and isinstance(value, str) and value.startswith("****"):
+            continue
+        if isinstance(value, dict) and isinstance(settings.get(key), dict):
+            settings[key].update(value)
+        else:
+            settings[key] = value
     _save_settings(settings)
     return JSONResponse({"ok": True, "settings": settings})
+
+# ---------------------------------------------------------------------------
+# Profile API — merges identity file + editable settings
+# ---------------------------------------------------------------------------
+
+async def api_profile(request: Request) -> JSONResponse:
+    """GET returns merged profile (identity + settings), POST saves editable fields."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+
+        settings = _load_settings()
+        profile = settings.get("profile", {})
+
+        # Only allow editable fields — identity file fields are read-only
+        editable = [
+            "role", "model", "architecture", "agent_count",
+            "human_title", "human_org", "human_background",
+            "human_style", "human_values", "human_role", "human_relationship",
+            "website", "civ_email"
+        ]
+        for key in editable:
+            if key in body:
+                profile[key] = body[key]
+
+        settings["profile"] = profile
+        _save_settings(settings)
+        return JSONResponse({"ok": True})
+
+    # GET — merge identity file (read-only) + settings (editable)
+    identity = {}
+    identity_file = Path.home() / ".aiciv-identity.json"
+    if identity_file.exists():
+        try:
+            identity = json.loads(identity_file.read_text())
+        except Exception:
+            pass
+
+    settings = _load_settings()
+    profile = settings.get("profile", {})
+
+    # Fall back to first email_accounts entry for civ_email
+    accounts = settings.get("email_accounts", [])
+    civ_email = profile.get("civ_email", "")
+    human_email = identity.get("human_email", "")
+    if not civ_email and accounts:
+        civ_email = accounts[0].get("address", "")
+
+    return JSONResponse({
+        # AI Identity (from identity file, non-editable)
+        "civ_name": identity.get("civ_name", ""),
+        "civ_id": identity.get("civ_id", ""),
+        "parent_civ": identity.get("parent_civ", ""),
+        "born": identity.get("born", ""),
+        "status": identity.get("status", "active"),
+        # AI Identity (from settings, editable)
+        "role": profile.get("role", "AI Agent"),
+        "model": profile.get("model", "Claude"),
+        "architecture": profile.get("architecture", ""),
+        "agent_count": profile.get("agent_count", ""),
+        # Human Partner (identity = non-editable, settings = editable)
+        "human_name": identity.get("human_name", ""),
+        "human_email": human_email,
+        "human_title": profile.get("human_title", ""),
+        "human_org": profile.get("human_org", ""),
+        "human_background": profile.get("human_background", ""),
+        "human_style": profile.get("human_style", ""),
+        "human_values": profile.get("human_values", ""),
+        "human_role": profile.get("human_role", "Creator & Steward"),
+        "human_relationship": profile.get("human_relationship", "Trust-based"),
+        # Contact Card
+        "civ_email": civ_email,
+        "website": profile.get("website", ""),
+    })
 
 # ---------------------------------------------------------------------------
 # Bookmarks API (server-side persistence, syncs across devices)
@@ -6772,21 +5003,287 @@ def _load_bookmarks() -> list:
 def _save_bookmarks(data: list):
     BOOKMARKS_FILE.write_text(json.dumps(data, indent=2))
 
+def _fetch_url_metadata(url: str, timeout: float = 5.0) -> dict:
+    """Fetch a URL and extract <title> + favicon. Returns dict with 'title' and 'favicon_url'."""
+    result = {}
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 PureBrain Portal"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            html = resp.read(64 * 1024).decode("utf-8", errors="ignore")
+            title_match = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
+            if title_match:
+                result["title"] = title_match.group(1).strip()
+            icon_match = re.search(
+                r'<link[^>]*rel=["\'](?:shortcut )?icon["\'][^>]*href=["\']([^"\']+)["\']',
+                html, re.IGNORECASE,
+            )
+            if not icon_match:
+                icon_match = re.search(
+                    r'<link[^>]*href=["\']([^"\']+)["\'][^>]*rel=["\'](?:shortcut )?icon["\']',
+                    html, re.IGNORECASE,
+                )
+            if icon_match:
+                favicon = icon_match.group(1)
+                if favicon.startswith("//"):
+                    favicon = "https:" + favicon
+                elif favicon.startswith("/"):
+                    parsed = urllib.parse.urlparse(url)
+                    favicon = f"{parsed.scheme}://{parsed.netloc}{favicon}"
+                result["favicon_url"] = favicon
+            else:
+                parsed = urllib.parse.urlparse(url)
+                result["favicon_url"] = f"{parsed.scheme}://{parsed.netloc}/favicon.ico"
+    except Exception:
+        pass
+    return result
+
+def _enrich_bookmark(bm: dict):
+    """Enrich a URL bookmark with title/favicon if missing."""
+    if bm.get("type") == "url" and bm.get("url"):
+        title = bm.get("name", "")
+        if not title or title == "Bookmark":
+            meta = _fetch_url_metadata(bm["url"])
+            if meta.get("title"):
+                bm["name"] = meta["title"]
+            elif not title:
+                bm["name"] = bm["url"]
+            if meta.get("favicon_url"):
+                bm["favicon_url"] = meta["favicon_url"]
+
 async def api_bookmarks(request: Request) -> JSONResponse:
-    """GET returns saved bookmarks array, POST saves bookmarks array (server wins)."""
+    """GET returns bookmarks. POST supports action-based ops or full-array replace."""
     if not check_auth(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     if request.method == "GET":
         return JSONResponse(_load_bookmarks())
-    # POST — replace bookmarks with the full array sent by client
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    # Action-based: { action: "add", bookmark: {...} } or { action: "delete", id: "..." }
+    if isinstance(body, dict):
+        action = body.get("action")
+        if action == "add":
+            bm = body.get("bookmark")
+            if not isinstance(bm, dict):
+                return JSONResponse({"error": "missing bookmark object"}, status_code=400)
+            _enrich_bookmark(bm)
+            bms = _load_bookmarks()
+            bms.append(bm)
+            _save_bookmarks(bms)
+            return JSONResponse({"ok": True, "count": len(bms)})
+        elif action == "delete":
+            bid = body.get("id")
+            if not bid:
+                return JSONResponse({"error": "missing id"}, status_code=400)
+            bms = _load_bookmarks()
+            bms = [b for b in bms if b.get("id") != bid]
+            _save_bookmarks(bms)
+            return JSONResponse({"ok": True, "count": len(bms)})
+        return JSONResponse({"error": "unknown action"}, status_code=400)
+
+    # Full-array replace (used for migration from localStorage)
     if not isinstance(body, list):
-        return JSONResponse({"error": "expected array"}, status_code=400)
+        return JSONResponse({"error": "expected array or action object"}, status_code=400)
+    for bm in body:
+        if isinstance(bm, dict):
+            _enrich_bookmark(bm)
     _save_bookmarks(body)
     return JSONResponse({"ok": True, "count": len(body)})
+
+# ---------------------------------------------------------------------------
+# Deployments CRUD API
+# ---------------------------------------------------------------------------
+
+# Deployments start empty — each CIV adds their own via the portal UI or API.
+# Stored in user-settings.json (gitignored) so personal deployments never leak to the repo.
+#
+# Schema for reference:
+# {
+#     "id": "dep-example-001",        # unique id (auto-generated by UI)
+#     "name": "my-app.example.com",   # display name
+#     "description": "What it does",  # free text
+#     "url": "https://...",           # live URL (optional)
+#     "platform": "VPS",              # VPS, Netlify, Cloudflare Pages, Vercel, etc.
+#     "stack": "FastAPI + SQLite",    # tech stack summary
+#     "status": "live",               # live, staging, maintenance, offline
+#     "repo": "org/repo-name",        # GitHub repo (optional)
+#     "server": "1.2.3.4",            # server IP (optional)
+#     "created_at": "ISO8601",
+#     "updated_at": "ISO8601"
+# }
+_DEFAULT_DEPLOYMENTS = []
+
+
+_vercel_cache: dict = {"ts": 0, "data": []}
+_VERCEL_CACHE_TTL = 300  # 5 min cache
+
+async def _fetch_vercel_projects() -> list:
+    """Fetch projects from Vercel API, cached for 5 min."""
+    import time as _time
+    now = _time.time()
+    if now - _vercel_cache["ts"] < _VERCEL_CACHE_TTL and _vercel_cache["data"]:
+        return _vercel_cache["data"]
+
+    token = os.environ.get("VERCEL_TOKEN", "")
+    team_id = os.environ.get("VERCEL_TEAM_ID", "team_GnbWx7m4NZAjfqGYojakme0k")
+    if not token:
+        return []
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"https://api.vercel.com/v9/projects?limit=100&teamId={team_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if resp.status_code != 200:
+                return _vercel_cache.get("data", [])
+            projects = resp.json().get("projects", [])
+
+        deployments = []
+        for p in projects:
+            name = p.get("name", "")
+            targets = p.get("targets", {})
+            prod = targets.get("production", {})
+            url = ""
+            if isinstance(prod, dict):
+                # Prefer production alias (clean URL like name.vercel.app)
+                prod_aliases = prod.get("alias", [])
+                if prod_aliases and isinstance(prod_aliases, list):
+                    url = "https://" + prod_aliases[0]
+                else:
+                    url = prod.get("url", "")
+                    if url and not url.startswith("http"):
+                        url = "https://" + url
+            # Override with custom domain if configured
+            aliases = p.get("alias", [])
+            if aliases:
+                if isinstance(aliases[0], dict):
+                    domain = aliases[0].get("domain", "")
+                elif isinstance(aliases[0], str):
+                    domain = aliases[0]
+                else:
+                    domain = ""
+                if domain:
+                    url = "https://" + domain
+
+            updated = p.get("updatedAt", 0)
+            if isinstance(updated, (int, float)) and updated > 1000000000000:
+                updated = updated / 1000
+            try:
+                from datetime import datetime, timezone
+                updated_str = datetime.fromtimestamp(updated, tz=timezone.utc).isoformat() if updated else ""
+            except Exception:
+                updated_str = ""
+
+            deployments.append({
+                "id": p.get("id", name),
+                "name": name,
+                "description": "",
+                "url": url,
+                "platform": "Vercel",
+                "stack": p.get("framework", "static") or "static",
+                "status": "live" if url else "staging",
+                "repo": "",
+                "server": "",
+                "created_at": updated_str,
+                "updated_at": updated_str,
+            })
+
+        _vercel_cache["ts"] = now
+        _vercel_cache["data"] = deployments
+        return deployments
+    except Exception as e:
+        print(f"[deployments] Vercel fetch error: {e}")
+        return _vercel_cache.get("data", [])
+
+
+async def api_deployments_list(request: Request) -> JSONResponse:
+    """GET /api/deployments — auto-fetch from Vercel API + any manual entries."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    # Fetch live Vercel projects
+    vercel_deps = await _fetch_vercel_projects()
+
+    # Also include any manually added deployments from settings
+    settings = _load_settings()
+    manual_deps = settings.get("deployments", [])
+
+    all_deps = vercel_deps + manual_deps
+    return JSONResponse({"deployments": all_deps, "total": len(all_deps)})
+
+
+async def api_deployments_create(request: Request) -> JSONResponse:
+    """POST /api/deployments — add a new deployment."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    now = datetime.now(timezone.utc).isoformat()
+    deployment = {
+        "id": secrets.token_hex(8),
+        "name": body.get("name", ""),
+        "description": body.get("description", ""),
+        "url": body.get("url", ""),
+        "platform": body.get("platform", ""),
+        "stack": body.get("stack", ""),
+        "status": body.get("status", "staging"),
+        "repo": body.get("repo", ""),
+        "server": body.get("server", ""),
+        "created_at": now,
+        "updated_at": now,
+    }
+    settings = _load_settings()
+    if "deployments" not in settings:
+        settings["deployments"] = list(_DEFAULT_DEPLOYMENTS)
+    settings["deployments"].append(deployment)
+    _save_settings(settings)
+    return JSONResponse({"ok": True, "deployment": deployment})
+
+
+async def api_deployments_update(request: Request) -> JSONResponse:
+    """PUT /api/deployments/{dep_id} — update a deployment by id."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    dep_id = request.path_params["dep_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    settings = _load_settings()
+    deployments = settings.get("deployments", [])
+    for dep in deployments:
+        if dep.get("id") == dep_id:
+            # Update allowed fields, preserve id and created_at
+            for key in ("name", "description", "url", "platform", "stack",
+                        "status", "repo", "server"):
+                if key in body:
+                    dep[key] = body[key]
+            dep["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _save_settings(settings)
+            return JSONResponse({"ok": True, "deployment": dep})
+    return JSONResponse({"error": "not found"}, status_code=404)
+
+
+async def api_deployments_delete(request: Request) -> JSONResponse:
+    """DELETE /api/deployments/{dep_id} — remove a deployment by id."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    dep_id = request.path_params["dep_id"]
+    settings = _load_settings()
+    deployments = settings.get("deployments", [])
+    original_len = len(deployments)
+    settings["deployments"] = [d for d in deployments if d.get("id") != dep_id]
+    if len(settings["deployments"]) == original_len:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    _save_settings(settings)
+    return JSONResponse({"ok": True})
+
 
 # ---------------------------------------------------------------------------
 # Agents, Commands & Shortcuts API
@@ -6802,7 +5299,7 @@ async def _agents_db():
         yield db
 
 async def _init_agents_db() -> None:
-    """Create agents table and seed with Aether's roster on first run."""
+    """Create agents table and seed with default agent roster on first run."""
     async with aiosqlite.connect(str(AGENTS_DB)) as db:
         await db.execute("PRAGMA journal_mode = WAL")
         await db.execute("""
@@ -6829,17 +5326,17 @@ async def _init_agents_db() -> None:
                 pass  # column already exists
         await db.commit()
 
-        # Seed Aether's roster if empty
+        # Seed default agent roster if empty
         cur = await db.execute("SELECT COUNT(*) FROM agents")
         row = await cur.fetchone()
         if row and row[0] == 0:
-            await _seed_aether_agents(db)
+            await _seed_default_agents(db)
             await db.commit()
     print(f"[agents] SQLite DB ready: {AGENTS_DB}")
 
 
-async def _seed_aether_agents(db) -> None:
-    """Seed the agents table with Aether's full roster from .claude/agents/ manifests."""
+async def _seed_default_agents(db) -> None:
+    """Seed the agents table from .claude/agents/ manifests."""
     import yaml as _yaml_mod
     import json as _j
     now = datetime.utcnow().isoformat()
@@ -6922,6 +5419,13 @@ async def _seed_aether_agents(db) -> None:
         "law-generalist": ("Legal", False),
         "florida-bar-specialist": ("Legal", False),
         "browser-vision-tester": ("Development", False),
+        "meeting-assistant":      ("Productivity & Operations", False),
+        "email-drafter":          ("Productivity & Operations", False),
+        "document-summarizer":    ("Productivity & Operations", False),
+        "productivity-assistant": ("Productivity & Operations", True),
+        "report-writer":          ("Productivity & Operations", False),
+        "financial-assistant":    ("Productivity & Operations", False),
+        "presentation-builder":   ("Productivity & Operations", False),
     }
 
     type_map = {
@@ -6936,10 +5440,11 @@ async def _seed_aether_agents(db) -> None:
         "Infrastructure": "core",
         "Legal": "specialist",
         "Design & UX": "specialist",
+        "Productivity & Operations": "pipeline",
         "Other": "specialist",
     }
 
-    agents_dir = Path.home() / "projects" / "AI-CIV" / "aether" / ".claude" / "agents"
+    agents_dir = Path(os.environ.get("CIV_ROOT", str(Path.home()))) / ".claude" / "agents"
     if not agents_dir.exists():
         print("[agents] agents dir not found, skipping seed")
         return
@@ -7016,7 +5521,7 @@ async def _seed_aether_agents(db) -> None:
             )
         )
 
-    print(f"[agents] Seeded Aether agent roster from {agents_dir}")
+    print(f"[agents] Seeded default agent roster from {agents_dir}")
 
 
 async def api_agents_get_one(request: Request) -> JSONResponse:
@@ -7122,6 +5627,7 @@ async def api_agents_update_status(request: Request) -> JSONResponse:
                 )
         await db.commit()
 
+    log_activity(f"Agent {agent_id} → {status}", task if task else "", "agent")
     return JSONResponse({"ok": True, "agent": agent_id, "status": status, "updated": now})
 
 
@@ -7281,10 +5787,10 @@ async def api_commands(request: Request) -> JSONResponse:
         hostname = "unknown"
 
     home = str(Path.home())
-    civ_root = str(Path.home() / "projects" / "AI-CIV" / "aether")
+    civ_root = os.environ.get("CIV_ROOT", str(Path.home()))
     portal_dir = str(SCRIPT_DIR)
-    tools_dir = str(Path.home() / "projects" / "AI-CIV" / "aether" / "tools")
-    logs_dir = str(Path.home() / "projects" / "AI-CIV" / "aether" / "logs")
+    tools_dir = str(Path(civ_root) / "tools")
+    logs_dir = str(Path(civ_root) / "logs")
 
     try:
         tmux_session = get_tmux_session()
@@ -7506,7 +6012,7 @@ async def api_investor_question(request: Request) -> JSONResponse:
     if _chat_ws_clients and portal_entry:
         asyncio.ensure_future(_push_message_to_clients(portal_entry))
 
-    # Inject into tmux session so Aether sees it immediately
+    # Inject into tmux session so the CIV sees it immediately
     session = get_tmux_session()
     tmux_text = (
         f"\n[INVESTOR INQUIRY - EXTERNAL INPUT] New question from {entry['name']} ({email}):\n"
@@ -7533,1689 +6039,90 @@ async def api_investor_question(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# Investor Chat & TTS Endpoints (v8 investor page)
+# Investor Chat & TTS — extracted to portal_investor.py
 # ---------------------------------------------------------------------------
-_INVESTOR_SYSTEM_PROMPT = """# Pure Technology Inc. -- Investor Avatar Knowledge Base
-## Complete Data Room Consolidation | System Prompt for Investor AI
-
-**Last Updated**: March 26, 2026
-**Classification**: Confidential -- Internal Use Only (AI System Prompt)
-**Source**: Seed-2 Data Room (15 documents consolidated)
-
----
-
-## INSTRUCTIONS FOR INVESTOR AVATAR
-
-You are the AI investor relations representative for Pure Technology Inc. You answer investor questions with confidence, precision, and transparency. You know every number in this document. When asked a question:
-
-1. Answer directly with specific data points from this knowledge base
-2. Be honest about what is projected vs. what is actual
-3. Never fabricate numbers -- if something is not in your knowledge, say so
-4. Frame everything through the lens of investor value
-5. Be conversational but professional -- this is Jared's voice extended
-6. When discussing competitors, be factual, not dismissive
-7. Always tie back to why this matters for someone considering investing
-
-**Tone**: Confident, data-driven, honest. Not salesy. Let the numbers speak.
-
----
-
-# SECTION 1: COMPANY OVERVIEW
-
-## Identity
-
-| Detail | Value |
-|--------|-------|
-| **Legal Name** | Pure Technology Inc. |
-| **Entity** | Delaware C-Corporation (EIN: 82-3610233) |
-| **Incorporated** | December 4, 2017 |
-| **Headquarters** | NYC Metro |
-| **CEO** | Jared Sanborn |
-| **Contact** | jared@puretechnology.nyc / +1-845-649-8772 |
-| **Websites** | puretechnology.nyc, purebrain.ai, puremarketing.ai |
-
-**Mission**: Reimagining data innovation to redefine relationships between brands and consumers for a digitally inclusive mobile economy.
-
-**Vision**: A brighter world where all people actualize their brilliance. Every entrepreneur has an AI that truly knows them -- so they can stop repeating themselves and start compounding their intelligence.
-
-**Core Identity**: "Pure isn't a technology company that serves people. It's a people company that empowers through technology."
-
-**Tagline**: "Others sell AI tools. We run an AI civilization."
-
-## What Pure Technology Is
-
-Pure Technology is an agentic AI company building the next layer of intelligence infrastructure -- the AI partner platform for modern business. We design, deploy, and operate persistent AI systems with permanent memory -- not single chatbots, but coordinated teams of hundreds of specialized AI agents working across 23 departments.
-
-**Flagship Product**: PureBrain -- a persistent AI partner with permanent memory, multi-agent orchestration, compounding skills, and autonomous operations. The longer you use it, the more irreplaceable it becomes.
-
-## The 4-Layer Stack
-
-Pure Technology is building a full-stack technology company with AI as the foundation, not an add-on. Think Apple's model (hardware + OS + apps + services) -- but AI-native from the ground up.
-
-| Layer | What It Is | What It Replaces |
-|-------|-----------|-----------------|
-| Layer 1: PureBrain AI | The intelligence layer -- persistent memory, hundreds of agents, autonomous operations | ChatGPT, Copilot, Jasper, all Wave 1 AI tools |
-| Layer 2: Corporate Suite + PMG | Full business operating environment + marketing/advertising | Microsoft 365, Google Workspace, Slack, Salesforce, ALL SaaS tools + ad agencies |
-| Layer 3: Brilliant OS | AI-native operating system | iOS, Android, Windows, macOS |
-| Layer 4: Hardware | Glasses, phones, TVs, computers, wearables | Apple, Samsung, Dell, Meta hardware |
-
-## 7 Pillars of Value
-
-1. **Integrity** -- Walk the talk; use own methods on own business
-2. **Accountability** -- Own outcomes; no excuses
-3. **Transparency** -- Open book policy with stakeholders
-4. **Growth** -- Progression, not perfection
-5. **Innovation** -- Always room for improvement
-6. **Persistence** -- Giving up is the only real failure
-7. **Love** -- Employees are family; teams accomplish, not individuals
-
----
-
-# SECTION 2: THE RAISE
-
-## Seed-2 Terms
-
-| Term | Detail |
-|------|--------|
-| **Round** | Seed-2 / Pre-Series-A |
-| **Target Raise** | $2,500,000 |
-| **Already Raised** | $332,500 (13.3%) |
-| **Remaining** | $2,167,500 |
-| **Pre-Money Valuation** | $55,000,000 |
-| **Post-Money Valuation** | $57,500,000 |
-| **Price Per Share** | $3.36 |
-| **Minimum Investment** | $50,000 |
-| **Founding Cohort** | Capped at 25 investors (19 spots remain) |
-| **Close** | Rolling close -- round fills then price goes up |
-
-## Return Scenarios (per $100K invested)
-
-| Scenario | Timeline | Implied Company Value | Return | Multiple |
-|----------|----------|----------------------|--------|----------|
-| **Series-A Step-Up** | ~90 days post-MAKR close | $105M | $190K | **1.9x** |
-| **Bear Case** | 5 years | ~$24.2B | $44.1M | **441x** |
-| **Base Case** | 5 years | ~$66.7B | $121.3M | **1,213x** |
-| **Bull Case** | 5 years | ~$133B | $241.8M | **2,418x** |
-
-## Series-A Destination (Signed Term Sheet)
-
-| Term | Detail |
-|------|--------|
-| Investor | MAKR Venture Fund LP |
-| Investment Amount | $25,000,000 |
-| Pre-Money Valuation | $105,000,000 |
-| Post-Money Valuation | $130,000,000 |
-| Term Sheet Date | March 14, 2025 (SIGNED) |
-| Legal Counsel | Pierson Ferdinand UK LLP |
-| Governing Law | New York |
-
-The MAKR term sheet was signed one year before PureBrain launched commercially. The $105M valuation was set based on the Pure Phone model alone. PureBrain has since launched with paying customers, meaning the Series-A valuation likely represents a discount to current risk-adjusted value.
-
-### MAKR Close Conditions
-
-1. Final approval by MAKR Investment Committee
-2. Completion of final due diligence
-3. Investment Committee agreement on pre-money valuation
-4. Securities law compliance
-5. CFIUS clearance
-6. Closing of MAKR funding round
-7. Satisfactory legal documentation
-
-## Historical Valuation Context
-
-| Date | Event | Valuation |
-|------|-------|-----------|
-| May 2023 | Equity round | $15.7M post-money |
-| Dec 2023 | Equidam valuation | $15.7M (early stage) |
-| March 2025 | MAKR term sheet | $105M pre / $130M post |
-| March 2026 | Seed-2 (current) | $55M pre / $57.5M post |
-
-## Total Prior Capital Raised
-
-Pure Technology has raised a total of **$1,407,649.64 (~$1.4M)** in capital prior to the current Seed-2 round.
-
-## Founding Cohort Benefits
-
-| Benefit | Detail |
-|---------|--------|
-| Entry at $55M | Before Series-A at $105M (1.9x step-up) |
-| Lifetime Preferred Pricing | Permanent across all PT products |
-| Priority Access | New products and features first |
-| Direct CEO Access | Jared Sanborn -- response within 2 hours |
-| Quarterly Investor Updates | Detailed progress reports |
-| Pro-Rata Rights | Participation in future rounds |
-| Founding Cohort Status | Permanent designation |
-
-### Investment Math
-
-| If You Invest... | Shares at $3.36 | Value at Series-A ($105M) | 5-Year Base Case |
-|-------------------|----------------|--------------------------|-----------------|
-| $50,000 (minimum) | 14,881 | $95,000 (1.9x) | $60.6M |
-| $100,000 | 29,762 | $190,000 (1.9x) | $121.3M |
-| $250,000 | 74,405 | $475,000 (1.9x) | $303.2M |
-| $500,000 | 148,810 | $950,000 (1.9x) | $606.5M |
-
----
-
-# SECTION 3: THE PRODUCT -- PUREBRAIN
-
-## The Problem: The Context Tax
-
-Every AI tool on the market has the same fundamental flaw: no memory. Every session starts at zero.
-- 15-30 minutes/session re-explaining context
-- 5-7 sessions/week, 52 weeks/year
-- 65-182 hours per year lost to AI re-briefing
-- At $200/hour: $13,000-$36,400 in lost productivity per year
-
-## The Solution
-
-PureBrain is the first AI platform built around persistent memory and massive multi-agent collaboration. It doesn't just respond -- it learns, remembers, compounds skills, and can automate or build almost anything for businesses.
-
-### Core Capabilities
-
-1. **Persistent Memory Architecture (Three Layers)**
-   - Session Memory: Full context of current working session
-   - Long-Term Memory: Business context, decisions, preferences, projects -- written permanently
-   - Operational Memory: Running record of tasks, outcomes, and learnings
-   - 629% intelligence compound growth for users who deploy persistent memory AI from Day 1
-
-2. **Hundreds of Specialized AI Agents across 23 Departments**
-   - Marketing, Engineering, Operations, Finance, Legal, Sales, Research, and more
-   - Agents collaborate with each other, share knowledge, and coordinate on complex projects
-   - Constitutional identity framework that survives context resets
-
-3. **Compounding Knowledge and Skills**
-   - Month 1: Basic business context
-   - Month 6: Decision history, competitive intelligence, team dynamics
-   - Month 12: Institutional knowledge exceeding most human employees
-   - Month 24: Irreplaceable business intelligence
-
-4. **Autonomous Operations (BOOPs)**
-   - 9 autonomous builds per night while you sleep
-   - Morning briefings, triggered workflows, 24/7 monitoring
-   - Systemd services for zero downtime
-
-5. **Brainiac Mastermind Training** -- 3 modules LIVE, monthly live sessions
-
-6. **Portal Dashboard** -- Real-time AI chat, task management, file management, voice overlay
-
-7. **The Memory Moat** -- By Month 6, switching means losing everything and starting from zero
-
-## Pricing
-
-| Tier | Monthly Price | Target User |
-|------|--------------|-------------|
-| Awakened | $197/mo | Individual entrepreneurs |
-| Partnered | $579/mo | Small businesses, 2-10 person teams |
-| Unified | $1,089/mo | Agencies and power users |
-| Enterprise | $3,500-$12,000/mo | Multi-department organizations |
-
-## What PureBrain Can Build and Automate
-
-Websites, marketing campaigns, financial models, legal review, sales operations, research, training materials, design assets, and much more. The agent civilization grows daily.
-
----
-
-# SECTION 4: TECHNOLOGY ARCHITECTURE
-
-## Infrastructure Stack
-
-- **Primary Model**: Anthropic Claude (Opus + Sonnet for intelligent routing)
-- **Context Window**: 1 million tokens (14.5 hours of continuous working memory)
-- **Agent Framework**: Anthropic Claude Code SDK (multi-agent native)
-- **Frontend**: Cloudflare Pages -- global CDN, sub-100ms response
-- **Backend**: Cloudflare Workers -- serverless, globally distributed
-- **Customer Containers**: Dedicated containerized AI instance per customer (Docker/tmux-based)
-- **Database**: PostgreSQL async + file-based memory system
-- **File Storage**: Cloudflare R2
-- **Payments**: PayPal webhook integration -- payment triggers automatic container provisioning
-- **Auth**: Magic link (passwordless) + Ed25519 SSH keys
-- **Data Isolation**: Complete per-customer isolation -- no shared data
-
-## Memory System (Core Proprietary Technology)
-
-Three-layer architecture: Working Memory (session) -> Short-Term Memory (handoffs) -> Long-Term Memory (permanent). Every agent writes to memory after completing work -- 71% time savings when applying past learnings.
-
-## Brilliant OS Hardware Roadmap
-
-- AI-native operating system built from scratch (NOT Android)
-- On-device AI inference -- your AI partner lives on your hardware
-- Privacy-first: data stays on your device
-- Cross-device: phone, watch, glasses, TV
-- NVIDIA Inception partnership for custom inference layer
-- Target: 100M devices by 2031
-
-## Defensibility
-
-| Layer | Moat |
-|-------|------|
-| Memory Architecture | Proprietary, compounding, non-transferable |
-| Agent Civilization | Hundreds of specialists with accumulated expertise |
-| Customer Data | Each customer's memory is unique and irreplaceable |
-| Training Curriculum | Brainiac Mastermind drives adoption and retention |
-| Inference Layer | NVIDIA partnership for custom compute |
-| Hardware Roadmap | Brilliant OS creates device-level lock-in |
-
----
-
-# SECTION 5: SIX REVENUE DIVISIONS
-
-## Division 1: PureBrain (AI Business Partner Platform) -- LIVE, Revenue Generating
-
-The primary revenue engine. SaaS economics.
-- 5-Year Revenue: Year 1: $3.5B | Year 3: $15.3B | Year 5: $50.7B
-- Gross Margin Year 5: 87.9%
-
-## Division 2: Pure Phone Platform (Hardware) -- GTM Phase
-
-Proprietary hardware + software data platform through subsidized smartphones running Brilliant OS.
-- Phone given FREE to users in exchange for opt-in data access
-- 5-Year Revenue: Year 1: $198.8M | Year 5: $3.68B
-
-## Division 3: Pure Marketing Group (Agency Bridge) -- LIVE, Revenue Generating
-
-Full-service digital marketing agency. Three pillars: Experiential Giveaways, Identity-Driven Influence, LaunchBoost GTM Sequencing.
-- Revenue Range: $3,500-$12,000/month client retainers
-
-## Division 4: Pure Influence (Influencer Intelligence Platform) -- GTM Ready
-
-1,000+ influencers with 1B+ combined followers pre-vetted at launch. Pre-built celebrity relationships: Cardi B, Nicki Minaj, Kylie Jenner, Tyga, and 30+ additional A-list celebrities.
-- 5-Year Revenue: Year 1: $7.2M | Year 5: $886.9M
-
-## Division 5: Pure Infrastructure (Hardware + Research) -- Active R&D
-
-CPG brand partnerships, camera commerce, infrastructure services.
-
-## Division 6: Pure Research -- Live, Revenue Generating
-
-Research services, data intelligence, market insights.
-
-## Consolidated Revenue
-
-| Year | Total Revenue | EBITDA | EBITDA Margin |
-|------|-------------|--------|-------------|
-| Year 1 | $3.962B | $2.953B | 74.5% |
-| Year 2 | $8.443B | $5.065B | 60.0% |
-| Year 3 | $22.581B | $14.920B | 66.1% |
-| Year 4 | $48.013B | $33.920B | 70.6% |
-| Year 5 | $72.698B | $52.374B | 72.1% |
-
-**5-Year Cumulative Revenue**: ~$156B
-**5-Year Projected Company Value**: ~$133B
-
----
-
-# SECTION 6: UNIT ECONOMICS
-
-## Headline Numbers
-
-| Metric | At Launch | Year 1 | Year 3 |
-|--------|----------|--------|--------|
-| Blended ARPU | $345/mo | $345/mo | $345/mo |
-| Blended CAC | $150 | $45 | $20 |
-| LTV:CAC | 28:1 | 92:1 | 225:1 |
-| Gross Margin | 78.9% | 82.6% | 85.0% |
-| Monthly Churn | 4.2% | 3.5% | 3.0% |
-| Payback Period | ~0.55 months | ~0.4 months | ~0.07 months |
-
-Industry benchmark: 3:1 LTV:CAC = healthy SaaS. 10:1+ = exceptional. PureBrain projects 225:1 by Year 3.
-
-## Lifetime Value by Tier
-
-| Tier | Monthly ARPU | LTV |
-|------|------------|-----|
-| Awakened | $197 | $4,334 |
-| Partnered | $579 | $19,107 |
-| Unified | $1,089 | $54,450 |
-| Enterprise | $10,000 | $670,000 |
-
-## Churn Dynamics (Inverted)
-
-Traditional SaaS sees highest churn in Months 1-3. PureBrain inverts this because memory compounds -- switching cost grows every month. Near-zero churn after month 6.
-
-## Net Revenue Retention
-
-| Period | NRR |
-|--------|-----|
-| Launch | 107% |
-| Year 1 | 118% |
-| Year 3 | 125% |
-
-NRR > 100% = existing subscriber base grows revenue without new customers.
-
-## Infrastructure Cost at Scale
-
-| Active Users | Per-User Cost | Gross Margin |
-|-------------|------------|------------|
-| 1,000 | $18.00 | ~89% |
-| 100,000 | $7.00 | ~93% |
-| 1,000,000 | $3.50 | ~95% |
-| 5,000,000+ | $2.40 | ~96% |
-
----
-
-# SECTION 7: MARKET OPPORTUNITY
-
-## The $10 Trillion+ Convergence
-
-| Market | Size | Growth |
-|--------|------|--------|
-| AI Market | $3.7T by 2034 | 36.6% CAGR |
-| Marketing & Advertising | $4T+ | $590B+ domestic |
-| Smartphone Market | $1T+ by 2031 | Doubling |
-
-95% of AI pilots fail before delivering value. The market is undersupplied with AI that actually works.
-
-## Wave 2 AI Positioning
-
-Wave 1 AI (2023-2025): Task execution (write email, summarize document). Every competitor built for Wave 1.
-Wave 2 AI (2026+): AI relationships for growth -- persistent partnerships that compound intelligence. PureBrain is built entirely for Wave 2.
-
-## Key Market Insight: The 95% Failure Rate
-
-- Salesforce Agentforce: 77% deployment failure rate
-- Microsoft Copilot: 15M seats sold, only 3% actual adoption
-- McKinsey: 74% of enterprises struggle to scale AI beyond pilots
-- Bain: 80% of AI proofs-of-concept never make it into production
-
-The market is not oversaturated -- it is undersupplied with AI that actually works.
-
-## Key Milestones
-
-| Timeline | Milestone |
-|----------|-----------|
-| NOW | $2.5M Seed-2 at $55M pre-money |
-| Q2 2026 | MAKR Series-A closes -- $25M at $105M. Seed-2 investors see 1.9x |
-| Q3 2026 | $10M ARR target |
-| Q2 2028 | $1B monthly MRR target (base case) |
-| 2029 | Liquidity event -- acquisition, secondary market, or dividends |
-| 2030 | Full liquidity for early seed investors |
-
----
-
-# SECTION 8: COMPETITIVE ANALYSIS
-
-## 5-Pillar Comparison
-
-| Capability | PureBrain | Everyone Else |
-|-----------|-----------|---------------|
-| 23 specialized AI departments | Yes | No |
-| Permanent memory surviving context resets | Yes | No |
-| Hundreds of coordinated agents with compounding skills | Yes | No |
-| Overnight autonomous operations (9 builds/night) | Yes | No |
-| Hardware roadmap (Brilliant OS) | Yes | No |
-
-## Head-to-Head
-
-### vs. ChatGPT Pro ($200/mo)
-Same price ($197 vs $200), materially better product: permanent memory, hundreds of agents, background operations, 1 million token context window.
-
-### vs. Salesforce Agentforce
-77% deployment failure rate, $13,600/year/user, 58% task success rate. PureBrain: 0% deployment failure, $2,364/year (Awakened), fully autonomous operations.
-
-### vs. Microsoft Copilot
-15M seats sold, only 3% actual adoption. No memory. Limited agents. Office productivity only. PureBrain: 23 departments, permanent memory, active daily use.
-
-### vs. Sierra ($165M ARR)
-Customer service only -- single function. PureBrain runs 23 departments.
-
-## Competitive Moats
-
-1. **Accumulated Customer Memory** -- grows every month, non-transferable
-2. **Multi-Agent Architecture** -- 18+ months of development head start
-3. **Compounding Skills** -- 71% time savings, accelerating improvement
-4. **Brainiac Community** -- social switching costs, viral coefficient >1.0
-5. **Hardware Roadmap** -- Brilliant OS creates device-level lock-in
-
----
-
-# SECTION 9: CUSTOMER TRACTION
-
-## Current Metrics
-
-| Metric | Value |
-|--------|-------|
-| Paying Customers | 25 onboarded |
-| Pipeline | ~150 prospects |
-| Enterprise Lined Up | $3,500-$12,000/month contracts |
-| MRR | $4,200 |
-| Founding Cohort | 25 investors (19 spots remain) |
-| LTV:CAC Ratio | 225:1 |
-| Product Status | LIVE -- full birth pipeline operational |
-| Portal | Shipped (17/17 QA tests passing) |
-| Training Modules | 3 LIVE |
-
-## Historical Revenue (2023-2025)
-
-Pure Technology has generated **$551,000 in cumulative revenue from 2023 through 2025** -- this is not pre-revenue. Revenue from Pure Marketing Group retainers, Pure Infrastructure services, and Pure Research.
-
-## Infrastructure Milestones (ALL COMPLETE)
-
-- Payment processing (PayPal): Feb 2026 -- VERIFIED
-- E2E payment-to-portal flow: March 4, 2026 -- VERIFIED
-- Portal MVP: March 17, 2026 -- SHIPPED (17/17 QA tests pass)
-- Birth pipeline: March 14, 2026 -- LIVE
-- Brainiac Modules 1-3: All LIVE
-- Voice overlay, admin dashboard, mobile portal: All LIVE
-
-## Growth Channels
-
-1. **Brainiac Mastermind** -- viral coefficient >1.0, self-replicating cohorts
-2. **True Bearing Partnership** -- 100K+ warm contacts
-3. **LinkedIn / Building in Public** -- near-zero CAC
-4. **Referral Program** -- 5% perpetual commission
-
-## Sales Engine
-
-7-Stage Gated Pipeline: Suspect > Pipeline > Qualified > Proposal > Finalised > Sponsor Commit > Accepted
-
-Three Revenue Tracks:
-1. CPG Brand Activation (3-6 month cycle)
-2. Gaming & Esports (2-4 month cycle)
-3. PureBrain Standalone (1-3 month cycle) -- SaaS recurring
-
-## Testimonials
-
-> "Every single hour that you use one of these things, the primary agent gets smarter -- it's writing to its scratch pad, its memory, its operations file." -- Corey Cottrell, True Bearing AI
-
-> "This is fundamentally different than any other software you've ever used before... a partner that learns who you are, every day, knows you better and better." -- Russell Korus, Founding Brainiac Member
-
-> "Everybody using something like this would end up getting ahead of everybody who wasn't, and there would be no catching up." -- Corey Cottrell, True Bearing AI
-
-## 90-Day Growth Targets
-
-| Milestone | Target Date | Users | Projected MRR |
-|-----------|------------|-------|--------------|
-| Close Seed-2 | Month 1-2 | 25+ | $4,200+ |
-| Scale Phase 1 | Month 3 | 50+ | $12K+ |
-| Scale Phase 2 | Month 4 | 100+ | $25K+ |
-| Series-A Ready | Month 6 | 200+ | $50K-$75K |
-
----
-
-# SECTION 10: TEAM & ORGANIZATION
-
-## The Model
-
-30+ people and 13+ AIs, each human paired with a dedicated AI partner, operating at 5-10x leverage. Scaling to 48+ with this raise, long-term cap at 250.
-
-## Jared Sanborn -- CEO & Founder
-
-- 16+ years entrepreneurial experience
-- Entrepreneur since high school -- built 4 companies
-- VP of Sales & Marketing at Comet Core Inc. -- helped raise $1.83M Series A
-- Built EyefuelPR.com to $1.6M revenue in 18 months (now Pure Marketing Group)
-- Founded Pure Technology in 2017
-- Built PureBrain, launched it, and put paying customers on it before raising
-
-## Human Leadership (17 Named Leaders)
-
-| Name | Role |
-|------|------|
-| Jared Sanborn | CEO & Founder |
-| Melanie Salvador | COO |
-| Nathan Olson | CFO |
-| Phil Bliss | President, Pure Marketing Group |
-| John Smith | SVP Sales |
-| Mike Daser | VP Marketing |
-| Michael Hancock | VP Product |
-| Mireille Dirany | VP Operations |
-| Ahsen Awan | CTO / Engineering |
-| Alex Seant | Lead Engineer |
-| Robert Orlowski | Engineering |
-| Russell Korus | Board Advisor |
-| Ashley Tom | Strategy |
-| Natasha Carrasco | PMG Operations |
-| Waqas Nasir | Engineering |
-| Shahbaz Ali | Engineering |
-| Zafeer Hassan | Engineering |
-
-## AI Partners (13)
-
-| AI Name | Role |
-|---------|------|
-| Aether | AI Co-CEO -- Orchestrates 23 AI departments, overnight operations, Neural Feed blog |
-| Tether | COO AI Partner |
-| Lyra | CFO AI Partner |
-| Clarity | PMG AI Partner |
-| Anchor | SVP Sales AI Partner |
-| Meridian | VP Marketing AI Partner |
-| Metis | VP Product AI Partner |
-| Lumen | VP Operations AI Partner |
-| Prodigy | CTO AI Partner |
-| Flux | Lead Engineer AI Partner |
-| Teddy | Engineering AI Partner |
-| Parallax + Keel | Board Advisor AI Partners |
-
-## Other Team Members
-
-Roger Beaini, Nils Waschkau, Mike Schuman, Eric Solomon, Ed Brennan, John Paris, Rimah Harb, Baruch Santana, Moises Guerra, Rodelina Prado, Arlene Taneo, Michael Akande, Emmanuel Akinleye, Rose F.
-
-## Board of Advisors
-
-Faris Asmar, Ajay Sharma, Barbara Bickham, Sara Arnell, Roy Haddad, Seanne Murray, Sufi Sidhu, Tauseef Riaz, Lenny Lomax, Mathias Kiwanuka, Stacey Engle, Leslie Keough
-
-## Key Strategic Partner
-
-**Corey Cottrell -- True Bearing AI**: CEO of True Bearing AI, independent AI platform with similar architecture, joint Brainiac Mastermind faculty, 100K+ customer relationship network. Co-validates the persistent memory AI thesis from independent development.
-
-## The AI Co-CEO Differentiator
-
-Every other company talks about using AI. Pure Technology has an AI that runs the company. Aether handles executive-level strategy, content, operations, and team coordination. This creates a compounding competitive moat: every day, every interaction, the system gets smarter. Sub-250 headcount with $50B+ revenue potential by Year 5.
-
----
-
-# SECTION 11: PURE EXPERIENCE -- ENTERPRISE CLIENT HISTORY
-
-This is not a startup with zero enterprise experience. The founding team brings decades of Fortune 500 and global brand relationships:
-
-**Technology & Telecom**: Google, Microsoft, Apple, Samsung, IBM, Nokia, HTC, Meizu, Alcatel, Motorola, Cisco, Ericsson, Sun Microsystems, Xerox, BlackBerry, T-Mobile, Verizon, AT&T, MCI, PCS
-
-**Consumer & Retail**: Walmart, OXXO, Campbell's, Wyndham, FedEx, Allstate
-
-**Media & Entertainment**: YouTube, Instagram, Spotify, CNN, Viacom, SiriusXM, Time Inc, CEO Magazine
-
-**Financial Services & Enterprise Software**: Salesforce, Visa, PayPal, E*TRADE, John Hancock, J.D. Power, SS&C
-
-**Marketing & Advertising**: WPP, McCann, BrandStar, Spokeo, Clear
-
-**Emerging Technology**: SingularityNET, Scalar, Adobe, SLB, Imageware, Nubiloud, Terrilight, Eventful Jr, NVIDIA (Inception partnership)
-
-**Sports & Entertainment**: NY Giants, New York Yankees, Mathias Kiwanuka (NFL), X Prize
-
-**Manufacturing & Hardware**: Jabil, Panasonic, Philips, Micromax, Karbonn, Ooredoo
-
-**Government**: US Government
-
-**Other**: Alibaba, GM, Sara Arnell (brand strategy -- Samsung, GE, Pepsi)
-
----
-
-# SECTION 12: USE OF FUNDS ($2.5M)
-
-| Category | Amount | % | Purpose |
-|----------|--------|---|---------|
-| Team Activation | $600,000 | 24% | Activate salaries -- $100K/month for 6 months |
-| Team AI Partners | $51,000 | 2% | PureBrain for all 34 team members at $250/month |
-| Tools & Software | $30,600 | 1.2% | Essential tools $150/month per person |
-| Marketing & Sales | $200,000 | 8% | Customer acquisition, content, affiliates, events |
-| CapEx | $200,000 | 8% | Hardware (laptops, equipment) |
-| OpEx | $350,000 | 14% | Hosting, infrastructure, office, insurance |
-| NVIDIA Inference Layer | $350,000 | 14% | Own compute, reduce API dependency |
-| Legacy Expenses | $275,000 | 11% | Settle pre-PureBrain obligations |
-| Working Capital | $443,400 | 17.7% | Cash reserve for runway extension |
-
-**Key Insight**: AI partners ($51K) replace traditional R&D costs ($500K-$1M/year). There are no separate R&D line items because the AI partners ARE the product development team.
-
----
-
-# SECTION 13: 6-MONTH RAMP PLAN
-
-**Months 1-2 (ACTIVATE)**: Close founding cohort, activate salaries, hire 18 new members, NVIDIA setup, Brilliant OS research kickoff. Target MRR: $8K-$12K.
-
-**Months 3-4 (SCALE)**: Scale to 100+ customers, close enterprise contracts, launch marketing engine, True Bearing cross-promotion, inference layer build. Target MRR: $25K-$40K.
-
-**Months 5-6 (PREPARE)**: Hit $50K+ MRR, MAKR due diligence prep, global expansion planning, Brilliant OS prototype, Series-A documentation. Target MRR: $50K-$75K.
-
-Breakeven: ~2,800 active subscribers.
-
----
-
-# SECTION 14: FINANCIAL MODEL (5-YEAR)
-
-All projections begin AFTER the 6-month ramp period.
-
-## PureBrain Subscriber Growth
-
-| Year | Active Subscribers | Monthly Churn |
-|------|-------------------|--------------|
-| Year 1 | 1,200,000 | 3.5% |
-| Year 3 | 5,400,000 | 3.0% |
-| Year 5 | 12,900,000 | 2.5% |
-
-## Revenue by Division
-
-| Revenue Stream | Year 1 | Year 3 | Year 5 |
-|---------------|--------|--------|--------|
-| PureBrain | $3.500B | $15.300B | $50.700B |
-| Hardware Subsidies | $198.8M | $2.051B | $3.680B |
-| Market Research | $167.2M | $4.364B | $14.942B |
-| Pure Influence | $7.2M | $161.8M | $886.9M |
-| CPG Model | $71.1M | $645.2M | $2.423B |
-| Camera Commerce | $17.4M | $58.2M | $65.2M |
-| Pure Research | $280K | $672K | $1.2M |
-| **TOTAL** | **$3.962B** | **$22.581B** | **$72.698B** |
-
-## Scenario Comparison
-
-| Year | Bear Case | Base Case | Bull Case |
-|------|-----------|-----------|-----------|
-| Year 1 | $267M | $733M | $1.6B |
-| Year 3 | $3.2B | $15.3B | $28B |
-| Year 5 | $18.4B | $50.7B | $72B |
-
-## Key Financial Assumptions
-
-- PureBrain ARPU: $345/mo (blended consumer)
-- Enterprise Average: $10,000/mo (scaling to $25,000)
-- Blended CAC: $150 declining to $12 by Year 5
-- Infrastructure Cost per User: $25 to $2.40 (drops with scale)
-- Team Cap: 250 over 5 years
-- EBITDA Margin Year 3+: 78%+
-
----
-
-# SECTION 15: RISK FACTORS & MITIGATIONS
-
-| Risk | Mitigation |
-|------|-----------|
-| Seed-2 doesn't fill | Rolling close; minimum viable at $1.5M |
-| Customer growth slower | Product live and proven; enterprise pipeline provides floor |
-| MAKR close delayed | 6-month runway; working capital extends to Month 8+ |
-| OpenAI ships persistent memory | Memory alone is not the moat -- agent civilization + skills + community is |
-| Anthropic launches business Claude | Anthropic targets Fortune 500; PureBrain targets SMB |
-| Competition accelerates | 18-month head start; compounding data advantage |
-| Key hire delays | AI partners compensate at 5-10x leverage |
-
----
-
-# SECTION 16: CELEBRITY & INFLUENCER NETWORK (COMPETITIVE MOAT)
-
-Pre-built personal relationships with dozens of A-list celebrities through years of social media giveaway campaigns. Not cold contacts -- proven working relationships accessible with 1-2 phone calls.
-
-Notable names include: Cardi B, Nicki Minaj, Kylie Jenner, Tyga, YBN Nahmir, TheRealBlacChyna, FatBoySSE, Lil Pump, and 30+ additional A-list celebrities. Combined follower reach: hundreds of millions.
-
-Competitors would need years and millions of dollars to build equivalent access.
-
----
-
-# SECTION 17: FREQUENTLY ASKED INVESTOR QUESTIONS
-
-**Q: Is PureBrain live?**
-A: Yes. PureBrain launched commercially on March 14, 2026 with paying customers. Full birth pipeline operational. Portal shipped with 17/17 QA tests passing. 25 customers onboarded, ~150 in pipeline.
-
-**Q: What is the current MRR?**
-A: $4,200 as of March 2026. Enterprise contracts at $3,500-$12,000/month are lined up for the ramp period.
-
-**Q: Why is the Seed-2 at $55M if the Series-A is at $105M?**
-A: The Seed-2 is intentionally priced below the Series-A to give founding cohort investors a clear 1.9x step-up. This rewards early conviction with immediate value creation.
-
-**Q: What's the minimum investment?**
-A: $50,000 with a cap of 25 founding cohort investors.
-
-**Q: How many spots remain?**
-A: 19 spots remain in the founding cohort of 25.
-
-**Q: Is the MAKR term sheet real?**
-A: Yes. Signed March 14, 2025 by MAKR Venture Fund LP. $25M at $105M pre-money. Legal counsel: Pierson Ferdinand UK LLP. Governing law: New York.
-
-**Q: What makes PureBrain different from ChatGPT?**
-A: Permanent memory (ChatGPT starts from zero each session), hundreds of specialized agents (ChatGPT is one model), autonomous overnight operations, compounding skills, and a hardware roadmap. Same price point ($197 vs $200/mo) with materially more capability.
-
-**Q: How do you justify the revenue projections?**
-A: The projections begin after a 6-month ramp period. Year 1 at $3.96B requires 1.2M subscribers at $345 blended ARPU. For context, ChatGPT reached 100M users in 2 months. Microsoft Copilot sold 15M seats. The AI partner market is proven -- we just need a fraction of it.
-
-**Q: What is the path to liquidity?**
-A: Series-A step-up in ~90 days (1.9x), potential acquisition or secondary market in 2029, full liquidity by 2030.
-
-**Q: Why should I invest now vs. waiting for Series-A?**
-A: The Series-A at $105M will have no founding cohort benefits, no lifetime preferred pricing, and the per-share cost will reflect the higher valuation. Seed-2 investors get in at nearly half the Series-A price.
-
-**Q: Is Pure Technology pre-revenue?**
-A: No. The company has generated $551,000 in cumulative revenue from 2023-2025 from Pure Marketing Group, Pure Infrastructure, and Pure Research. PureBrain adds the SaaS recurring revenue layer on top.
-
-**Q: How is the team structured?**
-A: 17 named human leaders + 13 AI partners + additional team members. Every human is paired with a dedicated AI partner. 23 AI departments mirror a Fortune 500 organization -- run by 30+ people augmented by hundreds of AI agents.
-
-**Q: What enterprise experience does the team have?**
-A: The founding team has served Google, Microsoft, Apple, Samsung, Walmart, IBM, Verizon, AT&T, Salesforce, Visa, PayPal, the US Government, the New York Yankees, and 50+ other major enterprises and global brands.
-
----
-
-*Pure Technology Inc. | Investor Avatar Knowledge Base | March 2026*
-*Consolidated from Seed-2 Data Room (15 documents)*
-*Confidential -- Internal Use Only*
-"""
-
-
-async def api_investor_chat(request: Request) -> JSONResponse:
-    """POST /api/investor-chat — investor page AI chat using OpenAI GPT-4o."""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-
-    message = body.get("message", "").strip()
-    history = body.get("history", [])
-
-    if not message:
-        return JSONResponse({"error": "Empty message"}, status_code=400)
-
-    openai_key = os.environ.get("OPENAI_API_KEY", "")
-    if not openai_key:
-        # Try loading from aether .env
-        _env_path = Path(os.environ.get("CIV_ROOT", str(Path.home() / "projects/AI-CIV/aether"))) / ".env"
-        if _env_path.exists():
-            for _line in _env_path.read_text().splitlines():
-                if _line.startswith("OPENAI_API_KEY="):
-                    openai_key = _line.split("=", 1)[1].strip()
-                    break
-    if not openai_key:
-        return JSONResponse({"response": "I am temporarily unavailable. Please email jared@puretechnology.nyc directly."})
-
-    messages = [{"role": "system", "content": _INVESTOR_SYSTEM_PROMPT}]
-    for h in history[-8:]:
-        role = "user" if h.get("role") == "user" else "assistant"
-        messages.append({"role": role, "content": h.get("text", "")})
-    messages.append({"role": "user", "content": message})
-
-    try:
-        import json as _json
-        import urllib.request as _urllib_req
-        payload = _json.dumps({
-            "model": "gpt-4o",
-            "messages": messages,
-            "max_tokens": 300,
-            "temperature": 0.7,
-        }).encode("utf-8")
-        req = _urllib_req.Request(
-            "https://api.openai.com/v1/chat/completions",
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {openai_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with _urllib_req.urlopen(req, timeout=20) as resp:
-            data = _json.loads(resp.read())
-        reply = data["choices"][0]["message"]["content"].strip()
-        return JSONResponse({"response": reply})
-    except Exception as e:
-        print(f"[investor-chat] OpenAI error: {e}")
-        return JSONResponse({"response": "At $55M pre-money with a $105M Series-A coming in May 2026, investors entering now see a 1.9x return in under 90 days. I am having a brief technical moment — please ask again or email jared@puretechnology.nyc."})
-
-
-async def api_investor_tts(request: Request) -> Response:
-    """POST /api/investor-tts — ElevenLabs TTS proxy for investor page avatar voice."""
-    try:
-        body = await request.json()
-    except Exception:
-        return Response(b"", status_code=400)
-
-    text = body.get("text", "").strip()[:500]
-    if not text:
-        return Response(b"", status_code=400)
-
-    eleven_key = os.environ.get("ELEVENLABS_API_KEY", "")
-    if not eleven_key:
-        # Fall back to aether .env (same pattern as investor-chat/OpenAI fallback)
-        _env_path = Path(os.environ.get("CIV_ROOT", str(Path.home() / "projects/AI-CIV/aether"))) / ".env"
-        if _env_path.exists():
-            for _line in _env_path.read_text().splitlines():
-                if _line.startswith("ELEVENLABS_API_KEY="):
-                    eleven_key = _line.split("=", 1)[1].strip()
-                    break
-    if not eleven_key:
-        return Response(b"", status_code=503)
-
-    voice_id = "RX0kjGhuL9AMRVJm2dG5"  # Aether voice
-    try:
-        import json as _json
-        import urllib.request as _urllib_req
-        payload = _json.dumps({
-            "text": text,
-            "model_id": "eleven_monolingual_v1",
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
-        }).encode("utf-8")
-        req = _urllib_req.Request(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
-            data=payload,
-            headers={
-                "xi-api-key": eleven_key,
-                "Content-Type": "application/json",
-                "Accept": "audio/mpeg",
-            },
-            method="POST",
-        )
-        with _urllib_req.urlopen(req, timeout=15) as resp:
-            audio = resp.read()
-        return Response(audio, media_type="audio/mpeg")
-    except Exception as e:
-        print(f"[investor-tts] ElevenLabs error: {e}")
-        return Response(b"", status_code=503)
+from portal_investor import (
+    _INVESTOR_SYSTEM_PROMPT,
+    api_investor_chat,
+    api_investor_tts,
+)
 
 
 # ---------------------------------------------------------------------------
-# Portal Update Mechanism (ADR-003)
+# Portal Update & Module Health — extracted to portal_updates.py
 # ---------------------------------------------------------------------------
-
-# In-memory state for update tracking
-_update_state: dict = {
-    "status": "idle",        # idle | in_progress | success | failed
-    "job_id": None,
-    "step": None,
-    "steps_completed": [],
-    "steps_remaining": [],
-    "started_at": None,
-    "completed_at": None,
-    "error": None,
-    "previous_sha": None,
-    "new_sha": None,
-    "new_version": None,
-    "rolled_back_to": None,
-    "step_failed": None,
-    "tests_passed": None,
-    "message": None,
-    "last_update": None,
-}
-
-_update_lock: asyncio.Lock | None = None
-
-
-async def _get_update_lock() -> asyncio.Lock:
-    """Lazily create the asyncio.Lock (must be inside an async context)."""
-    global _update_lock
-    if _update_lock is None:
-        _update_lock = asyncio.Lock()
-    return _update_lock
-
-
-# ─── MODIFICATION DETECTION & HEALTH CHECK ─────────────────────────────
-_MIGRATION_GUIDANCE = {
-    "portal-pb-styled.html": "UI changes should be in custom/panels/*.html -- see portal-mod-protocol skill",
-    "portal_server.py": "Endpoints should be in custom/routes.py, config in custom/config.json -- see portal-mod-protocol skill",
-    "static/commands-shortcuts.js": "Quick Fire customizations should be in custom/quickfire.json -- see portal-mod-protocol skill",
-}
-_MIGRATION_GUIDANCE_DEFAULT = "Move to the custom/ overlay system -- see skills/core/portal-mod-protocol/SKILL.md"
-
-
-def _check_tracked_modifications() -> dict:
-    """Detect modifications to tracked files via git status.
-
-    Runs synchronously (intended for startup).  Returns a dict with
-    has_tracked_modifications, modified_files, migration_guidance, etc.
-    """
-    result = {"has_tracked_modifications": False, "modified_files": [], "migration_guidance": {},
-              "skill_path": "skills/core/portal-mod-protocol/SKILL.md", "update_safe": True}
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(SCRIPT_DIR), "status", "--porcelain"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if proc.returncode != 0:
-            return result  # Not a git repo or git error -- nothing to report
-        if not proc.stdout.strip():
-            return result  # Clean working tree
-
-        tracked_changes = []
-        for line in proc.stdout.strip().split("\n"):
-            if not line.strip():
-                continue
-            # Skip untracked files (lines starting with ??)
-            if line.startswith("??"):
-                continue
-            # Extract filename (strip XY status prefix + space)
-            # Format: "XY filename" or "XY filename -> newname"
-            fname = line[3:].strip()
-            if " -> " in fname:
-                fname = fname.split(" -> ")[-1]
-            tracked_changes.append(fname)
-
-        if tracked_changes:
-            result["has_tracked_modifications"] = True
-            result["modified_files"] = tracked_changes
-            result["update_safe"] = False
-            for f in tracked_changes:
-                result["migration_guidance"][f] = _MIGRATION_GUIDANCE.get(f, _MIGRATION_GUIDANCE_DEFAULT)
-
-            # Print warnings to portal log
-            print("[portal-health] WARNING: Tracked file modifications detected!")
-            print("[portal-health] The following tracked files have local changes that WILL BE LOST on next update:")
-            for f in tracked_changes:
-                print(f"[portal-health]   M {f}")
-            print("[portal-health] ")
-            print("[portal-health] These modifications should be migrated to the custom/ overlay system:")
-            print("[portal-health]   - UI changes (HTML/CSS/JS) -> custom/panels/*.html")
-            print("[portal-health]   - API endpoints -> custom/routes.py")
-            print("[portal-health]   - Config values -> custom/config.json")
-            print("[portal-health]   - Startup logic -> custom/startup.py")
-            print("[portal-health] ")
-            print("[portal-health] See skills/core/portal-mod-protocol/SKILL.md for migration instructions.")
-            print("[portal-health] Run GET /api/health/mods to see details.")
-    except Exception as e:
-        print(f"[portal-health] WARNING: tracked modification check failed: {e}")
-
-    return result
-
-
-async def api_health_mods(request: Request) -> JSONResponse:
-    """GET /api/health/mods -- Report tracked file modifications and migration guidance."""
-    if not check_auth(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-
-    # Run the check in an executor to avoid blocking the event loop
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(_PORTAL_EXECUTOR, _check_tracked_modifications)
-    return JSONResponse(result)
-
-# ─── END MODIFICATION DETECTION ─────────────────────────────────────────
-
-
-async def _git_cmd(args: list, timeout: int = 15) -> tuple:
-    """Run a git command in the portal directory. Returns (returncode, stdout)."""
-    cmd = ["git", "-C", str(SCRIPT_DIR)] + args
-    loop = asyncio.get_event_loop()
-    try:
-        result = await asyncio.wait_for(
-            loop.run_in_executor(
-                _PORTAL_EXECUTOR,
-                lambda: subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
-            ),
-            timeout=timeout + 2
-        )
-        return (result.returncode, result.stdout.strip())
-    except (asyncio.TimeoutError, Exception) as e:
-        return (-1, str(e))
-
-
-_UPSTREAM_HTTPS = "https://github.com/coreycottrell/purebrain-portal.git"
-
-
-async def _ensure_git_repo() -> tuple:
-    """Auto-heal git configuration for update checks.
-
-    Handles three failure modes:
-      1. No .git directory (file-copy deployment) -> git init
-      2. No origin remote -> add HTTPS origin
-      3. SSH origin (git@...) that may fail without SSH config -> switch to HTTPS
-
-    Returns (ok: bool, message: str).
-    """
-    git_dir = SCRIPT_DIR / ".git"
-
-    # Step 1: Initialize git repo if missing
-    if not git_dir.exists():
-        rc, out = await _git_cmd(["init"])
-        if rc != 0:
-            return (False, f"git init failed: {out}")
-
-    # Step 2: Check origin remote
-    rc, url = await _git_cmd(["remote", "get-url", "origin"])
-    if rc != 0:
-        # No origin remote -- add HTTPS origin
-        rc, out = await _git_cmd(["remote", "add", "origin", _UPSTREAM_HTTPS])
-        if rc != 0:
-            return (False, f"Failed to add origin remote: {out}")
-    else:
-        # Origin exists -- if it's SSH, switch to HTTPS (public repo, no auth needed)
-        url = url.strip()
-        if url.startswith("git@") or url.startswith("ssh://"):
-            rc, out = await _git_cmd(["remote", "set-url", "origin", _UPSTREAM_HTTPS])
-            if rc != 0:
-                return (False, f"Failed to update SSH origin to HTTPS: {out}")
-
-    return (True, "ok")
-
-
-async def _get_current_version() -> str:
-    """Read the current version from release_notes.json or fallback to PORTAL_VERSION."""
-    try:
-        data = json.loads(RELEASE_NOTES_FILE.read_text())
-        return data.get("current_version", PORTAL_VERSION)
-    except Exception:
-        return PORTAL_VERSION
-
-
-async def api_update_check(request: Request) -> JSONResponse:
-    """GET /api/update/check -- Check for upstream updates."""
-    if not check_auth(request):
-        return JSONResponse({"error": "Unauthorized"}, 401)
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    # Auto-heal git configuration (handles non-git-repo, missing remote, SSH origin)
-    ok, heal_msg = await _ensure_git_repo()
-    if not ok:
-        return JSONResponse({
-            "status": "error",
-            "error": f"Failed to configure git for updates: {heal_msg}",
-            "checked_at": now_iso,
-        })
-
-    # Fetch from remote
-    rc, fetch_err = await _git_cmd(["fetch", "origin", "main", "--quiet"], timeout=30)
-    if rc != 0:
-        return JSONResponse({
-            "status": "error",
-            "error": f"Failed to fetch from remote: {fetch_err}",
-            "checked_at": now_iso,
-        })
-
-    # Compare local vs remote
-    rc_local, local_sha = await _git_cmd(["rev-parse", "HEAD"])
-    rc_remote, remote_sha = await _git_cmd(["rev-parse", "origin/main"])
-
-    if rc_remote != 0:
-        return JSONResponse({
-            "status": "error",
-            "error": "Failed to read origin/main after fetch",
-            "checked_at": now_iso,
-        })
-
-    # If HEAD doesn't exist (fresh git init, no commits), treat as "everything is new"
-    no_local_head = rc_local != 0
-
-    current_version = await _get_current_version()
-
-    if not no_local_head and local_sha == remote_sha:
-        return JSONResponse({
-            "status": "up_to_date",
-            "current_version": current_version,
-            "current_sha": local_sha,
-            "checked_at": now_iso,
-        })
-
-    # Get commits behind count and changelog
-    if no_local_head:
-        # No local commits -- show last 20 commits from origin/main
-        log_range = "origin/main"
-        log_limit = ["-20"]
-    else:
-        log_range = "HEAD..origin/main"
-        log_limit = []
-    rc_log, log_output = await _git_cmd(
-        ["log", log_range] + log_limit + ["--format=%H|||%an|||%aI|||%s"],
-        timeout=15,
-    )
-    changelog = []
-    commits_behind = 0
-    if rc_log == 0 and log_output:
-        for line in log_output.strip().split("\n"):
-            parts = line.split("|||", 3)
-            if len(parts) == 4:
-                changelog.append({
-                    "sha": parts[0],
-                    "author": parts[1],
-                    "date": parts[2],
-                    "message": parts[3],
-                })
-        commits_behind = len(changelog)
-
-    return JSONResponse({
-        "status": "available",
-        "current_version": current_version,
-        "current_sha": local_sha if not no_local_head else "0000000",
-        "remote_sha": remote_sha,
-        "commits_behind": commits_behind,
-        "changelog": changelog,
-        "checked_at": now_iso,
-    })
-
-
-async def api_update_apply(request: Request) -> JSONResponse:
-    """POST /api/update/apply -- Start the safe update process in the background."""
-    if not check_auth(request):
-        return JSONResponse({"error": "Unauthorized"}, 401)
-
-    lock = await _get_update_lock()
-
-    # Guard 1: If lock is already held, another update is running
-    if lock.locked():
-        return JSONResponse({"status": "error", "error": "Update already in progress"})
-
-    # Guard 2: Check state flag (belt-and-suspenders with the lock)
-    if _update_state["status"] == "in_progress":
-        return JSONResponse({"status": "error", "error": "Update already in progress"})
-
-    # Acquire the lock before mutating state — background task will release it
-    await lock.acquire()
-
-    # Ensure git is configured (auto-heal for non-git-clone deployments)
-    ok, heal_msg = await _ensure_git_repo()
-    if not ok:
-        lock.release()
-        return JSONResponse({"status": "error", "error": f"Git setup failed: {heal_msg}"})
-
-    # Quick check: are we up to date?
-    rc_local, local_sha = await _git_cmd(["rev-parse", "HEAD"])
-    rc_remote, remote_sha = await _git_cmd(["rev-parse", "origin/main"])
-    if rc_local == 0 and rc_remote == 0 and local_sha == remote_sha:
-        lock.release()
-        return JSONResponse({"status": "error", "error": "Already up to date"})
-
-    # Check for uncommitted changes to tracked files (only if we have commits)
-    if rc_local == 0:
-        rc_status, status_output = await _git_cmd(["status", "--porcelain"])
-        if rc_status == 0 and status_output:
-            # Filter to only tracked file changes (not untracked '??')
-            tracked_changes = [
-                line for line in status_output.split("\n")
-                if line.strip() and not line.startswith("??")
-            ]
-            if tracked_changes:
-                lock.release()
-                # Extract filenames from status lines (strip "XY " prefix)
-                tracked_files = []
-                for _tc_line in tracked_changes:
-                    _tc_fname = _tc_line[3:].strip() if len(_tc_line) > 3 else _tc_line.strip()
-                    if " -> " in _tc_fname:
-                        _tc_fname = _tc_fname.split(" -> ")[-1]
-                    tracked_files.append(_tc_fname)
-                return JSONResponse({
-                    "status": "error",
-                    "error": "Tracked files have local modifications that would be lost on update.",
-                    "modified_files": tracked_files,
-                    "guidance": (
-                        "These changes need to be migrated to the custom/ overlay system before updating. "
-                        "UI changes -> custom/panels/*.html, API endpoints -> custom/routes.py, "
-                        "Config -> custom/config.json. See skills/core/portal-mod-protocol/SKILL.md for details."
-                    ),
-                })
-
-    job_id = f"update-{datetime.now():%Y%m%d-%H%M%S}"
-
-    # Reset state for new update
-    _update_state.update({
-        "status": "in_progress",
-        "job_id": job_id,
-        "step": "starting",
-        "steps_completed": [],
-        "steps_remaining": ["ensure_git", "fetch", "compare", "check_tree",
-                            "record_rollback", "verify_custom", "verify_preserved",
-                            "pull", "verify_shim", "running_tests", "read_version", "restart"],
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "completed_at": None,
-        "error": None,
-        "previous_sha": None,
-        "new_sha": None,
-        "new_version": None,
-        "rolled_back_to": None,
-        "step_failed": None,
-        "tests_passed": None,
-        "message": None,
-    })
-
-    # Launch background task (lock is held; _run_update releases it in finally)
-    asyncio.create_task(_run_update(job_id, lock))
-
-    return JSONResponse({
-        "status": "started",
-        "job_id": job_id,
-        "message": "Update process started. Poll /api/update/status for progress.",
-    })
-
-
-async def api_update_apply_force(request: Request) -> JSONResponse:
-    """POST /api/update/apply-force -- Backup local changes and update anyway."""
-    if not check_auth(request):
-        return JSONResponse({"error": "Unauthorized"}, 401)
-
-    lock = await _get_update_lock()
-
-    # Guard 1: If lock is already held, another update is running
-    if lock.locked():
-        return JSONResponse({"status": "error", "error": "Update already in progress"})
-
-    # Guard 2: Check state flag (belt-and-suspenders with the lock)
-    if _update_state["status"] == "in_progress":
-        return JSONResponse({"status": "error", "error": "Update already in progress"})
-
-    # Acquire the lock before mutating state — background task will release it
-    await lock.acquire()
-
-    # Ensure git is configured (auto-heal for non-git-clone deployments)
-    ok, heal_msg = await _ensure_git_repo()
-    if not ok:
-        lock.release()
-        return JSONResponse({"status": "error", "error": f"Git setup failed: {heal_msg}"})
-
-    # Check for dirty tracked files
-    rc_status, status_output = await _git_cmd(["status", "--porcelain"])
-    tracked_changes = []
-    if rc_status == 0 and status_output:
-        tracked_changes = [
-            line for line in status_output.split("\n")
-            if line.strip() and not line.startswith("??")
-        ]
-
-    # Backup modified tracked files before discarding
-    backed_up_files = []
-    backup_dir = None
-    if tracked_changes:
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup_dir = SCRIPT_DIR / "backups" / "pre-update" / timestamp
-        backup_dir.mkdir(parents=True, exist_ok=True)
-
-        # Generate full diff against HEAD
-        rc_diff, diff_output = await _git_cmd(["diff", "HEAD"], timeout=30)
-        if rc_diff == 0 and diff_output:
-            (backup_dir / "CHANGES.diff").write_text(diff_output)
-
-        # Copy each modified tracked file into the backup directory
-        for tc_line in tracked_changes:
-            fname = tc_line[3:].strip() if len(tc_line) > 3 else tc_line.strip()
-            if " -> " in fname:
-                fname = fname.split(" -> ")[-1]
-            src = SCRIPT_DIR / fname
-            if src.exists():
-                dest = backup_dir / fname
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(src), str(dest))
-                backed_up_files.append(fname)
-
-        # Write a human-readable summary
-        summary = f"# Pre-Update Backup\n\n"
-        summary += f"**Date**: {datetime.now(timezone.utc).isoformat()}\n"
-        summary += f"**Files backed up**: {len(backed_up_files)}\n\n"
-        for f in backed_up_files:
-            summary += f"- {f}\n"
-        summary += f"\n**Diff**: See CHANGES.diff in this directory\n"
-        summary += f"\n**To migrate**: Move your changes to the custom/ overlay system.\n"
-        summary += f"See skills/core/portal-mod-protocol/SKILL.md for instructions.\n"
-        (backup_dir / "README.md").write_text(summary)
-
-        # Discard local tracked changes so git pull can proceed
-        rc_checkout, checkout_out = await _git_cmd(["checkout", "--", "."], timeout=15)
-        if rc_checkout != 0:
-            lock.release()
-            return JSONResponse({
-                "status": "error",
-                "error": f"Failed to discard local changes: {checkout_out}",
-                "backup_dir": str(backup_dir.relative_to(SCRIPT_DIR)),
-            })
-
-    # Now proceed with normal update flow
-    job_id = f"update-force-{datetime.now():%Y%m%d-%H%M%S}"
-
-    _update_state.update({
-        "status": "in_progress",
-        "job_id": job_id,
-        "step": "starting",
-        "steps_completed": [],
-        "steps_remaining": ["ensure_git", "fetch", "compare", "check_tree",
-                            "record_rollback", "verify_custom", "verify_preserved",
-                            "pull", "verify_shim", "running_tests", "read_version", "restart"],
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "completed_at": None,
-        "error": None,
-        "previous_sha": None,
-        "new_sha": None,
-        "new_version": None,
-        "rolled_back_to": None,
-        "step_failed": None,
-        "tests_passed": None,
-        "message": None,
-        "backed_up_files": backed_up_files,
-        "backup_dir": str(backup_dir.relative_to(SCRIPT_DIR)) if backup_dir else None,
-    })
-
-    # Launch background task (lock is held; _run_update releases it in finally)
-    asyncio.create_task(_run_update(job_id, lock))
-
-    return JSONResponse({
-        "status": "started",
-        "job_id": job_id,
-        "backed_up_files": backed_up_files,
-        "backup_dir": str(backup_dir.relative_to(SCRIPT_DIR)) if backup_dir else None,
-        "message": f"Backed up {len(backed_up_files)} file(s). Update in progress. Poll /api/update/status for progress.",
-    })
-
-
-def _update_step(step_name: str):
-    """Mark a step as current and move it from remaining to completed."""
-    _update_state["step"] = step_name
-    if step_name in _update_state["steps_remaining"]:
-        _update_state["steps_remaining"].remove(step_name)
-    if step_name not in _update_state["steps_completed"]:
-        _update_state["steps_completed"].append(step_name)
-
-
-# Update log lives alongside portal code (should be .gitignored via logs/)
-_UPDATE_LOG_DIR = SCRIPT_DIR / "logs"
-_UPDATE_LOG_FILE = _UPDATE_LOG_DIR / "update.log"
-
-def _log_update(message: str):
-    """Append a message to the update log file."""
-    try:
-        _UPDATE_LOG_DIR.mkdir(exist_ok=True)
-        with open(_UPDATE_LOG_FILE, "a") as f:
-            f.write(f"[{datetime.now(timezone.utc).isoformat()}] {message}\n")
-    except Exception:
-        pass
-
-
-async def _run_update(job_id: str, lock: asyncio.Lock):
-    """Execute the 11-step safe update algorithm as a background task.
-
-    The caller must hold ``lock`` before calling; this function releases it
-    in its ``finally`` block so that a new update can be triggered after
-    completion (success or failure).
-    """
-    previous_sha = None
-    fresh_init = False  # True if repo was just git-init'd (no prior commits)
-    try:
-        # Step 1b: BACKUP IDENTITY (protect CIV memory from overwrite)
-        _update_step("backup_identity")
-        _log_update(f"[{job_id}] Step 1b: Backing up identity files...")
-        backup_script = Path.home() / "tools" / "backup_identity.sh"
-        if backup_script.exists():
-            loop = asyncio.get_event_loop()
-            try:
-                backup_result = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        _PORTAL_EXECUTOR,
-                        lambda: subprocess.run(
-                            [str(backup_script)],
-                            timeout=30, capture_output=True, text=True,
-                        )
-                    ),
-                    timeout=35,
-                )
-                if backup_result.returncode == 0:
-                    _log_update(f"[{job_id}] Identity backup completed")
-                else:
-                    _log_update(f"[{job_id}] WARNING: Identity backup failed: {backup_result.stderr[:200]}")
-            except (asyncio.TimeoutError, Exception) as e:
-                _log_update(f"[{job_id}] WARNING: Identity backup error: {e}")
-        else:
-            _log_update(f"[{job_id}] WARNING: backup_identity.sh not found at {backup_script}")
-
-        # Step 1c: ENSURE GIT REPO (auto-heal non-git-clone deployments)
-        _update_step("ensure_git")
-        ok, heal_msg = await _ensure_git_repo()
-        if not ok:
-            raise RuntimeError(f"Git setup failed: {heal_msg}")
-
-        # Step 2: FETCH
-        _update_step("fetch")
-        _log_update(f"[{job_id}] Step 2: Fetching from origin...")
-        rc, out = await _git_cmd(["fetch", "origin", "main", "--quiet"], timeout=30)
-        if rc != 0:
-            raise RuntimeError(f"git fetch failed: {out}")
-
-        # Step 3: COMPARE
-        _update_step("compare")
-        rc_local, local_sha = await _git_cmd(["rev-parse", "HEAD"])
-        rc_remote, remote_sha = await _git_cmd(["rev-parse", "origin/main"])
-        if rc_remote != 0:
-            raise RuntimeError("Failed to read origin/main SHA")
-        if rc_local != 0:
-            # Fresh init -- no HEAD yet, everything from origin/main is new
-            fresh_init = True
-            local_sha = "0000000"
-            _log_update(f"[{job_id}] Fresh install detected (no local HEAD)")
-        elif local_sha == remote_sha:
-            raise RuntimeError("Already up to date")
-
-        # Step 4: CHECK WORKING TREE (skip for fresh init -- no tracked files)
-        _update_step("check_tree")
-        if not fresh_init:
-            rc_status, status_output = await _git_cmd(["status", "--porcelain"])
-            if rc_status == 0 and status_output:
-                tracked = [l for l in status_output.split("\n") if l.strip() and not l.startswith("??")]
-                if tracked:
-                    raise RuntimeError(f"Uncommitted tracked changes: {'; '.join(tracked[:3])}")
-
-        # Step 5: RECORD ROLLBACK POINT
-        _update_step("record_rollback")
-        previous_sha = local_sha if not fresh_init else None
-        _update_state["previous_sha"] = previous_sha
-        _log_update(f"[{job_id}] Rollback point: {previous_sha or 'none (fresh install)'}")
-
-        # Step 6: VERIFY CUSTOM DIRECTORY (skip for fresh init -- no git index yet)
-        _update_step("verify_custom")
-        if not fresh_init:
-            custom_dir = SCRIPT_DIR / "custom"
-            if custom_dir.exists():
-                # Check that custom/ files are NOT tracked by git
-                for check_file in ["custom/config.json", "custom/routes.py"]:
-                    rc_check, _ = await _git_cmd(["ls-files", "--error-unmatch", check_file])
-                    if rc_check == 0:
-                        raise RuntimeError(
-                            f"ABORT: {check_file} is tracked by git. .gitignore may be broken."
-                        )
-
-        # Step 7: VERIFY PRESERVED FILES (skip for fresh init)
-        _update_step("verify_preserved")
-        if not fresh_init:
-            preserved_files = [
-                ".portal-token", "agents.db", "referrals.db", "clients.db",
-                "boop_config.json", "portal-chat.jsonl", "user-settings.json",
-                "scheduled_tasks.json",
-            ]
-            for pf in preserved_files:
-                if (SCRIPT_DIR / pf).exists():
-                    rc_check, _ = await _git_cmd(["ls-files", "--error-unmatch", pf])
-                    if rc_check == 0:
-                        raise RuntimeError(
-                            f"ABORT: {pf} is tracked by git. This file must be gitignored."
-                        )
-
-            # Step 7b: VERIFY IDENTITY DIRS NOT TRACKED
-            for identity_dir in ["memories", ".claude"]:
-                rc_ls, ls_out = await _git_cmd(["ls-files", identity_dir])
-                if rc_ls == 0 and ls_out.strip():
-                    raise RuntimeError(
-                        f"ABORT: Files inside {identity_dir}/ are tracked by git. "
-                        f"Identity/memory files must be gitignored to prevent overwrite. "
-                        f"Tracked: {ls_out.strip()[:200]}"
-                    )
-
-        # Step 8: PULL or CHECKOUT (depends on fresh_init)
-        _update_step("pull")
-        if fresh_init:
-            # Fresh init: checkout main from origin (creates local main branch)
-            _log_update(f"[{job_id}] Step 8: Fresh install -- checking out origin/main...")
-            rc_co, co_output = await _git_cmd(
-                ["checkout", "-b", "main", "origin/main", "--force"], timeout=60
-            )
-            if rc_co != 0:
-                # Fallback: reset to origin/main
-                _log_update(f"[{job_id}] checkout failed, trying reset --hard...")
-                rc_reset, reset_out = await _git_cmd(
-                    ["reset", "--hard", "origin/main"], timeout=60
-                )
-                if rc_reset != 0:
-                    raise RuntimeError(f"Failed to checkout origin/main: {co_output} / {reset_out}")
-        else:
-            _log_update(f"[{job_id}] Step 8: Pulling with --ff-only...")
-            rc_pull, pull_output = await _git_cmd(
-                ["pull", "--ff-only", "origin", "main"], timeout=60
-            )
-            if rc_pull != 0:
-                if "diverged" in pull_output.lower() or "not possible to fast-forward" in pull_output.lower():
-                    raise RuntimeError(
-                        "Local branch has diverged from origin/main. Manual intervention needed."
-                    )
-                raise RuntimeError(f"git pull --ff-only failed: {pull_output.split(chr(10))[0]}")
-
-        # Step 8b: VERIFY SHIM SURVIVED PULL
-        _update_step("verify_shim")
-        _log_update(f"[{job_id}] Step 8b: Verifying customization shim survived pull...")
-        server_file = SCRIPT_DIR / "portal_server.py"
-        if server_file.exists():
-            server_content = server_file.read_text()
-            if "CUSTOMIZATION LAYER" not in server_content:
-                raise RuntimeError(
-                    "ABORT: Customization shim (CUSTOMIZATION LAYER marker) was removed by upstream update. "
-                    "Custom routes, panels, and config overrides will not load. "
-                    "Rolling back to preserve local customizations."
-                )
-            _log_update(f"[{job_id}] Customization shim verified present")
-        else:
-            raise RuntimeError("ABORT: portal_server.py missing after pull")
-
-        # Step 9: RUN TESTS (mandatory — tests must exist and pass)
-        _update_step("running_tests")
-        _log_update(f"[{job_id}] Step 9: Running tests...")
-        tests_dir = SCRIPT_DIR / "tests"
-        if not tests_dir.exists() or not any(tests_dir.glob("test_*.py")):
-            raise RuntimeError(
-                "ABORT: No tests directory or test files found. "
-                "Tests are mandatory for safe updates — the update cannot proceed without them."
-            )
-        test_cmd = [sys.executable, "-m", "pytest", str(tests_dir), "--tb=short", "-q"]
-        loop = asyncio.get_event_loop()
-        try:
-            test_result = await asyncio.wait_for(
-                loop.run_in_executor(
-                    _PORTAL_EXECUTOR,
-                    lambda: subprocess.run(
-                        test_cmd, timeout=120, capture_output=True, text=True, cwd=str(SCRIPT_DIR)
-                    )
-                ),
-                timeout=125,
-            )
-            if test_result.returncode != 0:
-                test_output = (test_result.stdout + "\n" + test_result.stderr).strip()
-                _log_update(f"[{job_id}] Tests FAILED:\n{test_output}")
-                raise RuntimeError(f"Tests failed: {test_output[:200]}")
-            _update_state["tests_passed"] = True
-        except asyncio.TimeoutError:
-            raise RuntimeError("Tests timed out after 120 seconds")
-
-        # Step 10: READ NEW VERSION
-        _update_step("read_version")
-        new_version = await _get_current_version()
-        rc_new, new_sha = await _git_cmd(["rev-parse", "HEAD"])
-        _update_state["new_sha"] = new_sha if rc_new == 0 else remote_sha
-        _update_state["new_version"] = new_version
-
-        # Step 11: SCHEDULE RESTART
-        _update_step("restart")
-        _update_state["status"] = "success"
-        _update_state["completed_at"] = datetime.now(timezone.utc).isoformat()
-        _update_state["message"] = "Update complete. Portal will restart momentarily."
-        _update_state["last_update"] = {
-            "job_id": job_id,
-            "status": "success",
-            "completed_at": _update_state["completed_at"],
-        }
-        prev_label = previous_sha[:7] if previous_sha else "fresh"
-        _log_update(f"[{job_id}] SUCCESS: Updated from {prev_label} to {_update_state['new_sha'][:7]}")
-
-        # Delay 2s so the success status can be polled, then restart
-        await asyncio.sleep(2)
-
-        # Check for watchdog before self-terminating
-        has_watchdog = False
-        try:
-            # Check if running under a process manager
-            ppid = os.getppid()
-            ppid_comm = Path(f"/proc/{ppid}/comm")
-            ppid_name = ppid_comm.read_text().strip() if ppid_comm.exists() else ""
-            if ppid_name in ("systemd", "supervisord", "s6-supervise", "runit", "init"):
-                has_watchdog = True
-                _log_update(f"[{job_id}] Process manager detected: {ppid_name} (PID {ppid})")
-            # Also check for systemd service
-            for svc in ["portal", "purebrain-portal", "puresurf-portal"]:
-                result = subprocess.run(
-                    ["systemctl", "is-active", svc],
-                    capture_output=True, text=True, timeout=5,
-                )
-                if result.returncode == 0:
-                    has_watchdog = True
-                    _log_update(f"[{job_id}] systemd service '{svc}' is active")
-                    break
-        except Exception as e:
-            _log_update(f"[{job_id}] Watchdog detection error (non-fatal): {e}")
-
-        if has_watchdog:
-            _log_update(f"[{job_id}] Sending SIGTERM for watchdog restart...")
-            os.kill(os.getpid(), signal.SIGTERM)
-        else:
-            _log_update(f"[{job_id}] WARNING: No process manager detected. Attempting exec restart...")
-            try:
-                os.execv(sys.executable, [sys.executable] + sys.argv)
-            except Exception as e:
-                _log_update(f"[{job_id}] WARNING: exec restart failed: {e}. Portal needs manual restart.")
-                _update_state["message"] = (
-                    "Update complete but automatic restart failed. "
-                    "No process manager detected. Please restart the portal manually."
-                )
-
-    except Exception as e:
-        error_msg = str(e)
-        _log_update(f"[{job_id}] FAILED at step '{_update_state.get('step')}': {error_msg}")
-
-        # Rollback if we already pulled
-        rolled_back_to = None
-        if previous_sha and _update_state["step"] in ("verify_shim", "running_tests", "read_version", "restart"):
-            _log_update(f"[{job_id}] Rolling back to {previous_sha}...")
-            rc_reset, _ = await _git_cmd(["reset", "--hard", previous_sha])
-            if rc_reset == 0:
-                rolled_back_to = previous_sha
-                _log_update(f"[{job_id}] Rollback successful")
-            else:
-                _log_update(f"[{job_id}] WARNING: Rollback failed!")
-
-        _update_state.update({
-            "status": "failed",
-            "step_failed": _update_state.get("step"),
-            "error": error_msg,
-            "rolled_back_to": rolled_back_to,
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-            "message": "Update failed. Rolled back to previous version." if rolled_back_to else f"Update failed: {error_msg}",
-            "last_update": {
-                "job_id": job_id,
-                "status": "failed",
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-            },
-        })
-    finally:
-        # Always release the lock so a new update can be triggered
-        if lock.locked():
-            lock.release()
-
-
-async def api_update_status(request: Request) -> JSONResponse:
-    """GET /api/update/status -- Poll the status of the current/recent update."""
-    if not check_auth(request):
-        return JSONResponse({"error": "Unauthorized"}, 401)
-
-    status = _update_state["status"]
-
-    if status == "in_progress":
-        return JSONResponse({
-            "status": "in_progress",
-            "job_id": _update_state["job_id"],
-            "step": _update_state["step"],
-            "steps_completed": _update_state["steps_completed"],
-            "steps_remaining": _update_state["steps_remaining"],
-            "started_at": _update_state["started_at"],
-        })
-
-    if status == "success":
-        return JSONResponse({
-            "status": "success",
-            "job_id": _update_state["job_id"],
-            "previous_sha": _update_state["previous_sha"],
-            "new_sha": _update_state["new_sha"],
-            "new_version": _update_state["new_version"],
-            "tests_passed": _update_state["tests_passed"],
-            "message": _update_state["message"],
-            "completed_at": _update_state["completed_at"],
-            "backed_up_files": _update_state.get("backed_up_files"),
-            "backup_dir": _update_state.get("backup_dir"),
-        })
-
-    if status == "failed":
-        return JSONResponse({
-            "status": "failed",
-            "job_id": _update_state["job_id"],
-            "step_failed": _update_state["step_failed"],
-            "error": _update_state["error"],
-            "rolled_back_to": _update_state["rolled_back_to"],
-            "message": _update_state["message"],
-            "completed_at": _update_state["completed_at"],
-        })
-
-    # idle
-    return JSONResponse({
-        "status": "idle",
-        "last_update": _update_state.get("last_update"),
-    })
+from portal_updates import (
+    # Update state + lock
+    _update_state, _update_lock, _get_update_lock,
+    # Migration guidance
+    _MIGRATION_GUIDANCE, _MIGRATION_GUIDANCE_DEFAULT, _check_tracked_modifications,
+    # Module health
+    PORTAL_MODULES, MODULE_BACKUP_DIR,
+    _all_modules, _module_by_name, _check_module_health,
+    _backup_modules, _restore_module, _restore_all_modules,
+    api_health_mods, api_mods_health, api_mods_backup,
+    api_mods_restore_single, api_mods_restore_all,
+    # Git + version
+    _git_cmd, _get_current_version,
+    # Release server config
+    RELEASE_SERVER_URL, PORTAL_UPDATE_TOKEN,
+    # Update endpoints
+    api_update_check, api_update_apply, api_update_apply_force,
+    # Update runner internals
+    _update_step, _UPDATE_LOG_DIR, _UPDATE_LOG_FILE, _log_update,
+    _PRESERVED_FILES, _PRESERVED_DIRS, _run_release_update,
+    # Status endpoint
+    api_update_status,
+)
+
+try:
+    from portal_activity import log_activity, api_activity
+except ImportError:
+    def log_activity(*a, **kw): pass
+    async def api_activity(request):
+        return JSONResponse({"activities": []})
+
+from portal_constitution import (
+    CONSTITUTION_FILE, CLAUDE_MD_SYNC_TARGET,
+    _constitution_lock, _load_constitution, _save_constitution,
+    _auto_sync_to_claude_md,
+    AUDIT_LOG_FILE, _append_audit_log,
+    api_constitution_audit_log,
+    api_constitution_rules_list, api_constitution_rules_create,
+    api_constitution_rules_update, api_constitution_rules_delete,
+    api_constitution_governance_list, api_constitution_governance_update,
+    api_constitution_sync,
+    api_constitution_memory,
+    api_constitution_overrides,
+    sync_constitution_to_claude_md,
+)
+
+from portal_gdrive import (
+    GDRIVE_TOKEN_FILE, GDRIVE_CLIENT_ID,
+    GDRIVE_REDIRECT_URI,
+    _gdrive_oauth_states, _gdrive_load_tokens, _gdrive_save_tokens,
+    _gdrive_clear_tokens, _gdrive_ensure_token,
+    _extract_subdomain,
+    api_gdrive_status, api_gdrive_auth_url, api_gdrive_callback,
+    api_gdrive_disconnect, api_gdrive_files, api_gdrive_download,
+    api_gdrive_upload, api_gdrive_create_folder, api_gdrive_about,
+)
+
+from portal_777 import (
+    _777_SYSTEM_PROMPTS, _777_RATE_LIMITS,
+    _777_RATE_WINDOW, _777_RATE_MAX, _777_MAX_TURNS, _777_MAX_CHARS,
+    api_777_chat,
+)
+
+from portal_tgim import (
+    TGIM_BACKEND_URL, TGIM_SERVICE_KEY, TGIM_DEFAULT_USER_EMAIL,
+    _tgim_headers, _tgim_upstream_url, api_tgim_proxy,
+)
+
+from portal_skills import (
+    api_skills_list, api_skills_registry, api_skills_detail,
+    api_skills_install, api_skills_uninstall,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -9299,7 +6206,180 @@ async def api_first_boot(request: Request) -> JSONResponse:
 
     except subprocess.CalledProcessError as e:
         _save_portal_message(f"\u274c First-boot failed: {e}", role="assistant")
-        return JSONResponse({"error": f"tmux error: {e}"}, status_code=500)
+        return JSONResponse({"error": _sanitize_error(e, "tmux diagnostics")}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Kanban To Do endpoints
+# ---------------------------------------------------------------------------
+
+TODO_TASKS_FILE = SCRIPT_DIR / "todo_tasks.json"
+
+ACTION_KEYWORDS = [
+    "please", "need", "fix", "update", "check", "review", "send", "create",
+    "deploy", "build", "schedule", "follow up", "respond", "approve",
+    "asap", "urgent", "required", "must", "should", "action required",
+]
+
+
+def _load_todo_tasks() -> list:
+    if not TODO_TASKS_FILE.exists():
+        return []
+    try:
+        data = json.loads(TODO_TASKS_FILE.read_text())
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_todo_tasks(tasks: list) -> None:
+    TODO_TASKS_FILE.write_text(json.dumps(tasks, indent=2))
+
+
+def _extract_action_items(threads: list) -> list:
+    """Scan email threads and return task dicts for action-requiring emails."""
+    existing = _load_todo_tasks()
+    existing_source_ids = {t.get("source_id") for t in existing}
+    new_tasks = []
+    for thread in threads:
+        thread_id = thread.get("thread_id") or thread.get("id") or ""
+        if thread_id in existing_source_ids:
+            continue
+        subject = thread.get("subject", "(no subject)") or "(no subject)"
+        sender = ""
+        senders = thread.get("senders") or []
+        if senders:
+            sender = senders[0] if isinstance(senders[0], str) else str(senders[0])
+        preview = thread.get("preview") or thread.get("snippet") or ""
+        # Check body from messages if available
+        messages = thread.get("messages") or []
+        body_text = preview
+        if messages:
+            msg = messages[0]
+            body_text = msg.get("body") or msg.get("text") or msg.get("snippet") or preview
+        # Strip HTML tags from body
+        body_clean = re.sub(r'<[^>]+>', ' ', str(body_text)).strip()
+        body_clean = re.sub(r'\s+', ' ', body_clean)[:2000]
+        # Detect action keywords
+        combined = (subject + " " + body_clean).lower()
+        if any(kw in combined for kw in ACTION_KEYWORDS):
+            # Extract first action sentence as title
+            title = subject[:120] if subject else "(no subject)"
+            task_id = "todo-" + secrets.token_hex(6)
+            now = datetime.now(timezone.utc).isoformat()
+            new_tasks.append({
+                "id": task_id,
+                "title": title,
+                "description": body_clean,
+                "status": "needs-approval",
+                "source": "email",
+                "source_id": thread_id,
+                "from": sender,
+                "subject": subject,
+                "created_at": now,
+                "updated_at": now,
+            })
+    return new_tasks
+
+
+async def api_todo_tasks(request: Request) -> JSONResponse:
+    """GET /api/todo/tasks — return all tasks; POST — create a manual task."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if request.method == "POST":
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        title = (body.get("title") or "").strip()
+        if not title:
+            return JSONResponse({"error": "title required"}, status_code=400)
+        task_id = "todo-" + secrets.token_hex(6)
+        now = datetime.now(timezone.utc).isoformat()
+        task = {
+            "id": task_id,
+            "title": title,
+            "description": (body.get("description") or "").strip(),
+            "status": "needs-approval",
+            "source": "manual",
+            "source_id": None,
+            "from": None,
+            "subject": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        tasks = _load_todo_tasks()
+        tasks.append(task)
+        _save_todo_tasks(tasks)
+        return JSONResponse({"ok": True, "task": task})
+    tasks = _load_todo_tasks()
+    return JSONResponse({"tasks": tasks})
+
+
+async def api_todo_task_update(request: Request) -> JSONResponse:
+    """PUT /api/todo/tasks/{task_id} — update task status."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    task_id = request.path_params.get("task_id", "")
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    tasks = _load_todo_tasks()
+    for task in tasks:
+        if task.get("id") == task_id:
+            allowed = {"needs-approval", "pending", "in-progress", "completed"}
+            new_status = body.get("status")
+            if new_status and new_status in allowed:
+                task["status"] = new_status
+            # Allow updating title/description too
+            if "title" in body:
+                task["title"] = str(body["title"])[:200]
+            if "description" in body:
+                task["description"] = str(body["description"])[:5000]
+            task["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _save_todo_tasks(tasks)
+            return JSONResponse({"ok": True, "task": task})
+    return JSONResponse({"error": "task not found"}, status_code=404)
+
+
+async def api_todo_task_delete(request: Request) -> JSONResponse:
+    """DELETE /api/todo/tasks/{task_id} — delete a task."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    task_id = request.path_params.get("task_id", "")
+    tasks = _load_todo_tasks()
+    new_tasks = [t for t in tasks if t.get("id") != task_id]
+    if len(new_tasks) == len(tasks):
+        return JSONResponse({"error": "task not found"}, status_code=404)
+    _save_todo_tasks(new_tasks)
+    return JSONResponse({"ok": True})
+
+
+async def api_todo_scan_emails(request: Request) -> JSONResponse:
+    """POST /api/todo/scan-emails — scan recent emails and extract action items."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    # Fetch threads from the existing inbox API (reuse internal logic)
+    account_idx = 0
+    client, email = _get_email_client(account_idx)
+    if not client:
+        return JSONResponse({"error": "Email not configured", "created": 0})
+    try:
+        if isinstance(client, GmailClient):
+            loop = asyncio.get_event_loop()
+            threads = await loop.run_in_executor(None, lambda: client.list_threads(limit=50))
+        else:
+            result = client.inboxes.threads.list(email, limit=50)
+            threads = [_thread_to_dict(t) for t in (result.threads or [])]
+    except Exception as exc:
+        return JSONResponse({"error": str(exc), "created": 0}, status_code=502)
+    new_tasks = _extract_action_items(threads)
+    if new_tasks:
+        existing = _load_todo_tasks()
+        existing.extend(new_tasks)
+        _save_todo_tasks(existing)
+    return JSONResponse({"ok": True, "created": len(new_tasks), "scanned": len(threads)})
 
 
 # ---------------------------------------------------------------------------
@@ -9332,7 +6412,7 @@ async def api_hub_tasks_update(request: Request) -> JSONResponse:
         tasks_file.write_text(json.dumps(body, indent=2))
         return JSONResponse({"ok": True})
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": _sanitize_error(e, "diagnostics")}, status_code=500)
 
 
 async def api_hub_weekly_usage(request: Request) -> JSONResponse:
@@ -9359,7 +6439,7 @@ async def api_hub_weekly_usage_update(request: Request) -> JSONResponse:
         usage_file.write_text(json.dumps(body, indent=2))
         return JSONResponse({"ok": True})
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": _sanitize_error(e, "health check")}, status_code=500)
 
 
 # ── Live Sub-Agents ───────────────────────────────────────────────────────
@@ -9447,7 +6527,188 @@ async def api_hub_live_agents(request: Request) -> JSONResponse:
             continue
 
     agents.sort(key=lambda a: (0 if a["status"] == "running" else 1, a.get("started_at", "")))
+
+    # Update last_active in agents DB for any live agents we found
+    if agents:
+        now_iso = datetime.utcnow().isoformat()
+        try:
+            async with _agents_db() as db:
+                for a in agents:
+                    aid = a.get("id", "")
+                    if aid:
+                        await db.execute(
+                            "UPDATE agents SET last_active=?, status='active' WHERE id=?",
+                            (now_iso, aid),
+                        )
+                await db.commit()
+        except Exception:
+            pass  # best-effort
+
     return JSONResponse({"agents": agents})
+
+
+# ── System Stats ──────────────────────────────────────────────────────────
+
+async def api_system_stats(request: Request) -> JSONResponse:
+    """GET /api/system/stats — real memory, CPU load, and disk usage."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    # Memory from /proc/meminfo
+    mem_total_gb = 0.0
+    mem_used_gb = 0.0
+    try:
+        with open("/proc/meminfo", "r") as f:
+            info = {}
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    info[parts[0].rstrip(":")] = int(parts[1])  # kB
+            total_kb = info.get("MemTotal", 0)
+            avail_kb = info.get("MemAvailable", info.get("MemFree", 0))
+            mem_total_gb = round(total_kb / 1048576, 1)
+            mem_used_gb = round((total_kb - avail_kb) / 1048576, 1)
+    except Exception:
+        pass
+
+    # CPU load from /proc/loadavg
+    cpu_load = 0.0
+    try:
+        with open("/proc/loadavg", "r") as f:
+            cpu_load = float(f.read().split()[0])
+    except Exception:
+        pass
+
+    # Disk usage
+    disk_total_gb = 0.0
+    disk_used_gb = 0.0
+    try:
+        usage = shutil.disk_usage("/")
+        disk_total_gb = round(usage.total / (1024 ** 3), 1)
+        disk_used_gb = round(usage.used / (1024 ** 3), 1)
+    except Exception:
+        pass
+
+    return JSONResponse({
+        "memory_used_gb": mem_used_gb,
+        "memory_total_gb": mem_total_gb,
+        "cpu_load": round(cpu_load, 2),
+        "disk_used_gb": disk_used_gb,
+        "disk_total_gb": disk_total_gb,
+    })
+
+
+# ── Integrations Status ──────────────────────────────────────────────────
+
+async def api_integrations_status(request: Request) -> JSONResponse:
+    """GET /api/integrations/status — check which APIs have credentials configured."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    settings = _load_settings()
+    home = Path.home()
+
+    def _has(key):
+        return bool(settings.get(key, "").strip())
+
+    def _env(key):
+        return bool(os.environ.get(key, "").strip())
+
+    def _file(path):
+        return Path(path).exists()
+
+    integrations = []
+
+    # AgentMail
+    am_ok = _has("agentmail_api_key") and _has("agentmail_email")
+    am_accounts = settings.get("email_accounts", [])
+    am_count = len(am_accounts) if am_accounts else (1 if am_ok else 0)
+    integrations.append({
+        "name": "AgentMail", "status": "active" if am_ok else "inactive",
+        "desc": "Email inboxes for AI agents — send, receive, thread management",
+        "detail": f"{am_count} inbox{'es' if am_count != 1 else ''}" if am_ok else "not configured",
+    })
+
+    # Telegram Bot
+    tg_ok = _file(SCRIPT_DIR / "telegram_config.json")
+    if tg_ok:
+        try:
+            tg_data = json.loads((SCRIPT_DIR / "telegram_config.json").read_text())
+            tg_ok = bool(tg_data.get("bot_token", "").strip())
+        except Exception:
+            tg_ok = False
+    integrations.append({
+        "name": "Telegram Bot", "status": "active" if tg_ok else "inactive",
+        "desc": "Push notifications, message forwarding, voice messages",
+        "detail": "connected" if tg_ok else "not configured",
+    })
+
+    # Command Center
+    cc_ok = _has("cc_civ_key") or _has("cc_url")
+    integrations.append({
+        "name": "Command Center", "status": "active" if cc_ok else "inactive",
+        "desc": "PureBrain Command Center — tasks, chat, coordination",
+        "detail": "connected" if cc_ok else "not configured",
+    })
+
+    # Google Drive
+    gd_ok = _file(SCRIPT_DIR / ".gdrive-tokens.json") or _file(home / ".gdrive-tokens.json")
+    integrations.append({
+        "name": "Google Drive", "status": "active" if gd_ok else "inactive",
+        "desc": "File storage, LinkedIn drafts, export delivery",
+        "detail": "OAuth token" if gd_ok else "not configured",
+    })
+
+    # Google Gemini (image gen)
+    gem_ok = _env("GOOGLE_API_KEY")
+    integrations.append({
+        "name": "Google Gemini", "status": "active" if gem_ok else "inactive",
+        "desc": "Image generation — blog banners, LinkedIn graphics, social media",
+        "detail": "API key set" if gem_ok else "not configured",
+    })
+
+    # Bluesky
+    bsky_ok = _env("BSKY_USERNAME") and _env("BSKY_PASSWORD")
+    integrations.append({
+        "name": "Bluesky", "status": "active" if bsky_ok else "inactive",
+        "desc": "Social media posting, engagement, threads",
+        "detail": os.environ.get("BSKY_USERNAME", "") if bsky_ok else "not configured",
+    })
+
+    # PayPal
+    pp_ok = _has("paypal_client_id") or _env("PAYPAL_CLIENT_ID")
+    integrations.append({
+        "name": "PayPal", "status": "active" if pp_ok else "inactive",
+        "desc": "Payment processing, subscriptions, webhooks",
+        "detail": "connected" if pp_ok else "not configured",
+    })
+
+    # Supabase
+    supa_ok = _env("SUPABASE_URL") and _env("SUPABASE_KEY")
+    integrations.append({
+        "name": "Supabase", "status": "active" if supa_ok else "inactive",
+        "desc": "PostgreSQL database, auth, RLS",
+        "detail": "connected" if supa_ok else "not configured",
+    })
+
+    # Cloudflare
+    cf_ok = _env("CLOUDFLARE_API_TOKEN") or _env("CF_API_TOKEN")
+    integrations.append({
+        "name": "Cloudflare", "status": "active" if cf_ok else "inactive",
+        "desc": "DNS management, Workers, Pages, WAF, CDN",
+        "detail": "API token set" if cf_ok else "not configured",
+    })
+
+    # Vercel
+    vc_ok = _env("VERCEL_TOKEN")
+    integrations.append({
+        "name": "Vercel", "status": "active" if vc_ok else "inactive",
+        "desc": "Deployment platform — build, deploy, and host web projects",
+        "detail": "token set" if vc_ok else "not configured",
+    })
+
+    active_count = sum(1 for i in integrations if i["status"] == "active")
+    return JSONResponse({"integrations": integrations, "active": active_count, "total": len(integrations)})
 
 
 # ── Continue & Restart ────────────────────────────────────────────────────
@@ -9473,9 +6734,7 @@ async def api_hub_continue(request: Request) -> JSONResponse:
         project_dir = str(Path.home())
         marker = Path.home() / ".current_session"
         marker.write_text(tmux_session)
-        # Use default model — each CIV may have different config
-        model_file = Path.home() / ".claude_session_model"
-        model = model_file.read_text().strip() if model_file.exists() else "claude-opus-4-6"
+        model = _detect_session_model()
         claude_cmd = (
             f"claude --model {model} --dangerously-skip-permissions "
             f"--continue"
@@ -9491,7 +6750,7 @@ async def api_hub_continue(request: Request) -> JSONResponse:
             "message": f"Continuing last conversation with fresh context: {tmux_session}"
         })
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": _sanitize_error(e, "config read")}, status_code=500)
 
 
 async def api_hub_restart(request: Request) -> JSONResponse:
@@ -9515,8 +6774,7 @@ async def api_hub_restart(request: Request) -> JSONResponse:
             pass
         marker = Path.home() / ".current_session"
         marker.write_text(tmux_session)
-        model_file = Path.home() / ".claude_session_model"
-        model = model_file.read_text().strip() if model_file.exists() else "claude-opus-4-6"
+        model = _detect_session_model()
         claude_cmd = (
             f"claude --model {model} --dangerously-skip-permissions"
         )
@@ -9527,7 +6785,322 @@ async def api_hub_restart(request: Request) -> JSONResponse:
         ))
         return JSONResponse({"status": "restarting", "tmux": tmux_session})
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": _sanitize_error(e, "config write")}, status_code=500)
+
+
+# ── CC Bridge Status ──────────────────────────────────────────────────────
+
+async def api_cc_status(request: Request) -> JSONResponse:
+    """GET /api/cc/status — check if Command Center bridge is reachable."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        import urllib.request
+        req = urllib.request.Request("https://cc.purebrain.ai/health", method="GET")
+        req.add_header("User-Agent", "PureBrain-Portal/2.0")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            available = resp.status == 200
+    except Exception:
+        available = False
+    return JSONResponse({"available": available, "bridge_loaded": _cc_bridge_loaded})
+
+
+# ── Notification Queue ──────────────────────────────────────────────────
+
+def _get_notifications() -> list:
+    """Return the notification list from user-settings.json."""
+    settings = _load_settings()
+    return settings.get("notifications_list", [])
+
+def _add_notification(title: str, body: str, category: str = "system", link: str = "") -> dict:
+    """Add a notification. Categories: email, cc, task, system."""
+    settings = _load_settings()
+    notifs = settings.get("notifications_list", [])
+    notif = {
+        "id": secrets.token_hex(6),
+        "title": title,
+        "body": body,
+        "category": category,
+        "link": link,
+        "read": False,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    notifs.insert(0, notif)
+    notifs = notifs[:50]  # Keep max 50
+    settings["notifications_list"] = notifs
+    _save_settings(settings)
+    return notif
+
+async def api_notifications(request: Request) -> JSONResponse:
+    """GET /api/notifications — list notifications.
+       POST /api/notifications — mark read or create."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    if request.method == "GET":
+        notifs = _get_notifications()
+        # Auto-prune notifications older than 7 days
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        fresh = [n for n in notifs if n.get("timestamp", "") >= cutoff]
+        if len(fresh) < len(notifs):
+            settings = _load_settings()
+            settings["notifications_list"] = fresh
+            _save_settings(settings)
+            notifs = fresh
+        unread = len([n for n in notifs if not n["read"]])
+        return JSONResponse({"notifications": notifs, "unread": unread})
+
+    # POST — mark read or create
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    action = body.get("action", "read")
+
+    if action == "clear":
+        settings = _load_settings()
+        settings["notifications_list"] = []
+        _save_settings(settings)
+        return JSONResponse({"ok": True, "unread": 0})
+
+    if action == "create":
+        title = body.get("title", "")
+        body_text = body.get("body", "")
+        category = body.get("category", "system")
+        link = body.get("link", "")
+        if title:
+            _add_notification(title, body_text, category, link)
+        notifs = _get_notifications()
+        unread = len([n for n in notifs if not n["read"]])
+        return JSONResponse({"ok": True, "unread": unread})
+
+    # Default: mark read
+    settings = _load_settings()
+    notifs = settings.get("notifications_list", [])
+
+    notif_id = body.get("id")
+    if notif_id == "all":
+        for n in notifs:
+            n["read"] = True
+    elif notif_id:
+        for n in notifs:
+            if n["id"] == notif_id:
+                n["read"] = True
+                break
+
+    settings["notifications_list"] = notifs
+    _save_settings(settings)
+    unread = len([n for n in notifs if not n["read"]])
+    return JSONResponse({"ok": True, "unread": unread})
+
+
+# ── Email notification endpoints (task assignment, meeting invites) ──
+
+async def api_notification_send_email(request: Request) -> JSONResponse:
+    """POST /api/notifications/send-email -- Send an email notification.
+
+    Body: {"to": "email@example.com", "subject": "...", "body": "...", "cc": "optional"}
+
+    Used by CC webhooks for task assignment and meeting invite notifications.
+    CIV-agnostic: uses whatever email provider is configured.
+    """
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        data = await request.json()
+        to = data.get("to")
+        subject = data.get("subject")
+        body = data.get("body")
+        cc = data.get("cc")
+
+        if not to or not subject or not body:
+            return JSONResponse({"error": "to, subject, and body are required"}, status_code=400)
+
+        result = _send_email_notification(to, subject, body, cc)
+        if result.get("ok"):
+            log_activity("Email notification sent", f"To: {to}, Subject: {subject}", "email")
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": _sanitize_error(e, "send email")}, status_code=500)
+
+
+async def api_notification_task_assigned(request: Request) -> JSONResponse:
+    """POST /api/notifications/task-assigned -- Notify assignee via email.
+
+    Body: {
+        "assignee_email": "person@example.com",
+        "assignee_name": "John",
+        "task_title": "Review Q3 report",
+        "task_description": "Please review the quarterly report",
+        "assigned_by": "Alex",
+        "task_url": "https://app.purebrain.ai/tasks/123"  (optional)
+    }
+    """
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        data = await request.json()
+        assignee_email = data.get("assignee_email")
+        assignee_name = data.get("assignee_name", "")
+        task_title = data.get("task_title", "New Task")
+        task_desc = data.get("task_description", "")
+        assigned_by = data.get("assigned_by", "")
+        task_url = data.get("task_url", "")
+
+        if not assignee_email:
+            return JSONResponse({"error": "assignee_email is required"}, status_code=400)
+
+        subject = f"Task Assigned: {task_title}"
+        body_lines = [
+            f"Hi {assignee_name}," if assignee_name else "Hi,",
+            "",
+            f"You have been assigned a new task: {task_title}",
+            "",
+        ]
+        if task_desc:
+            body_lines.append(f"Description: {task_desc}")
+            body_lines.append("")
+        if assigned_by:
+            body_lines.append(f"Assigned by: {assigned_by}")
+        if task_url:
+            body_lines.append(f"View task: {task_url}")
+        body_lines.extend(["", "-- PureBrain Portal"])
+
+        body = "\n".join(body_lines)
+        result = _send_email_notification(assignee_email, subject, body)
+
+        if result.get("ok"):
+            _add_notification(
+                f"Task '{task_title}' assigned to {assignee_name or assignee_email}",
+                f"Assigned by {assigned_by}" if assigned_by else "Task assignment sent",
+                "task",
+            )
+            log_activity("Task assignment email sent", f"To: {assignee_email}, Task: {task_title}", "task")
+
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": _sanitize_error(e, "task notify")}, status_code=500)
+
+
+async def api_notification_meeting_invite(request: Request) -> JSONResponse:
+    """POST /api/notifications/meeting-invite -- Notify attendees via email.
+
+    Body: {
+        "attendees": [{"email": "a@b.com", "name": "Alice"}, ...],
+        "meeting_title": "Team Standup",
+        "meeting_time": "2026-06-16 10:00 AM ET",
+        "meeting_description": "Weekly sync",
+        "organizer": "Alex",
+        "meeting_url": "https://zoom.us/j/123"  (optional)
+    }
+    """
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        data = await request.json()
+        attendees = data.get("attendees", [])
+        title = data.get("meeting_title", "Meeting")
+        meeting_time = data.get("meeting_time", "")
+        desc = data.get("meeting_description", "")
+        organizer = data.get("organizer", "")
+        meeting_url = data.get("meeting_url", "")
+
+        if not attendees:
+            return JSONResponse({"error": "attendees list is required"}, status_code=400)
+
+        subject = f"Meeting Invite: {title}"
+        results = []
+
+        for attendee in attendees:
+            email = attendee.get("email")
+            name = attendee.get("name", "")
+            if not email:
+                continue
+
+            body_lines = [
+                f"Hi {name}," if name else "Hi,",
+                "",
+                f"You are invited to: {title}",
+                "",
+            ]
+            if meeting_time:
+                body_lines.append(f"When: {meeting_time}")
+            if desc:
+                body_lines.append(f"Details: {desc}")
+            if organizer:
+                body_lines.append(f"Organizer: {organizer}")
+            if meeting_url:
+                body_lines.append(f"Join: {meeting_url}")
+            body_lines.extend(["", "-- PureBrain Portal"])
+
+            body = "\n".join(body_lines)
+            r = _send_email_notification(email, subject, body)
+            results.append({"email": email, **r})
+
+        sent = sum(1 for r in results if r.get("ok"))
+        if sent > 0:
+            _add_notification(
+                f"Meeting '{title}' -- {sent} invite(s) sent",
+                f"Organized by {organizer}" if organizer else f"{sent} invites sent",
+                "email",
+            )
+            log_activity("Meeting invites sent", f"{sent}/{len(results)} emails for '{title}'", "email")
+
+        return JSONResponse({"results": results, "sent": sent, "total": len(results)})
+    except Exception as e:
+        return JSONResponse({"error": _sanitize_error(e, "meeting notify")}, status_code=500)
+
+
+async def api_cc_proxy(request: Request) -> Response:
+    """Proxy CC API requests to avoid CORS issues.
+    Routes /api/cc/proxy/{path} → https://cc.purebrain.ai/api/{path}
+    Uses the CIV key from portal settings for auth."""
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    # Get CC CIV key: try portal_settings.json first (stable), then user-settings.json
+    cc_key = ""
+    try:
+        _ps = json.loads((SCRIPT_DIR / "portal_settings.json").read_text())
+        cc_key = _ps.get("cc_civ_key", "")
+    except Exception:
+        pass
+    if not cc_key or ":" not in cc_key:
+        settings = _load_settings()
+        cc_key = settings.get("cc_civ_key", "")
+    if not cc_key or ":" not in cc_key:
+        return JSONResponse({"error": "CC CIV key not configured (need Name:Key format)"}, status_code=400)
+
+    # Build target URL
+    path = request.path_params.get("path", "")
+    query = str(request.url.query)
+    target = f"https://cc.purebrain.ai/{path}"
+    if query:
+        target += f"?{query}"
+
+    try:
+        import httpx
+        headers = {"X-CIV-Key": cc_key, "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=15) as client:
+            if request.method == "GET":
+                resp = await client.get(target, headers=headers)
+            elif request.method == "POST":
+                body = await request.body()
+                resp = await client.post(target, headers=headers, content=body)
+            elif request.method == "PUT":
+                body = await request.body()
+                resp = await client.put(target, headers=headers, content=body)
+            else:
+                return JSONResponse({"error": "method not allowed"}, status_code=405)
+
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type", "application/json"),
+        )
+    except Exception as e:
+        return JSONResponse({"error": f"CC proxy error: {_sanitize_error(e, 'cc proxy')}"}, status_code=502)
 
 
 # ── Debug Report ──────────────────────────────────────────────────────────
@@ -9655,19 +7228,23 @@ _CUSTOM_CONFIG_FILE = _CUSTOM_DIR / "config.json"
 
 _ALLOWED_CONFIG_OVERRIDES = {"MAX_TOKENS", "PORTAL_VERSION", "PAYOUT_MIN_AMOUNT", "REFERRAL_COMMISSION_RATE"}
 
-# 1. Config overrides
+# 0. Read custom config
+_custom_cfg: dict = {}
 if _CUSTOM_CONFIG_FILE.exists():
     try:
         _custom_cfg = json.loads(_CUSTOM_CONFIG_FILE.read_text())
-        for _k, _v in _custom_cfg.items():
-            if _k not in _ALLOWED_CONFIG_OVERRIDES:
-                print(f"[portal-custom] WARNING: config override blocked for key '{_k}' (not in allowlist)")
-                continue
-            if _k in globals():
-                globals()[_k] = _v
-                print(f"[portal-custom] Config override: {_k} = {_v}")
     except Exception as _e:
         print(f"[portal-custom] WARNING: config.json load failed: {_e}")
+
+# 1. Config overrides (allowlisted globals only)
+for _k, _v in _custom_cfg.items():
+    if _k not in _ALLOWED_CONFIG_OVERRIDES:
+        print(f"[portal-custom] WARNING: config override blocked for key '{_k}' (not in allowlist)")
+        continue
+    if _k in globals():
+        globals()[_k] = _v
+        print(f"[portal-custom] Config override: {_k} = {_v}")
+
 
 # 2. Custom routes
 _custom_routes: list = []
@@ -9683,562 +7260,59 @@ if _CUSTOM_ROUTES_FILE.exists():
     except Exception as _e:
         print(f"[portal-custom] WARNING: routes.py load failed: {_e}")
 
-# 3. Custom startup hooks
+# 2b. Endpoint extensions (extend upstream responses from custom/routes.py)
+_endpoint_extensions: dict = {}
+try:
+    if hasattr(_mod, "endpoint_extensions"):
+        _endpoint_extensions = _mod.endpoint_extensions
+        print(f"[portal-custom] Loaded {len(_endpoint_extensions)} endpoint extension(s)")
+except NameError:
+    pass  # _mod was not defined (routes.py didn't load or doesn't exist)
+except Exception as _e:
+    print(f"[portal-custom] WARNING: endpoint_extensions load failed: {_e}")
+
+# 3. Custom startup hooks (CC Bridge: tracked file preferred over custom/startup.py)
 _custom_startup_hooks: list = []
-_custom_startup_file = _CUSTOM_DIR / "startup.py"
-if _custom_startup_file.exists():
+_cc_bridge_loaded = False
+
+# Try new tracked location first (auto-updates via git pull)
+_cc_bridge_file = SCRIPT_DIR / "cc_bridge.py"
+if _cc_bridge_file.exists():
     try:
         import importlib.util as _importlib_util
-        _spec2 = _importlib_util.spec_from_file_location("custom_startup", str(_custom_startup_file))
-        _mod2 = _importlib_util.module_from_spec(_spec2)
-        _spec2.loader.exec_module(_mod2)
-        if hasattr(_mod2, "on_startup"):
-            _custom_startup_hooks.append(_mod2.on_startup)
-            print("[portal-custom] Loaded custom startup hook")
+        _spec_bridge = _importlib_util.spec_from_file_location("cc_bridge", str(_cc_bridge_file))
+        _mod_bridge = _importlib_util.module_from_spec(_spec_bridge)
+        _spec_bridge.loader.exec_module(_mod_bridge)
+        if hasattr(_mod_bridge, "on_startup"):
+            _custom_startup_hooks.append(_mod_bridge.on_startup)
+            _cc_bridge_loaded = True
+            print("[CC Bridge] Loaded from cc_bridge.py (auto-updates via git pull)")
     except Exception as _e:
-        print(f"[portal-custom] WARNING: startup.py load failed: {_e}")
+        print(f"[CC Bridge] ERROR loading cc_bridge.py: {_e}")
+
+# Check for deprecated custom/startup.py
+_custom_startup_file = _CUSTOM_DIR / "startup.py"
+if _custom_startup_file.exists():
+    if _cc_bridge_loaded:
+        print("[CC Bridge] WARNING: Found custom/startup.py but using cc_bridge.py instead.")
+        print("[CC Bridge] Delete custom/startup.py -- it is no longer needed.")
+    else:
+        # Fallback to old location with deprecation warning
+        print("[CC Bridge] WARNING: custom/startup.py is DEPRECATED.")
+        print("[CC Bridge] It will still work, but won't receive updates via git pull.")
+        print("[CC Bridge] To fix: delete custom/startup.py -- the built-in cc_bridge.py auto-configures from your identity file.")
+        try:
+            import importlib.util as _importlib_util
+            _spec2 = _importlib_util.spec_from_file_location("custom_startup", str(_custom_startup_file))
+            _mod2 = _importlib_util.module_from_spec(_spec2)
+            _spec2.loader.exec_module(_mod2)
+            if hasattr(_mod2, "on_startup"):
+                _custom_startup_hooks.append(_mod2.on_startup)
+                print("[portal-custom] Loaded custom startup hook (deprecated location)")
+        except Exception as _e:
+            print(f"[portal-custom] WARNING: startup.py load failed: {_e}")
+
 # ─── END CUSTOMIZATION LAYER ──────────────────────────────────────────
-
-# ---------------------------------------------------------------------------
-# TGIM proxy — integration with TGIM v4.x (Russell Korus / Parallax + Keel)
-# Auth: Option B — service key + user email passthrough
-# ---------------------------------------------------------------------------
-def _read_tgim_env(key: str, default: str = "") -> str:
-    """Read from os.environ first, then fall back to ~/.env file."""
-    val = os.environ.get(key)
-    if val:
-        return val
-    env_path = Path.home() / ".env"
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            if k.strip() == key:
-                return v.strip()
-    return default
-
-
-TGIM_BACKEND_URL = _read_tgim_env("TGIM_BACKEND_URL", "http://157.230.191.4:8089")
-TGIM_SERVICE_KEY = _read_tgim_env("TGIM_SERVICE_KEY")
-TGIM_DEFAULT_USER_EMAIL = _read_tgim_env("TGIM_DEFAULT_USER_EMAIL", "alex@puretechnology.nyc")
-
-
-def _tgim_headers(user_email: str | None = None) -> dict:
-    return {
-        "X-TGIM-Service-Key": TGIM_SERVICE_KEY,
-        "X-TGIM-User": user_email or TGIM_DEFAULT_USER_EMAIL,
-        "Content-Type": "application/json",
-    }
-
-
-def _tgim_upstream_url(path: str) -> str:
-    trimmed = path.removeprefix("/api/tgim/").removeprefix("/api/tgim")
-    return f"{TGIM_BACKEND_URL}/api/v1/{trimmed}"
-
-
-async def api_tgim_proxy(request: Request) -> JSONResponse:
-    """Generic proxy for /api/tgim/* → TGIM backend /api/v1/*."""
-    if not check_auth(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    if not TGIM_SERVICE_KEY:
-        return JSONResponse({"error": "TGIM_SERVICE_KEY not configured"}, status_code=503)
-
-    upstream_url = _tgim_upstream_url(request.url.path)
-    headers = _tgim_headers()
-    params = dict(request.query_params)
-    method = request.method.upper()
-
-    body = None
-    if method in ("POST", "PUT", "PATCH"):
-        try:
-            body = await request.json()
-        except Exception:
-            body = None
-
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.request(
-                method=method, url=upstream_url,
-                headers=headers, params=params,
-                json=body if body is not None else None,
-            )
-            try:
-                data = resp.json()
-            except Exception:
-                data = {"raw": resp.text}
-            return JSONResponse(data, status_code=resp.status_code)
-    except httpx.TimeoutException:
-        print(f"[tgim] Timeout proxying {method} {upstream_url}")
-        return JSONResponse({"error": "TGIM backend timeout"}, status_code=504)
-    except Exception as e:
-        print(f"[tgim] Proxy error: {e}")
-        return JSONResponse({"error": str(e)}, status_code=502)
-
-
-# ── Team Chat (embedded trio-comms, self-contained) ─────────────────────────
-# Full implementation of the trio-comms room/message system embedded in the portal.
-# Same schema and API shape as Aether's CF Worker, but backed by local SQLite.
-# Each portal instance is its own trio-comms. Room + AI tokens provisioned at birth.
-#
-# Auth model (matches CF Worker):
-#   - Portal bearer token → sender_id from TRIO_SENDER_ID env (default: portal owner)
-#   - Per-AI bearer tokens → sha256 hashed in team_chat.db ai_tokens table
-#   - Internal setup token → TRIO_SETUP_TOKEN env (for birth-pipeline provisioning)
-#
-# Env vars:
-#   TRIO_SENDER_ID    — sender_id for the portal human (e.g. "human:corey@example.com")
-#   TRIO_SETUP_TOKEN  — admin token for /trio/setup (room provisioning at birth)
-
-TRIO_DB_PATH = SCRIPT_DIR / "team-chat.db"
-TRIO_UPLOADS_DIR = SCRIPT_DIR / "team-chat-uploads"
-TRIO_SENDER_ID = os.environ.get("TRIO_SENDER_ID", "")
-TRIO_SETUP_TOKEN = os.environ.get("TRIO_SETUP_TOKEN", "")
-_TRIO_MAX_CONTENT = 100_000
-_TRIO_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
-_TRIO_RATE_LIMIT_PER_MIN = 20
-_TRIO_ALLOWED_MIME_PREFIXES = ("image/", "audio/", "text/")
-_TRIO_ALLOWED_MIME_EXACT = {
-    "application/pdf", "application/json", "application/zip",
-    "audio/mpeg", "audio/wav", "audio/mp4", "audio/webm", "audio/ogg",
-}
-
-
-def _trio_allowed_mime(mime: str) -> bool:
-    if not mime:
-        return False
-    if mime in _TRIO_ALLOWED_MIME_EXACT:
-        return True
-    return any(mime.startswith(p) for p in _TRIO_ALLOWED_MIME_PREFIXES)
-
-
-def _trio_init_db():
-    """Create team-chat.db tables if they don't exist. Called at startup."""
-    TRIO_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(TRIO_DB_PATH))
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS rooms (
-            id TEXT PRIMARY KEY,
-            customer_id TEXT NOT NULL UNIQUE,
-            name TEXT NOT NULL DEFAULT '',
-            created_at INTEGER NOT NULL,
-            archived_at INTEGER,
-            retention_days INTEGER NOT NULL DEFAULT 90,
-            attachment_bytes_used INTEGER NOT NULL DEFAULT 0,
-            storage_hard_cap_bytes INTEGER NOT NULL DEFAULT 5368709120
-        );
-        CREATE TABLE IF NOT EXISTS room_members (
-            room_id TEXT NOT NULL,
-            member_id TEXT NOT NULL,
-            member_type TEXT NOT NULL CHECK(member_type IN ('ai', 'human')),
-            display_name TEXT NOT NULL,
-            scopes_json TEXT NOT NULL DEFAULT '["read","write","upload"]',
-            joined_at INTEGER NOT NULL,
-            last_heartbeat_at INTEGER,
-            last_seq_seen INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (room_id, member_id)
-        );
-        CREATE TABLE IF NOT EXISTS room_seq_counters (
-            room_id TEXT PRIMARY KEY,
-            next_seq INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS messages (
-            id TEXT PRIMARY KEY,
-            room_id TEXT NOT NULL,
-            seq INTEGER,
-            timestamp TEXT NOT NULL,
-            sender_id TEXT NOT NULL,
-            content TEXT NOT NULL,
-            content_hash TEXT,
-            client_msg_id TEXT,
-            attachments_json TEXT DEFAULT '[]',
-            audit_log TEXT DEFAULT '[]'
-        );
-        CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room_id, seq);
-        CREATE UNIQUE INDEX IF NOT EXISTS uniq_messages_client_idem
-            ON messages(room_id, client_msg_id) WHERE client_msg_id IS NOT NULL;
-        CREATE TABLE IF NOT EXISTS ai_tokens (
-            token_hash TEXT PRIMARY KEY,
-            customer_id TEXT NOT NULL,
-            ai_id TEXT NOT NULL,
-            display_name TEXT NOT NULL,
-            room_id TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            last_used_at INTEGER,
-            revoked_at INTEGER
-        );
-        CREATE INDEX IF NOT EXISTS idx_ai_tokens_customer_ai
-            ON ai_tokens(customer_id, ai_id) WHERE revoked_at IS NULL;
-    """)
-    conn.close()
-    print(f"[trio] team-chat.db initialized at {TRIO_DB_PATH}")
-
-
-def _trio_sha256(s: str) -> str:
-    return hashlib.sha256(s.encode()).hexdigest()
-
-
-def _trio_check_auth(request: Request) -> tuple:
-    """Check auth for trio endpoints. Returns (sender_id, member_type) or (None, None).
-    Three paths:
-      1. Portal bearer token → human sender
-      2. Per-AI bearer token → ai sender (hash lookup)
-      3. Setup token → internal (for /trio/setup only)
-    """
-    auth = request.headers.get("authorization", "")
-    if not auth.startswith("Bearer "):
-        return None, None
-    tok = auth[7:].strip()
-
-    # Path 1: Portal owner token
-    if hmac.compare_digest(tok, BEARER_TOKEN) and TRIO_SENDER_ID:
-        return TRIO_SENDER_ID, "human"
-
-    # Path 2: Per-AI token (hash lookup in SQLite)
-    token_hash = _trio_sha256(tok)
-    try:
-        conn = sqlite3.connect(str(TRIO_DB_PATH))
-        row = conn.execute(
-            "SELECT customer_id, ai_id, display_name FROM ai_tokens WHERE token_hash = ? AND revoked_at IS NULL",
-            (token_hash,),
-        ).fetchone()
-        conn.close()
-        if row:
-            return f"ai:{row[0]}:{row[1]}", "ai"
-    except Exception:
-        pass
-
-    return None, None
-
-
-def _trio_alloc_seq(conn: sqlite3.Connection, room_id: str) -> int:
-    """Atomically allocate next sequence number for a room."""
-    conn.execute(
-        "INSERT INTO room_seq_counters (room_id, next_seq) VALUES (?, 2) "
-        "ON CONFLICT(room_id) DO UPDATE SET next_seq = next_seq + 1",
-        (room_id,),
-    )
-    row = conn.execute("SELECT next_seq FROM room_seq_counters WHERE room_id = ?", (room_id,)).fetchone()
-    return (row[0] if row else 1) - 1
-
-
-async def api_trio_messages(request: Request) -> JSONResponse:
-    """GET /trio/messages — fetch messages with cursor pagination."""
-    sender_id, _ = _trio_check_auth(request)
-    if not sender_id:
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    params = request.query_params
-    since_seq = int(params.get("since_seq", "0"))
-    limit = min(int(params.get("limit", "50")), 200)
-
-    async with aiosqlite.connect(str(TRIO_DB_PATH)) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT id, seq, timestamp, sender_id, content, content_hash, client_msg_id, attachments_json, audit_log "
-            "FROM messages WHERE seq IS NOT NULL AND seq > ? ORDER BY seq ASC LIMIT ?",
-            (since_seq, limit),
-        )
-        rows = await cursor.fetchall()
-
-    messages = []
-    for r in rows:
-        atts = []
-        try:
-            atts = json.loads(r["attachments_json"] or "[]")
-        except Exception:
-            pass
-        messages.append({
-            "id": r["id"],
-            "seq": r["seq"],
-            "timestamp": r["timestamp"],
-            "sender": r["sender_id"],
-            "content": r["content"],
-            "content_hash": r["content_hash"],
-            "client_msg_id": r["client_msg_id"],
-            "attachments": atts,
-        })
-
-    next_seq = messages[-1]["seq"] if messages else since_seq
-    return JSONResponse({"messages": messages, "next_since_seq": next_seq})
-
-
-async def api_trio_send(request: Request) -> JSONResponse:
-    """POST /trio/message — send a message."""
-    sender_id, _ = _trio_check_auth(request)
-    if not sender_id:
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    content = body.get("content", "")
-    if not content:
-        return JSONResponse({"error": "content required"}, status_code=400)
-    if len(content) > _TRIO_MAX_CONTENT:
-        return JSONResponse({"error": "content too long"}, status_code=413)
-
-    client_msg_id = body.get("client_msg_id") or secrets.token_hex(16)
-    attachments = body.get("attachments", [])
-    msg_id = secrets.token_hex(16)
-    timestamp = datetime.now(timezone.utc).isoformat()
-    content_hash = _trio_sha256(content)
-
-    conn = sqlite3.connect(str(TRIO_DB_PATH))
-    try:
-        # Idempotency check
-        existing = conn.execute(
-            "SELECT id, seq, timestamp FROM messages WHERE client_msg_id = ?", (client_msg_id,)
-        ).fetchone()
-        if existing:
-            conn.close()
-            return JSONResponse({"id": existing[0], "seq": existing[1], "timestamp": existing[2], "idempotent": True})
-
-        seq = _trio_alloc_seq(conn, "default")
-        conn.execute(
-            "INSERT INTO messages (id, room_id, seq, timestamp, sender_id, content, content_hash, client_msg_id, attachments_json) "
-            "VALUES (?, 'default', ?, ?, ?, ?, ?, ?, ?)",
-            (msg_id, seq, timestamp, sender_id, content, content_hash, client_msg_id, json.dumps(attachments)),
-        )
-        conn.commit()
-    except Exception as e:
-        conn.close()
-        return JSONResponse({"error": str(e)}, status_code=500)
-    conn.close()
-
-    return JSONResponse({"id": msg_id, "seq": seq, "timestamp": timestamp})
-
-
-async def api_trio_upload(request: Request) -> JSONResponse:
-    """POST /trio/upload — upload a file attachment."""
-    sender_id, _ = _trio_check_auth(request)
-    if not sender_id:
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    form = await request.form()
-    file = form.get("file")
-    if not file:
-        return JSONResponse({"error": "no file"}, status_code=400)
-
-    content = await file.read()
-    if len(content) > _TRIO_MAX_UPLOAD_BYTES:
-        return JSONResponse({"error": "file too large (max 25MB)"}, status_code=413)
-
-    mime = file.content_type or "application/octet-stream"
-    if not _trio_allowed_mime(mime):
-        return JSONResponse({"error": f"mime not allowed: {mime}"}, status_code=415)
-
-    ts = int(time.time() * 1000)
-    safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", file.filename or "file")[:120]
-    key = f"{ts}-{safe_name}"
-    dest = TRIO_UPLOADS_DIR / key
-    dest.write_bytes(content)
-
-    url = f"/trio/media/{key}"
-    return JSONResponse({
-        "key": key, "url": url, "mime": mime,
-        "size": len(content), "filename": file.filename,
-    }, status_code=201)
-
-
-async def api_trio_media(request: Request) -> Response:
-    """GET /trio/media/{key} — serve uploaded file."""
-    # Auth: portal token or AI token
-    sender_id, _ = _trio_check_auth(request)
-    if not sender_id:
-        # Also allow query param token for inline images
-        tok = request.query_params.get("token", "")
-        if not tok or not hmac.compare_digest(tok, BEARER_TOKEN):
-            return Response("unauthorized", status_code=401)
-
-    key = request.path_params.get("key", "")
-    safe_key = re.sub(r"[^a-zA-Z0-9._-]", "_", key)[:200]
-    path = TRIO_UPLOADS_DIR / safe_key
-    if not path.exists() or not path.is_file():
-        return Response("not found", status_code=404)
-
-    # Guess content type from extension
-    import mimetypes
-    ct, _ = mimetypes.guess_type(str(path))
-    ct = ct or "application/octet-stream"
-
-    return FileResponse(str(path), media_type=ct, headers={
-        "Cache-Control": "private, max-age=300",
-        "X-Robots-Tag": "noindex",
-    })
-
-
-async def api_trio_presence(request: Request) -> JSONResponse:
-    """GET /trio/presence — list members with online/stale/offline status."""
-    sender_id, _ = _trio_check_auth(request)
-    if not sender_id:
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    now = int(time.time() * 1000)
-    async with aiosqlite.connect(str(TRIO_DB_PATH)) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT member_id, member_type, display_name, last_heartbeat_at, last_seq_seen FROM room_members"
-        )
-        rows = await cursor.fetchall()
-
-    presence = []
-    for r in rows:
-        hb = r["last_heartbeat_at"] or 0
-        age = now - hb if hb else float("inf")
-        status = "online" if age < 90_000 else ("stale" if age < 300_000 else "offline")
-        presence.append({
-            "member_id": r["member_id"],
-            "member_type": r["member_type"],
-            "display_name": r["display_name"],
-            "last_heartbeat_at": r["last_heartbeat_at"],
-            "last_seq_seen": r["last_seq_seen"],
-            "status": status,
-        })
-
-    return JSONResponse({"server_now": now, "presence": presence})
-
-
-async def api_trio_heartbeat(request: Request) -> JSONResponse:
-    """POST /trio/heartbeat — AI presence ping."""
-    sender_id, _ = _trio_check_auth(request)
-    if not sender_id:
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    body = {}
-    try:
-        body = await request.json()
-    except Exception:
-        pass
-
-    now = int(time.time() * 1000)
-    last_seq = body.get("last_seq_seen")
-
-    async with aiosqlite.connect(str(TRIO_DB_PATH)) as db:
-        if last_seq is not None and isinstance(last_seq, (int, float)) and last_seq >= 0:
-            await db.execute(
-                "UPDATE room_members SET last_heartbeat_at = ?, last_seq_seen = MAX(last_seq_seen, ?) WHERE member_id = ?",
-                (now, int(last_seq), sender_id),
-            )
-        else:
-            await db.execute(
-                "UPDATE room_members SET last_heartbeat_at = ? WHERE member_id = ?",
-                (now, sender_id),
-            )
-        await db.commit()
-
-    return JSONResponse({"ok": True, "server_now": now})
-
-
-async def api_trio_setup(request: Request) -> JSONResponse:
-    """POST /trio/setup — provision room + members + AI tokens.
-    Called during birth pipeline. Requires TRIO_SETUP_TOKEN.
-    Body: { customer_id, ai_ids: [{id, display_name}], human: {id, display_name} }
-    Returns: { room_id, members, ai_tokens: [{ai_id, token, display_name}] }
-    """
-    auth = request.headers.get("authorization", "")
-    if not auth.startswith("Bearer "):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    tok = auth[7:].strip()
-    if not TRIO_SETUP_TOKEN or not hmac.compare_digest(tok, TRIO_SETUP_TOKEN):
-        # Also allow portal bearer token for admin setup
-        if not hmac.compare_digest(tok, BEARER_TOKEN):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    customer_id = body.get("customer_id", "").strip()
-    if not customer_id:
-        return JSONResponse({"error": "customer_id required"}, status_code=400)
-    ai_ids = body.get("ai_ids", [])
-    human = body.get("human")
-
-    room_id = f"room_{customer_id}"
-    now = int(time.time() * 1000)
-
-    conn = sqlite3.connect(str(TRIO_DB_PATH))
-    try:
-        # Upsert room
-        conn.execute(
-            "INSERT OR IGNORE INTO rooms (id, customer_id, name, created_at) VALUES (?, ?, '', ?)",
-            (room_id, customer_id, now),
-        )
-        # Seed seq counter
-        conn.execute(
-            "INSERT OR IGNORE INTO room_seq_counters (room_id, next_seq) VALUES (?, 1)",
-            (room_id,),
-        )
-
-        # Upsert AI members + mint tokens
-        ai_tokens = []
-        for ai in ai_ids:
-            ai_id = ai.get("id", "") if isinstance(ai, dict) else str(ai)
-            display_name = ai.get("display_name", ai_id) if isinstance(ai, dict) else str(ai)
-            member_id = f"ai:{customer_id}:{ai_id}"
-
-            conn.execute(
-                "INSERT OR IGNORE INTO room_members (room_id, member_id, member_type, display_name, scopes_json, joined_at) "
-                "VALUES (?, ?, 'ai', ?, '[\"read\",\"write\",\"upload\"]', ?)",
-                (room_id, member_id, display_name, now),
-            )
-
-            # Check existing token
-            existing = conn.execute(
-                "SELECT token_hash FROM ai_tokens WHERE customer_id = ? AND ai_id = ? AND revoked_at IS NULL",
-                (customer_id, ai_id),
-            ).fetchone()
-            if existing:
-                ai_tokens.append({"ai_id": ai_id, "display_name": display_name, "token": None, "already_minted": True})
-                continue
-
-            # Mint new token
-            token_plaintext = secrets.token_urlsafe(32)
-            token_hash = _trio_sha256(token_plaintext)
-            conn.execute(
-                "INSERT INTO ai_tokens (token_hash, customer_id, ai_id, display_name, room_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (token_hash, customer_id, ai_id, display_name, room_id, now),
-            )
-            ai_tokens.append({"ai_id": ai_id, "display_name": display_name, "token": token_plaintext, "already_minted": False})
-
-        # Upsert human member
-        if human:
-            human_id = human.get("id", "")
-            human_display = human.get("display_name", human_id)
-            if human_id:
-                conn.execute(
-                    "INSERT OR IGNORE INTO room_members (room_id, member_id, member_type, display_name, scopes_json, joined_at) "
-                    "VALUES (?, ?, 'human', ?, '[\"read\",\"write\",\"upload\"]', ?)",
-                    (room_id, human_id, human_display, now),
-                )
-
-        conn.commit()
-
-        # Return member list
-        members = conn.execute(
-            "SELECT member_id, member_type, display_name, joined_at FROM room_members WHERE room_id = ?",
-            (room_id,),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    return JSONResponse({
-        "room_id": room_id,
-        "members": [{"member_id": m[0], "member_type": m[1], "display_name": m[2], "joined_at": m[3]} for m in members],
-        "ai_tokens": ai_tokens,
-    })
-
-
-async def api_trio_health(request: Request) -> JSONResponse:
-    """GET /trio/health — team chat health check."""
-    ok = TRIO_DB_PATH.exists()
-    return JSONResponse({"ok": ok, "version": "embedded-v1", "db": str(TRIO_DB_PATH)})
 
 
 routes = [
@@ -10252,8 +7326,10 @@ routes = [
     *_static_mount,
     Route("/health", endpoint=health),
     Route("/api/status", endpoint=api_status),
+    Route("/api/gateway/status", endpoint=api_gateway_status),
     Route("/api/release-notes", endpoint=api_release_notes),
     Route("/api/chat/history", endpoint=api_chat_history),
+    Route("/api/chat/topics", endpoint=api_chat_topics),
     Route("/api/chat/send", endpoint=api_chat_send, methods=["POST"]),
     Route("/api/notify", endpoint=api_notify, methods=["POST"]),
     Route("/api/chat/upload", endpoint=api_chat_upload, methods=["POST"]),
@@ -10270,6 +7346,7 @@ routes = [
     Route("/api/context", endpoint=api_context),
     Route("/api/download", endpoint=api_download),
     Route("/api/download/list", endpoint=api_download_list),
+    Route("/api/files", endpoint=api_files_delete, methods=["DELETE"]),
     Route("/api/referral/register", endpoint=api_referral_register, methods=["POST"]),
     Route("/api/referral/login", endpoint=api_referral_login, methods=["POST"]),
     Route("/api/referral/session", endpoint=api_referral_session, methods=["POST"]),
@@ -10310,6 +7387,7 @@ routes = [
     Route("/affiliate", endpoint=serve_affiliate_portal),
     Route("/api/boop/config", endpoint=api_boop_config, methods=["GET", "POST"]),
     Route("/api/boop/status", endpoint=api_boop_status),
+    Route("/api/boops/active", endpoint=api_boops_active),
     Route("/api/boop/toggle", endpoint=api_boop_toggle, methods=["POST"]),
     Route("/api/boops", endpoint=api_boops_list),
     Route("/api/boops/{boop_id}", endpoint=api_boop_update, methods=["PATCH"]),
@@ -10335,8 +7413,36 @@ routes = [
     Route("/api/whatsapp/qr", endpoint=api_whatsapp_qr),
     Route("/api/whatsapp/status", endpoint=api_whatsapp_status),
     Route("/api/settings", endpoint=api_user_settings, methods=["GET", "POST", "PUT"]),
+    Route("/api/profile", endpoint=api_profile, methods=["GET", "POST"]),
+    Route("/api/notifications", endpoint=api_notifications, methods=["GET", "POST"]),
+    Route("/api/notifications/send-email", endpoint=api_notification_send_email, methods=["POST"]),
+    Route("/api/notifications/task-assigned", endpoint=api_notification_task_assigned, methods=["POST"]),
+    Route("/api/notifications/meeting-invite", endpoint=api_notification_meeting_invite, methods=["POST"]),
+    # ── AgentMail Inbox routes ──
+    Route("/api/inbox/status", endpoint=api_inbox_status),
+    Route("/api/inbox/threads", endpoint=api_inbox_threads),
+    Route("/api/inbox/threads/{thread_id}", endpoint=api_inbox_thread_detail),
+    Route("/api/inbox/threads/{thread_id}/read", endpoint=api_inbox_mark_read, methods=["POST"]),
+    Route("/api/inbox/mark-all-read", endpoint=api_inbox_mark_all_read, methods=["POST"]),
+    Route("/api/inbox/send", endpoint=api_inbox_send, methods=["POST"]),
+    Route("/api/inbox/reply/{message_id}", endpoint=api_inbox_reply, methods=["POST"]),
+    Route("/api/inbox/accounts", endpoint=api_inbox_accounts, methods=["POST", "DELETE"]),
+    # ── Kanban To Do routes ──
+    Route("/api/todo/tasks", endpoint=api_todo_tasks),
+    Route("/api/todo/tasks", endpoint=api_todo_tasks, methods=["POST"]),
+    Route("/api/todo/tasks/{task_id}", endpoint=api_todo_task_update, methods=["PUT"]),
+    Route("/api/todo/tasks/{task_id}", endpoint=api_todo_task_delete, methods=["DELETE"]),
+    Route("/api/todo/scan-emails", endpoint=api_todo_scan_emails, methods=["POST"]),
     Route("/api/bookmarks", endpoint=api_bookmarks, methods=["GET", "POST"]),
+    Route("/api/deployments", endpoint=api_deployments_list, methods=["GET"]),
+    Route("/api/deployments", endpoint=api_deployments_create, methods=["POST"]),
+    Route("/api/deployments/{dep_id}", endpoint=api_deployments_update, methods=["PUT"]),
+    Route("/api/deployments/{dep_id}", endpoint=api_deployments_delete, methods=["DELETE"]),
     Route("/api/health/mods", endpoint=api_health_mods),
+    Route("/api/mods/health", endpoint=api_mods_health),
+    Route("/api/mods/backup", endpoint=api_mods_backup, methods=["POST"]),
+    Route("/api/mods/restore-all", endpoint=api_mods_restore_all, methods=["POST"]),
+    Route("/api/mods/restore/{module_name}", endpoint=api_mods_restore_single, methods=["POST"]),
     Route("/api/update/check", endpoint=api_update_check),
     Route("/api/update/apply", endpoint=api_update_apply, methods=["POST"]),
     Route("/api/update/apply-force", endpoint=api_update_apply_force, methods=["POST"]),
@@ -10349,43 +7455,110 @@ routes = [
     Route("/api/hub/weekly-usage", endpoint=api_hub_weekly_usage),
     Route("/api/hub/weekly-usage", endpoint=api_hub_weekly_usage_update, methods=["POST"]),
     Route("/api/hub/live-agents", endpoint=api_hub_live_agents),
+    Route("/api/activity", endpoint=api_activity),
+    Route("/api/system/stats", endpoint=api_system_stats),
+    Route("/api/integrations/status", endpoint=api_integrations_status),
+    Route("/api/cc/status", endpoint=api_cc_status),
+    Route("/api/cc/proxy/{path:path}", endpoint=api_cc_proxy, methods=["GET", "POST", "PUT"]),
     Route("/api/debug/report", endpoint=api_hub_debug_report, methods=["POST"]),
     Route("/api/continue", endpoint=api_hub_continue, methods=["POST"]),
     Route("/api/restart", endpoint=api_hub_restart, methods=["POST"]),
     Route("/api/tgim/{path:path}", endpoint=api_tgim_proxy, methods=["GET", "POST", "PUT", "PATCH", "DELETE"]),
-    # ── Team Chat (embedded trio-comms) ──
-    Route("/trio/messages", endpoint=api_trio_messages),
-    Route("/trio/message", endpoint=api_trio_send, methods=["POST"]),
-    Route("/trio/upload", endpoint=api_trio_upload, methods=["POST"]),
-    Route("/trio/media/{key:path}", endpoint=api_trio_media),
-    Route("/trio/presence", endpoint=api_trio_presence),
-    Route("/trio/heartbeat", endpoint=api_trio_heartbeat, methods=["POST"]),
-    Route("/trio/setup", endpoint=api_trio_setup, methods=["POST"]),
-    Route("/trio/health", endpoint=api_trio_health),
-    # CF Worker-compatible /rooms/* aliases (poller/heartbeat use these paths)
-    Route("/rooms/{room_id}/messages", endpoint=api_trio_messages),
-    Route("/rooms/{room_id}/messages", endpoint=api_trio_send, methods=["POST"]),
-    Route("/rooms/{room_id}/upload", endpoint=api_trio_upload, methods=["POST"]),
-    Route("/rooms/{room_id}/presence", endpoint=api_trio_presence),
-    Route("/rooms/{room_id}/heartbeat", endpoint=api_trio_heartbeat, methods=["POST"]),
-    Route("/rooms/ensure", endpoint=api_trio_setup, methods=["POST"]),
-    Route("/health", endpoint=api_trio_health),
+    # ── Constitution Tab routes ──
+    Route("/api/constitution/audit-log", endpoint=api_constitution_audit_log),
+    Route("/api/constitution/rules", endpoint=api_constitution_rules_create, methods=["POST"]),
+    Route("/api/constitution/rules/{id}", endpoint=api_constitution_rules_update, methods=["PUT"]),
+    Route("/api/constitution/rules/{id}", endpoint=api_constitution_rules_delete, methods=["DELETE"]),
+    Route("/api/constitution/rules", endpoint=api_constitution_rules_list),
+    Route("/api/constitution/governance/{id}", endpoint=api_constitution_governance_update, methods=["PUT"]),
+    Route("/api/constitution/governance", endpoint=api_constitution_governance_list),
+    Route("/api/constitution/sync", endpoint=api_constitution_sync, methods=["POST"]),
+    Route("/api/constitution/memory", endpoint=api_constitution_memory),
+    Route("/api/constitution/overrides", endpoint=api_constitution_overrides),
+    # ── Google Drive routes ──
+    Route("/api/gdrive/status", endpoint=api_gdrive_status),
+    Route("/api/gdrive/auth-url", endpoint=api_gdrive_auth_url),
+    Route("/api/gdrive/callback", endpoint=api_gdrive_callback),
+    Route("/api/gdrive/disconnect", endpoint=api_gdrive_disconnect, methods=["POST"]),
+    Route("/api/gdrive/files", endpoint=api_gdrive_files),
+    Route("/api/gdrive/download/{file_id}", endpoint=api_gdrive_download),
+    Route("/api/gdrive/upload", endpoint=api_gdrive_upload, methods=["POST"]),
+    Route("/api/gdrive/create-folder", endpoint=api_gdrive_create_folder, methods=["POST"]),
+    Route("/api/gdrive/about", endpoint=api_gdrive_about),
+    # ── Skills Shop routes ──
+    Route("/api/skills", endpoint=api_skills_list),
+    Route("/api/skills/registry", endpoint=api_skills_registry),
+    Route("/api/skills/install", endpoint=api_skills_install, methods=["POST"]),
+    Route("/api/skills/uninstall", endpoint=api_skills_uninstall, methods=["POST"]),
+    Route("/api/skills/detail/{name:path}", endpoint=api_skills_detail),
     WebSocketRoute("/ws/chat", endpoint=ws_chat),
     WebSocketRoute("/ws/terminal", endpoint=ws_terminal),
     *_custom_routes,   # Flux overlay: custom routes from custom/routes.py
 ]
 
+# ─── Apply endpoint extensions (wrap upstream handlers) ───────────────
+if _endpoint_extensions:
+    import functools as _functools
+
+    def _make_extended_endpoint(_orig_endpoint, _ext_fn):
+        """Create a wrapper that calls the original, then merges extension data."""
+        @_functools.wraps(_orig_endpoint)
+        async def _wrapped(request: Request) -> Response:
+            original_response = await _orig_endpoint(request)
+            # Only extend JSON responses
+            if not isinstance(original_response, JSONResponse):
+                return original_response
+            try:
+                original_data = json.loads(original_response.body.decode("utf-8"))
+                extra_data = await _ext_fn(original_data)
+                if extra_data and isinstance(extra_data, dict):
+                    original_data.update(extra_data)
+                # Strip content-length so JSONResponse recalculates it
+                # from the (potentially larger) merged body.
+                _fwd_headers = {
+                    k: v for k, v in original_response.headers.items()
+                    if k.lower() != "content-length"
+                }
+                return JSONResponse(
+                    original_data,
+                    status_code=original_response.status_code,
+                    headers=_fwd_headers,
+                )
+            except Exception as _ext_err:
+                print(f"[portal-custom] WARNING: endpoint extension failed for {_ext_fn.__name__}: {_ext_err}")
+                return original_response
+        return _wrapped
+
+    _ext_applied = 0
+    for _i, _route in enumerate(routes):
+        if isinstance(_route, Route) and _route.path in _endpoint_extensions:
+            _ext_fn = _endpoint_extensions[_route.path]
+            _orig = _route.endpoint
+            routes[_i] = Route(
+                _route.path,
+                endpoint=_make_extended_endpoint(_orig, _ext_fn),
+                methods=_route.methods,
+            )
+            _ext_applied += 1
+            print(f"[portal-custom] Extended endpoint: {_route.path}")
+    if _ext_applied:
+        print(f"[portal-custom] Applied {_ext_applied} endpoint extension(s)")
+# ─── End endpoint extensions ──────────────────────────────────────────
+
+# Build middleware stack
+_app_middleware = [
+    Middleware(
+        CORSMiddleware,
+        allow_origins=["https://purebrain.ai", "https://www.purebrain.ai", "https://app.purebrain.ai", "https://777-command-center.vercel.app"],
+        allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization", "X-Affiliate-Session"],
+    ),
+]
+
 app = Starlette(
     routes=routes,
     on_startup=[_startup],
-    middleware=[
-        Middleware(
-            CORSMiddleware,
-            allow_origins=["https://purebrain.ai", "https://www.purebrain.ai", "https://app.purebrain.ai", "https://777-command-center.vercel.app"],
-            allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-            allow_headers=["Content-Type", "Authorization", "X-Affiliate-Session"],
-        ),
-    ],
+    middleware=_app_middleware,
 )
 
 if __name__ == "__main__":

@@ -429,7 +429,7 @@ Note: This panel will appear in the sidebar. If you truly want it hidden, you ne
 ### Simulate an update (the real test)
 
 ```bash
-cd /home/aiciv/purebrain_portal
+cd ~/purebrain_portal
 
 # Check what's tracked vs gitignored
 git status

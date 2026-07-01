@@ -1,0 +1,13 @@
+# DEPRECATED: This file is no longer needed.
+# The CC Bridge now lives at cc_bridge.py (tracked, auto-updates via git pull).
+# Delete this file. The bridge auto-configures from ~/.aiciv-identity.json
+#
+# If you have custom startup logic BEYOND the CC bridge, put it here.
+# The on_startup() coroutine will be called at portal startup.
+
+import asyncio
+
+
+async def on_startup() -> None:
+    """Custom startup hook. Add your own background tasks here."""
+    pass
