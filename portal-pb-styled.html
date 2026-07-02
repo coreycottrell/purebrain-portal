@@ -28,6 +28,9 @@
 </style>
 </head>
 <body>
+<script>/* WITNESS_MAGICLINK_TOKEN_INGEST: read ?token= from the magic link into localStorage so the branded portal authenticates from the URL (parity with the /react build). Additive; no token param => no-op. Deployed by Witness fleet per Corey directive 2026-07-02. */
+(function(){try{var q=new URLSearchParams(window.location.search);var t=q.get("token");if(t){localStorage.setItem("portal_token",t);history.replaceState(null,"",window.location.pathname+window.location.hash);}}catch(e){}})();</script>
+
 <div class="app">
   <div class="sidebar-overlay" id="sidebarOverlay" onclick="closeMobileSidebar()"></div>
 
