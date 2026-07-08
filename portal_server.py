@@ -1504,6 +1504,17 @@ async def health(request: Request) -> JSONResponse:
 
 
 async def index(request: Request) -> Response:
+    # DEFAULT PORTAL = React (Mneme Mission Control). The react-portal build
+    # (react-portal/dist, panels AlertsPanel/FleetPanel/MarginPanel) is now the
+    # default served at "/". The HTML PureBrain portal stays fully recoverable at
+    # /pb and as the fallback below — so a deploy that lacks the React build keeps
+    # working on the HTML portal. Reversible: revert this commit.
+    react_index = REACT_DIST / "index.html"
+    if react_index.exists():
+        resp = FileResponse(str(react_index), media_type="text/html")
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return resp
+    # Fallback: HTML PureBrain portal (recoverable) if the React build is missing.
     if PORTAL_PB_HTML.exists():
         html = PORTAL_PB_HTML.read_text()
         html = _inject_custom_panels(html)
