@@ -1,7 +1,14 @@
 # AiCIV Portal — Setup Guide
 
-**For**: Aether's team (or any AiCIV operator)
+**For**: Witness / Aether's team (or any AiCIV operator)
 **Time to deploy**: ~15 minutes
+
+> **Frontend = REACT ONLY (2026-07-08).** This repo deploys the **React portal
+> and only the React portal**. The legacy HTML frontends (`portal.html`,
+> `portal-pb-styled.html`) have been retired from the deploy path — their source
+> is preserved under `_retired-html-portal/` and the full pre-React deploy is
+> recoverable on branch `main-html-archive-20260708`. A fresh `git pull` +
+> `./start.sh` serves React.
 
 ---
 
@@ -9,19 +16,21 @@
 
 | File | Purpose |
 |------|---------|
-| `portal_server.py` | Backend server (Python/Starlette, ~470 lines) |
-| `portal.html` | Original dark theme portal (300 lines, zero deps) |
-| `portal-pb-styled.html` | PureBrain-styled portal (980 lines, zero deps) |
-| `react-portal/` | React + Vite version (20 components, full PB frontend) |
-| `start.sh` | One-liner startup script |
+| `portal_server.py` | Backend server (Python/Starlette) — API + WebSocket + serves the React portal |
+| `react-portal/dist/` | The React portal (built bundle) — **THE deployed frontend** |
+| `start.sh` | One-liner startup script (guards that `react-portal/dist/` is present) |
 | `.portal-token` | You create this — your auth bearer token |
+| `_retired-html-portal/` | Retired legacy HTML frontends — NOT served; reference only |
 
 ## Prerequisites
 
 - Python 3.10+ with `pip`
-- Node.js 18+ (only if using React version)
 - A running AiCIV container with tmux session
 - Reverse proxy for TLS (Caddy recommended)
+
+The React portal ships **pre-built** in `react-portal/dist/`, so **Node.js is NOT
+required to deploy**. Node 18+ is only needed to rebuild the React frontend from
+source (see "Iterating on the Frontend").
 
 ## Quick Start (5 minutes)
 
@@ -49,15 +58,18 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))" > /home/aiciv/pure
 
 ```bash
 cd /home/aiciv/purebrain_portal
-python3 portal_server.py
+./start.sh          # preferred — guards that the React build is present
+# or: python3 portal_server.py
 # Runs on port 8097 by default
 ```
 
 ### 5. Access the portal
 
-- Original: `http://localhost:8097/`
-- PureBrain-styled: `http://localhost:8097/pb`
-- React version: `http://localhost:8097/react`
+The **React portal** is served at all three paths (there is only one frontend now):
+
+- `http://localhost:8097/`   ← React portal (default)
+- `http://localhost:8097/react` ← React portal (explicit alias)
+- `http://localhost:8097/pb`   ← 301-redirects to `/` (legacy path kept for old links)
 
 Enter your bearer token from `.portal-token` to authenticate.
 
@@ -110,9 +122,9 @@ All authenticated endpoints require: `Authorization: Bearer <token>` header.
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| GET | `/` | No | Original HTML portal |
-| GET | `/pb` | No | PureBrain-styled portal |
-| GET | `/react` | No | React portal |
+| GET | `/` | No | React portal (the deployed frontend) |
+| GET | `/react` | No | React portal (explicit alias for `/`) |
+| GET | `/pb` | No | 301 redirect to `/` (legacy path) |
 | GET | `/health` | No | `{"status":"ok","civ":"...","uptime":N}` |
 | GET | `/api/status` | Yes | CIV health: tmux, Claude, TG bot status |
 | GET | `/api/chat/history?last=N` | Yes | Last N messages from JSONL session logs |
@@ -162,17 +174,18 @@ All authenticated endpoints require: `Authorization: Bearer <token>` header.
 
 ## Iterating on the Frontend
 
-### HTML versions
-Just edit `portal.html` or `portal-pb-styled.html` directly. Refresh browser. No build step.
+The frontend is **React only**. To change it, rebuild the React bundle:
 
-### React version
 ```bash
 cd react-portal
 # Edit src/components/*.jsx
-npm run build    # Produces dist/ served at /react
+npm install       # first time only
+npm run build     # produces dist/ — served at / and /react
 ```
 
-The portal server auto-serves from `react-portal/dist/`. No server restart needed after rebuild.
+The portal server serves directly from `react-portal/dist/`. No server restart
+needed after a rebuild. The legacy HTML frontends are retired (see
+`_retired-html-portal/`) and are no longer served or edited.
 
 ## How the Portal Talks to the AiCIV
 
@@ -202,8 +215,7 @@ Without this, screenshot-heavy workflows can crash sessions with "image exceeds 
 
 ## Source Tagging
 
-Messages sent from the portal are prefixed in tmux:
-- `[portal]` — from HTML versions
-- `[portal-react]` — from React version
+Messages sent from the React portal are prefixed in tmux with `[portal-react]`.
+This lets you distinguish portal input from Telegram or direct tmux in the session.
 
 This lets you distinguish portal input from Telegram or direct tmux in the session.

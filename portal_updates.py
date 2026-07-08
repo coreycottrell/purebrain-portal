@@ -79,7 +79,7 @@ async def _get_update_lock() -> asyncio.Lock:
 
 # ─── MODIFICATION DETECTION & HEALTH CHECK ─────────────────────────────
 _MIGRATION_GUIDANCE = {
-    "portal-pb-styled.html": "UI changes should be in custom/panels/*.html -- see portal-mod-protocol skill",
+    "react-portal/dist/index.html": "UI changes belong in the React source (react-portal/src/**), then `npm run build` -- the HTML portal is retired",
     "portal_server.py": "Endpoints should be in custom/routes.py, config in custom/config.json -- see portal-mod-protocol skill",
     "static/commands-shortcuts.js": "Quick Fire customizations should be in custom/quickfire.json -- see portal-mod-protocol skill",
 }
@@ -841,8 +841,10 @@ async def _run_release_update(job_id: str, lock: asyncio.Lock):
                     filter="fully_trusted",
                 )
 
-                # Post-extraction verification: ensure critical files were written
-                _critical = ["portal-pb-styled.html", "portal_server.py",
+                # Post-extraction verification: ensure critical files were written.
+                # Frontend critical file is the React bundle (portal-pb-styled.html
+                # retired from the deploy path 2026-07-08 — React is the only frontend).
+                _critical = ["react-portal/dist/index.html", "portal_server.py",
                              "portal_config.py", "portal_updates.py"]
                 missing = [cf for cf in _critical if not (SCRIPT_DIR / cf).exists()]
                 if missing:

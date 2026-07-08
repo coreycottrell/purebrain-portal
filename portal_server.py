@@ -1503,36 +1503,38 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "civ": CIV_NAME, "version": PORTAL_VERSION, "uptime": int(time.time() - START_TIME)})
 
 
-async def index(request: Request) -> Response:
-    if PORTAL_PB_HTML.exists():
-        html = PORTAL_PB_HTML.read_text()
-        html = _inject_custom_panels(html)
-        resp = Response(html, media_type="text/html")
+def _react_index_response() -> Response:
+    """Serve the React portal's index.html — the ONLY deployed portal frontend.
+
+    The legacy HTML frontends (portal.html / portal-pb-styled.html) were retired
+    from the deploy path 2026-07-08 (Corey directive: "the react version and ONLY
+    the react version deployed"). Their source is preserved under _retired-html-portal/
+    and the full pre-React deploy is recoverable on branch main-html-archive-20260708.
+    """
+    react_index = REACT_DIST / "index.html"
+    if react_index.exists():
+        resp = FileResponse(str(react_index), media_type="text/html")
         resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         return resp
-    if PORTAL_HTML.exists():
-        return FileResponse(str(PORTAL_HTML), media_type="text/html")
-    return Response("<h1>Portal HTML not found</h1>", media_type="text/html", status_code=503)
+    return Response(
+        "<h1>React Portal not found — react-portal/dist/index.html is missing</h1>",
+        media_type="text/html", status_code=503)
+
+
+async def index(request: Request) -> Response:
+    """Root portal — serves the React portal (the only deployed frontend)."""
+    return _react_index_response()
 
 
 async def index_pb(request: Request) -> Response:
-    """Serve PureBrain-styled portal at /pb path."""
-    if not PORTAL_PB_HTML.exists():
-        return Response("<h1>PB Portal not found</h1>", media_type="text/html", status_code=503)
-    html = PORTAL_PB_HTML.read_text()
-    html = _inject_custom_panels(html)
-    resp = Response(html, media_type="text/html")
-    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    return resp
+    """Legacy /pb path — retired. Redirect to the React portal at /."""
+    from starlette.responses import RedirectResponse
+    return RedirectResponse(url="/", status_code=301)
 
 
 async def index_react(request: Request) -> Response:
-    """Serve React portal at /react path."""
-    react_index = REACT_DIST / "index.html"
-    if react_index.exists():
-        return FileResponse(str(react_index), media_type="text/html")
-    return Response("<h1>React Portal not found — run npm run build in react-portal/</h1>",
-                    media_type="text/html", status_code=503)
+    """/react path — kept as an explicit alias for the React portal (same as /)."""
+    return _react_index_response()
 
 
 async def api_status(request: Request) -> JSONResponse:

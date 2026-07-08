@@ -3,6 +3,12 @@
 **From**: Aether (AI Collective, PureBrain.ai)
 **For**: Witness / Corey — to recreate per-customer portals at scale
 
+> **Frontend = REACT ONLY (2026-07-08).** A fresh clone of `main` + `./start.sh`
+> deploys the **React portal and only the React portal** (`react-portal/dist/`,
+> served at `/`). The legacy HTML frontends were retired to `_retired-html-portal/`
+> and are no longer served. The pre-React deploy is recoverable on branch
+> `main-html-archive-20260708`.
+
 ---
 
 ## What This Is
@@ -36,16 +42,15 @@ When a customer pays and completes onboarding:
 ```
 app-purebrain-ai-full-repo/
 ├── portal-server/              # THE MAIN APP — this is what each customer gets
-│   ├── portal_server.py        # FastAPI/Starlette server (74KB)
-│   │                           #   REST API + WebSocket + HTML serving
+│   ├── portal_server.py        # FastAPI/Starlette server
+│   │                           #   REST API + WebSocket + serves the React portal
 │   │                           #   Chat, terminal, file upload/download
 │   │                           #   Referral tracking, payout requests
 │   │                           #   Health monitoring, context tracking
-│   ├── portal-pb-styled.html   # Production portal UI (426KB single-file app)
-│   │                           #   Dark theme, responsive, mobile hamburger menu
-│   │                           #   Chat with inline images, bookmarks, search
-│   │                           #   Multi-tab terminal, teams panel
-│   │                           #   Referral dashboard with payout request
+│   ├── react-portal/dist/      # THE deployed frontend — React portal (built bundle)
+│   │                           #   AlertsPanel / FleetPanel / MarginPanel + chat/terminal
+│   │                           #   Served at / and /react
+│   ├── _retired-html-portal/   # Retired legacy HTML frontends — NOT served (reference only)
 │   ├── portal_send_file.sh     # Send files into portal chat from server-side
 │   ├── portal_owner.example.json # Per-customer config (name, email, referral code)
 │   ├── start.sh                # Launch script
@@ -101,7 +106,9 @@ app-purebrain-ai-full-repo/
 ### Endpoints
 | Path | Method | Purpose |
 |------|--------|---------|
-| `/pb` | GET | PureBrain-styled portal (production) |
+| `/` | GET | React portal (production frontend) |
+| `/react` | GET | React portal (explicit alias for `/`) |
+| `/pb` | GET | 301 redirect to `/` (legacy path) |
 | `/api/status` | GET | Server health |
 | `/api/chat/history` | GET | Chat history (JSONL) |
 | `/api/chat/send` | POST | Send chat message → injects into Claude Code tmux |
@@ -126,8 +133,8 @@ Token passed via query param (`?token=XXX`) or `Authorization: Bearer XXX` heade
 ### Key Files Per Customer Instance
 ```
 ~/purebrain_portal/
-├── portal_server.py            # Server
-├── portal-pb-styled.html       # UI
+├── portal_server.py            # Server (serves the React portal)
+├── react-portal/dist/          # UI — the React portal (the deployed frontend)
 ├── portal_send_file.sh         # Server→chat file delivery
 ├── portal_owner.json           # {"name":"...", "email":"...", "referral_code":"..."}
 ├── .portal-token               # Auth token (auto-generated)
@@ -148,7 +155,7 @@ Plus shared:
 For each new customer:
 
 1. **Spin up Claude Code instance** (the AI brain)
-2. **Create portal directory** with copies of portal_server.py + portal-pb-styled.html
+2. **Create portal directory** with copies of portal_server.py + react-portal/dist/
 3. **Generate portal_owner.json** with customer name, email, referral code
 4. **Generate .portal-token** (random 32-byte base64)
 5. **Create systemd service** from template (auto-restart on crash)
@@ -226,9 +233,9 @@ cat > ~/purebrain_portal/.env << 'EOF'
 PORTAL_TOKEN=YOUR_TOKEN_HERE
 EOF
 
-# 6. Start the portal server
-cd ~/purebrain_portal && python3 portal_server.py
-# Runs on port 8097 — access at http://localhost:8097/pb
+# 6. Start the portal server (serves the React portal)
+cd ~/purebrain_portal && ./start.sh   # or: python3 portal_server.py
+# Runs on port 8097 — access the React portal at http://localhost:8097/
 ```
 
 ### Getting a Portal Token
@@ -266,7 +273,7 @@ The update script checks the version, verifies the checksum, backs up your confi
 
 ### What gets updated
 - `portal_server.py` — server code
-- `portal-pb-styled.html` — UI
+- `react-portal/dist/` — UI (the React portal — the deployed frontend)
 - `static/` — CSS, JS, assets
 - `tools/` — utility scripts
 
@@ -294,11 +301,15 @@ Developer merges PR
 If you have GitHub access to the puretechnyc/purebrain-portal-2 repo:
 
 ```bash
-git clone https://github.com/puretechnyc/purebrain-portal-2.git ~/purebrain_portal
+git clone https://github.com/coreycottrell/purebrain-portal.git ~/purebrain_portal
 pip install -r ~/purebrain_portal/requirements.txt
 python3 -c "import secrets; print(secrets.token_urlsafe(32))" > ~/purebrain_portal/.portal-token
-cd ~/purebrain_portal && python3 portal_server.py
+cd ~/purebrain_portal && ./start.sh   # serves the React portal at http://localhost:8097/
 ```
+
+The React frontend ships pre-built in `react-portal/dist/`, so a plain clone
+already has everything needed to serve React — no Node/npm build step required
+to deploy.
 
 ---
 
