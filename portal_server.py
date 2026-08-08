@@ -148,8 +148,8 @@ def _detect_session_model() -> str:
         except Exception:
             pass
 
-    # 4. Final fallback
-    return "claude-opus-4-6[1m]"
+    # 4. Final fallback — constitutional Opus-4.8 floor (never emit below 4.8)
+    return "claude-opus-4-8[1m]"
 
 
 # ---------------------------------------------------------------------------
